@@ -1,6 +1,6 @@
 {
   "name": "@shinick/teams-linux-arm64",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Prebuilt teams binary for Linux arm64 (glibc)",
   "repository": {
     "type": "git",

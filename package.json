@@ -1,6 +1,6 @@
 {
   "name": "@shinick/teams",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Ultra-fast Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",
@@ -34,11 +34,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@shinick/teams-win32-x64": "0.7.3",
-    "@shinick/teams-win32-arm64": "0.7.3",
-    "@shinick/teams-darwin-x64": "0.7.3",
-    "@shinick/teams-darwin-arm64": "0.7.3",
-    "@shinick/teams-linux-x64": "0.7.3",
-    "@shinick/teams-linux-arm64": "0.7.3"
+    "@shinick/teams-win32-x64": "0.7.4",
+    "@shinick/teams-win32-arm64": "0.7.4",
+    "@shinick/teams-darwin-x64": "0.7.4",
+    "@shinick/teams-darwin-arm64": "0.7.4",
+    "@shinick/teams-linux-x64": "0.7.4",
+    "@shinick/teams-linux-arm64": "0.7.4"
   }
 }
