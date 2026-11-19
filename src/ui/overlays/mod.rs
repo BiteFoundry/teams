@@ -4,7 +4,9 @@ pub mod attachments;
 pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
+pub mod file_picker;
 pub mod image_preview;
+pub mod links;
 pub mod mentions;
 pub mod new_chat;
 pub mod path_input;
@@ -28,7 +30,8 @@ use crate::ui::{
     hitmap::{HitMap, HitTarget, MessageScope},
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
-        context_menu::ContextMenu, image_preview::ImagePreviewOverlay, new_chat::NewChatState,
+        context_menu::ContextMenu, file_picker::FilePickerOverlay,
+        image_preview::ImagePreviewOverlay, links::LinksOverlay, new_chat::NewChatState,
         path_input::PathInputState, presence::PresenceOverlay, reactions::ReactionsOverlay,
         room_info::RoomInfoState, search::SearchOverlay, settings::SettingsState,
     },
@@ -44,6 +47,8 @@ pub enum OverlayKind {
     Reactions,
     Attachments,
     PathInput,
+    FilePicker,
+    Links,
     NewChat,
     RoomInfo,
     ImagePreview,
@@ -76,6 +81,8 @@ pub enum Overlay {
     Reactions(ReactionsOverlay),
     Attachments(AttachmentsState),
     PathInput(PathInputState),
+    FilePicker(FilePickerOverlay),
+    Links(LinksOverlay),
     NewChat(NewChatState),
     RoomInfo(RoomInfoState),
     ImagePreview(ImagePreviewOverlay),
@@ -94,6 +101,8 @@ impl Overlay {
             Overlay::Reactions(_) => OverlayKind::Reactions,
             Overlay::Attachments(_) => OverlayKind::Attachments,
             Overlay::PathInput(_) => OverlayKind::PathInput,
+            Overlay::FilePicker(_) => OverlayKind::FilePicker,
+            Overlay::Links(_) => OverlayKind::Links,
             Overlay::NewChat(_) => OverlayKind::NewChat,
             Overlay::RoomInfo(_) => OverlayKind::RoomInfo,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
@@ -108,6 +117,7 @@ impl Overlay {
             Overlay::Search(_)
                 | Overlay::CommandPalette(_)
                 | Overlay::PathInput(_)
+                | Overlay::FilePicker(_)
                 | Overlay::NewChat(_)
         )
     }
@@ -142,6 +152,14 @@ impl Overlay {
 
     pub fn path_input() -> Self {
         Overlay::PathInput(PathInputState::new())
+    }
+
+    pub fn file_picker() -> Self {
+        Overlay::FilePicker(FilePickerOverlay::new())
+    }
+
+    pub fn links(overlay: LinksOverlay) -> Self {
+        Overlay::Links(overlay)
     }
 
     pub fn new_chat() -> Self {
@@ -191,6 +209,8 @@ impl Overlay {
             Overlay::Reactions(reactions) => reactions.handle(action),
             Overlay::Attachments(tray) => tray.handle(action, app),
             Overlay::PathInput(input) => input.handle(action),
+            Overlay::FilePicker(picker) => picker.handle(action),
+            Overlay::Links(links) => links.handle(action),
             Overlay::NewChat(new_chat) => match action {
                 Action::Tab => new_chat.handle(&Action::MoveDown, app),
                 Action::PrevFocus => new_chat.handle(&Action::MoveUp, app),
@@ -216,6 +236,8 @@ impl Overlay {
             Overlay::Presence(presence) => presence.select(index),
             Overlay::Reactions(reactions) => reactions.select(index),
             Overlay::Attachments(tray) => tray.select(index),
+            Overlay::FilePicker(picker) => picker.select(index),
+            Overlay::Links(links) => links.select(index),
             Overlay::NewChat(new_chat) => new_chat.select(index),
             Overlay::RoomInfo(info) => info.select(index),
             Overlay::ImagePreview(_) | Overlay::PathInput(_) | Overlay::Help(_) | Overlay::Confirm(_) => {}
@@ -239,6 +261,8 @@ impl Overlay {
             Overlay::Reactions(reactions) => reactions.draw(frame, area, app, ui, hitmap),
             Overlay::Attachments(tray) => tray.draw(frame, area, app, ui, hitmap),
             Overlay::PathInput(input) => input.draw(frame, area, ui, hitmap),
+            Overlay::FilePicker(picker) => picker.draw(frame, area, ui, hitmap),
+            Overlay::Links(links) => links.draw(frame, area, ui, hitmap),
             Overlay::NewChat(new_chat) => new_chat.draw(frame, area, app, ui, hitmap),
             Overlay::RoomInfo(info) => info.draw(frame, area, app, ui, hitmap),
             Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
@@ -261,7 +285,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
         &[
             ("Ctrl+K", "Omni-Switcher (chats, channels, commands)"),
             ("1/2/3 · Alt+1..3", "Chats / Teams / Activity (@mentions)"),
-            ("u / U / Alt+u", "Jump to next / previous unread"),
+            ("u (Nav) / U / Alt+u", "Jump to next / previous unread"),
             ("` / Alt+← / Alt+→", "Last conversation / history back-fwd"),
             ("Alt+↑ / Alt+↓", "Previous / next conversation in list"),
             ("←/→ or h/l (Nav)", "Collapse / expand team or open chat"),
@@ -278,6 +302,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("o / H / s", "Load older (50) / deep history sync"),
             ("t / + / e", "Open channel thread / add reaction"),
             ("r / y / Del", "Reply / copy / delete message"),
+            ("u / h", "Extract links / toggle inline href URLs"),
             ("v / d / m", "Preview image / download / menu"),
         ],
     ),
@@ -287,10 +312,10 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("i / Enter", "Focus Composer / send message"),
             ("Shift+Enter / Ctrl+E", "Newline / external $EDITOR"),
             ("Ctrl+W / Alt+Bksp", "Delete word backward"),
-            ("Ctrl+V / Ctrl+Shift+X", "Paste image / clear pending images"),
+            ("Ctrl+V / Ctrl+Shift+X", "Paste image/text / clear pending images"),
             ("Alt+T / Ctrl+S", "Toggle thread target / channel subject"),
-            ("Ctrl+O / Ctrl+T", "Send file / attachments tray"),
-            ("Ctrl+F / /", "Search messages"),
+            ("Ctrl+F / Ctrl+O / Ctrl+T", "File picker (zoxide) / path / tray"),
+            ("/", "Search messages"),
         ],
     ),
     (

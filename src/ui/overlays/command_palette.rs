@@ -55,8 +55,11 @@ fn palette_commands() -> Vec<PaletteItem> {
             Action::SelectNavTab(2),
         ),
         ("New Chat", "Ctrl+N", Action::OpenOverlay(OverlayKind::NewChat)),
-        ("Search Messages", "Ctrl+F", Action::OpenSearch),
-        ("Jump to Next Unread", "u / Alt+u", Action::JumpNextUnread),
+        ("Search Messages", "/", Action::OpenSearch),
+        ("Browse & Attach File (File Picker)", "Ctrl+F", Action::OpenFilePicker),
+        ("Extract Links (URLs)", "u", Action::OpenLinks),
+        ("Toggle Inline Link URLs (href)", "h", Action::ToggleShowHrefs),
+        ("Jump to Next Unread", "u (Nav) / Alt+u", Action::JumpNextUnread),
         ("Jump to Previous Unread", "U", Action::JumpPrevUnread),
         (
             "Toggle Last Conversation",

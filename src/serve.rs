@@ -893,7 +893,10 @@ async fn download_attachment(
         "ok": true,
         "path": downloaded.path,
         "file_name": downloaded.file_name,
+        "mime_type": downloaded.mime_type,
+        "size_bytes": downloaded.bytes_written,
         "bytes_written": downloaded.bytes_written,
+        "is_image": downloaded.is_image,
     })))
 }
 

@@ -247,6 +247,8 @@ impl Keymap {
                 Action::OpenReactionsForSelected,
             );
             map.bind(Some(focus), Char('r'), M::NONE, Action::ReplyToSelected);
+            map.bind(Some(focus), Char('u'), M::NONE, Action::OpenLinks);
+            map.bind(Some(focus), Char('h'), M::NONE, Action::ToggleShowHrefs);
         }
         map.bind(
             Some(Focus::Chat),
@@ -308,7 +310,7 @@ impl Keymap {
             Action::OpenOverlay(OverlayKind::Help),
         );
         map.bind(any, Char('/'), M::NONE, Action::OpenSearch);
-        map.bind(any, Char('f'), M::CONTROL, Action::OpenSearch);
+        map.bind(any, Char('f'), M::CONTROL, Action::OpenFilePicker);
         map.bind(
             any,
             Char('k'),
@@ -581,6 +583,50 @@ mod tests {
                 key(KeyCode::Char('v'), KeyModifiers::ALT)
             ),
             Some(Action::OpenImagePreview)
+        );
+    }
+
+    #[test]
+    fn links_href_toggle_and_file_picker_bindings() {
+        let map = Keymap::default_teams();
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(Action::OpenLinks)
+        );
+        assert_eq!(
+            map.resolve(Focus::Thread, key(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(Action::OpenLinks)
+        );
+        assert_eq!(
+            map.resolve(Focus::Nav, key(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(Action::JumpNextUnread)
+        );
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::ToggleShowHrefs)
+        );
+        assert_eq!(
+            map.resolve(Focus::Thread, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::ToggleShowHrefs)
+        );
+        assert_eq!(
+            map.resolve(Focus::Nav, key(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(Action::NavCollapseOrParent)
+        );
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('f'), KeyModifiers::CONTROL)),
+            Some(Action::OpenFilePicker)
+        );
+        assert_eq!(
+            map.resolve(
+                Focus::Composer,
+                key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
+            Some(Action::OpenFilePicker)
+        );
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('/'), KeyModifiers::NONE)),
+            Some(Action::OpenSearch)
         );
     }
 }

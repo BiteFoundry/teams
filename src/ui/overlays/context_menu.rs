@@ -99,6 +99,16 @@ impl ContextMenu {
                     Some("y"),
                     Action::CopyMessage { scope, msg_index },
                 ));
+                items.push(MenuItem::new(
+                    "Extract Links (URLs)",
+                    Some("u"),
+                    Action::OpenLinks,
+                ));
+                items.push(MenuItem::new(
+                    "Toggle Inline Link URLs",
+                    Some("h"),
+                    Action::ToggleShowHrefs,
+                ));
                 if has_attach {
                     let attach_index = ui.attach_index.min(
                         msg.map_or(0, |m| m.attachments.len().saturating_sub(1)),
@@ -135,7 +145,8 @@ impl ContextMenu {
                 MenuItem::new("Clear Draft", None, Action::ClearComposer),
             ],
             ContextTarget::Global => vec![
-                MenuItem::new("Search", Some("Ctrl+F"), Action::OpenSearch),
+                MenuItem::new("Search", Some("/"), Action::OpenSearch),
+                MenuItem::new("Browse & Attach File", Some("Ctrl+F"), Action::OpenFilePicker),
                 MenuItem::new(
                     "New Chat",
                     Some("Ctrl+N"),

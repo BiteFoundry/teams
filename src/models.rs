@@ -325,6 +325,10 @@ pub struct DownloadedFile {
     pub path: PathBuf,
     pub file_name: String,
     pub bytes_written: u64,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub is_image: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

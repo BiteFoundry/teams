@@ -171,6 +171,7 @@ pub enum UiMsg {
     ClipboardImageEncoded {
         width: u32,
         height: u32,
+        file_name: String,
         png_bytes: Vec<u8>,
         preview: Option<RenderedTerminalImage>,
     },
@@ -298,6 +299,7 @@ pub struct UiState {
     pub show_nav_rail: bool,
     pub auto_thread_pane: bool,
     pub inline_images: bool,
+    pub show_hrefs: bool,
     pub thread_drawer_open: bool,
     pub narrow_pane: NarrowPane,
     pub editor_requested: bool,
@@ -367,6 +369,7 @@ impl UiState {
             show_nav_rail: true,
             auto_thread_pane: true,
             inline_images: true,
+            show_hrefs: false,
             thread_drawer_open: false,
             narrow_pane: NarrowPane::List,
             editor_requested: false,
@@ -2673,14 +2676,14 @@ impl AppState {
             UiMsg::ClipboardImageEncoded {
                 width: _,
                 height: _,
+                file_name,
                 png_bytes,
                 preview,
             } => {
-                let n = ui.composer.pending_images.len() + 1;
                 ui.composer.stage_inline_image_with_preview(
                     png_bytes,
                     "image/png",
-                    Some(format!("clipboard-{n}.png")),
+                    Some(file_name),
                     preview,
                 );
                 ui.set_focus(Focus::Composer);

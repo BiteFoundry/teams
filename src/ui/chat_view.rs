@@ -747,6 +747,7 @@ fn compute_chat_lines_sig(
     my_presence: Option<&PresenceStatus>,
     width: usize,
     hyperlinks: bool,
+    show_hrefs: bool,
     inline_images: bool,
     image_cache_gen: u64,
     loading_older: bool,
@@ -781,6 +782,7 @@ fn compute_chat_lines_sig(
     h.write_hash(&Local::now().date_naive());
     h.write_hash(&width);
     h.write_hash(&hyperlinks);
+    h.write_hash(&show_hrefs);
     h.write_hash(&inline_images);
     h.write_hash(&image_cache_gen);
     h.write_hash(&loading_older);
@@ -870,6 +872,7 @@ pub(crate) fn build_stream_cached(
             app.my_presence.as_ref(),
             width,
             hyperlinks,
+            ui.show_hrefs,
             ui.inline_images,
             app.image_cache_gen,
             app.loading_older,
@@ -922,6 +925,7 @@ pub(crate) fn build_stream_cached(
         width,
         thumbs,
         (thumb_cols, thumb_rows),
+        ui.show_hrefs,
     );
 
     let cached = CachedStream {
@@ -953,6 +957,7 @@ pub fn build_lines_with_hyperlinks(
         width,
         None,
         (0, 0),
+        false,
     );
     out
 }
@@ -971,6 +976,7 @@ fn build_chat_body_lines(
     width: usize,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    show_hrefs: bool,
 ) -> Vec<(usize, usize)> {
     let first_unread = find_first_unread(view.messages, unread_anchor_ts);
     let mut last_date_key: Option<String> = None;
@@ -1046,6 +1052,7 @@ fn build_chat_body_lines(
             my_presence,
             image_cache,
             thumb_dims,
+            show_hrefs,
         };
         render_message_item_with_ctx(out, msg, msg_index, &ctx);
         let end_line = out.len();
@@ -1143,6 +1150,7 @@ pub(crate) struct MessageRenderCtx<'a> {
     pub my_presence: Option<&'a PresenceStatus>,
     pub image_cache: Option<&'a HashMap<String, RenderedTerminalImage>>,
     pub thumb_dims: (u16, u16),
+    pub show_hrefs: bool,
 }
 
 /// Renders a single `MessageItem` into `RenderedLine`s. Shared by `chat_view` and `thread_view`.
@@ -1201,6 +1209,7 @@ pub fn render_message_item_with_thumbs(
         my_presence: None,
         image_cache,
         thumb_dims,
+        show_hrefs: false,
     };
     render_message_item_with_ctx(out, msg, msg_index, &ctx);
 }
@@ -1382,6 +1391,7 @@ fn render_message_cozy(
         target,
         image_cache: ctx.image_cache,
         thumb_dims: ctx.thumb_dims,
+        show_hrefs: ctx.show_hrefs,
     };
     render_message_body_and_attachments(out, msg, &body_ctx);
 
@@ -1536,6 +1546,7 @@ fn render_message_compact(
             target,
             image_cache: ctx.image_cache,
             thumb_dims: ctx.thumb_dims,
+            show_hrefs: ctx.show_hrefs,
         };
         let ended_with_plain_text = render_message_body_and_attachments(&mut content_lines, msg, &body_ctx);
         if content_lines.len() > before_body {
@@ -1685,6 +1696,7 @@ struct BodyBlockCtx<'a> {
     target: HitTarget,
     image_cache: Option<&'a HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    show_hrefs: bool,
 }
 
 /// Renders parsed `RichBlock`s + attachments + thumbnails.
@@ -1833,6 +1845,7 @@ fn render_message_body_and_attachments(
                     bctx.my_user_id,
                     bctx.my_display_name,
                     bctx.mentions,
+                    bctx.show_hrefs,
                 );
             }
         }
@@ -2118,7 +2131,18 @@ pub fn render_rich_blocks(
     _hyperlinks: bool,
 ) {
     let start = out.len();
-    render_rich_blocks_inner(out, blocks, indent, target, theme, width, "", None, &[]);
+    render_rich_blocks_inner(
+        out,
+        blocks,
+        indent,
+        target,
+        theme,
+        width,
+        "",
+        None,
+        &[],
+        false,
+    );
     if selected && out.len() > start {
         if let Some(HitTarget::Message { scope, msg_index }) = target {
             apply_selection_to_lines(&mut out[start..], scope, msg_index, width, theme, false);
@@ -2145,6 +2169,7 @@ fn render_rich_blocks_inner(
     my_user_id: &str,
     my_display_name: Option<&str>,
     mentions: &[MentionInfo],
+    show_hrefs: bool,
 ) {
     let indent_w = UnicodeWidthStr::width(indent);
     let body_w = width.saturating_sub(indent_w).max(6);
@@ -2159,8 +2184,15 @@ fn render_rich_blocks_inner(
     for block in blocks {
         match block {
             RichBlock::Paragraph(spans) => {
-                let wrapped =
-                    wrap_rich_spans(spans, body_w, theme, my_user_id, my_display_name, mentions);
+                let wrapped = wrap_rich_spans(
+                    spans,
+                    body_w,
+                    theme,
+                    my_user_id,
+                    my_display_name,
+                    mentions,
+                    show_hrefs,
+                );
                 for line_spans in wrapped {
                     let mut full = if indent.is_empty() {
                         Vec::new()
@@ -2184,6 +2216,7 @@ fn render_rich_blocks_inner(
                     my_user_id,
                     my_display_name,
                     mentions,
+                    show_hrefs,
                 );
                 for (i, line_spans) in wrapped.into_iter().enumerate() {
                     let mut full = vec![Span::styled(
@@ -2211,6 +2244,7 @@ fn render_rich_blocks_inner(
                     my_user_id,
                     my_display_name,
                     mentions,
+                    show_hrefs,
                 );
                 for line_spans in wrapped {
                     let mut full = Vec::new();
@@ -2301,6 +2335,7 @@ fn render_rich_blocks_inner(
                         my_user_id,
                         my_display_name,
                         mentions,
+                        show_hrefs,
                     );
                     for (i, line_spans) in wrapped.into_iter().enumerate() {
                         let mut full = Vec::new();
@@ -2393,8 +2428,15 @@ fn render_rich_blocks_inner(
                         Span::styled(truncate(bl, body_w.saturating_sub(2)), b_style),
                     );
                 }
-                for (label, _url) in actions {
-                    let link_label = format!("[{label}]");
+                for (label, url) in actions {
+                    let link_label = if show_hrefs
+                        && !url.trim().is_empty()
+                        && !label.contains(url.trim())
+                    {
+                        format!("[{label}] ({})", url.trim())
+                    } else {
+                        format!("[{label}]")
+                    };
                     let a_style = match card_bg {
                         Some(bg) => Style::default()
                             .fg(theme.accent)
@@ -2550,17 +2592,16 @@ fn wrap_rich_spans(
     my_user_id: &str,
     my_display_name: Option<&str>,
     mentions: &[MentionInfo],
+    show_hrefs: bool,
 ) -> Vec<Vec<Span<'static>>> {
     let limit = width.max(1);
     let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
 
-    for piece in rich {
-        let style = span_style(piece, theme, my_user_id, my_display_name, mentions);
+    let mut push_wrapped_text = |text: &str, style: Style| {
         let mut buf = String::new();
-
-        for ch in piece.text.chars() {
+        for ch in text.chars() {
             if ch == '\n' {
                 if !buf.is_empty() {
                     current.push(Span::styled(std::mem::take(&mut buf), style));
@@ -2596,6 +2637,27 @@ fn wrap_rich_spans(
         }
         if !buf.is_empty() {
             current.push(Span::styled(buf, style));
+        }
+    };
+
+    for piece in rich {
+        let style = span_style(piece, theme, my_user_id, my_display_name, mentions);
+        push_wrapped_text(&piece.text, style);
+
+        if show_hrefs {
+            if let Some(url) = piece
+                .style
+                .link_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            {
+                let label_trimmed = piece.text.trim();
+                if !label_trimmed.eq_ignore_ascii_case(url) && !label_trimmed.contains(url) {
+                    let href_suffix = format!(" ({url})");
+                    push_wrapped_text(&href_suffix, theme.muted_style());
+                }
+            }
         }
     }
 
@@ -2805,6 +2867,7 @@ mod tests {
             80,
             None,
             (0, 0),
+            false,
         );
         assert_eq!(ranges.len(), 3);
         // m1 and m2 have 0 blank lines between them (m1 ends where m2 starts)
@@ -2851,6 +2914,7 @@ mod tests {
             100,
             None,
             (0, 0),
+            false,
         );
         let joined = plain_text(&out);
         assert!(joined.contains("─── 1 unread message ───"));
@@ -2894,6 +2958,7 @@ mod tests {
             80,
             None,
             (0, 0),
+            false,
         );
         let joined = plain_text(&out);
         assert!(!joined.contains('\x1b'));
@@ -2934,6 +2999,7 @@ mod tests {
                 None,
                 None,
                 80,
+                false,
                 false,
                 true,
                 0,
@@ -2978,6 +3044,7 @@ mod tests {
             None,
             80,
             false,
+            false,
             true,
             0,
             false,
@@ -3003,6 +3070,7 @@ mod tests {
             None,
             80,
             false,
+            false,
             true,
             0,
             false,
@@ -3026,6 +3094,7 @@ mod tests {
             None,
             None,
             100,
+            false,
             false,
             true,
             0,
@@ -3051,6 +3120,7 @@ mod tests {
             None,
             None,
             80,
+            false,
             false,
             true,
             0,
@@ -3083,6 +3153,7 @@ mod tests {
             None,
             None,
             80,
+            false,
             false,
             true,
             0,
@@ -3223,6 +3294,7 @@ mod tests {
             80,
             Some(&cache),
             thumb_dims,
+            false,
         );
 
         let thumb_lines: Vec<_> = out
@@ -3243,5 +3315,61 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn show_hrefs_toggle_appends_url_next_to_labeled_links_only() {
+        let mut msg = sample_msg("m-link", None, 0);
+        msg.attachments.clear();
+        msg.reactions.clear();
+        msg.body_html = r#"<p>Read <a href="https://example.com/guide">the guide</a> and <a href="https://bare.example.com">https://bare.example.com</a>.</p>"#.into();
+        msg.body_plain = "Read the guide and https://bare.example.com.".into();
+
+        let view = ChatRender {
+            messages: std::slice::from_ref(&msg),
+            is_channel: false,
+            selected_index: None,
+        };
+        let theme = Theme::default();
+
+        let mut hidden_out = Vec::new();
+        build_chat_body_lines(
+            &mut hidden_out,
+            &view,
+            DensityMode::Cozy,
+            None,
+            "",
+            None,
+            None,
+            None,
+            &theme,
+            120,
+            None,
+            (0, 0),
+            false,
+        );
+        let hidden_text = plain_text(&hidden_out);
+        assert!(hidden_text.contains("the guide"));
+        assert!(!hidden_text.contains("(https://example.com/guide)"));
+
+        let mut shown_out = Vec::new();
+        build_chat_body_lines(
+            &mut shown_out,
+            &view,
+            DensityMode::Cozy,
+            None,
+            "",
+            None,
+            None,
+            None,
+            &theme,
+            120,
+            None,
+            (0, 0),
+            true,
+        );
+        let shown_text = plain_text(&shown_out);
+        assert!(shown_text.contains("the guide (https://example.com/guide)"));
+        assert!(!shown_text.contains("(https://bare.example.com)"));
     }
 }

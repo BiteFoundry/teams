@@ -617,6 +617,7 @@ pub async fn run_with_persona(
     let sync_ctrl = SyncController::from_channels(proxy_focus_tx, proxy_nudge_tx, false);
 
     let mut ui = UiState::from_config(&config);
+    ui.graphics_caps = crate::img_preview::probe_terminal_graphics_caps(config.image_protocol);
     ui.kitty_keyboard_supported = guard.keyboard_enhanced;
     let mut app = AppState::new(
         config.clone(),

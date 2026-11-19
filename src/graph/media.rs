@@ -330,10 +330,24 @@ impl GraphClient {
             }
         }
 
+        let abs_path = if dest_path.is_absolute() {
+            dest_path
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(&dest_path)
+        } else {
+            dest_path
+        };
+
+        let (mime_type, is_image) =
+            detect_downloaded_mime_and_image(&abs_path, &final_name, &attachment.content_type)
+                .await;
+
         Ok(DownloadedFile {
-            path: dest_path,
+            path: abs_path,
             file_name: final_name,
             bytes_written,
+            mime_type,
+            is_image,
         })
     }
 
@@ -587,6 +601,86 @@ async fn maybe_refine_hosted_image_extension(
     Some((target_path, target_name))
 }
 
+async fn detect_downloaded_mime_and_image(
+    path: &Path,
+    file_name: &str,
+    declared_content_type: &str,
+) -> (String, bool) {
+    let mut header = [0u8; 16];
+    let n = match tokio::fs::File::open(path).await {
+        Ok(mut f) => {
+            let mut read = 0usize;
+            while read < header.len() {
+                match f.read(&mut header[read..]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(chunk) => read += chunk,
+                }
+            }
+            read
+        }
+        Err(_) => 0,
+    };
+
+    if n >= 3 {
+        if let Ok(fmt) = image::guess_format(&header[..n]) {
+            let mime = match fmt {
+                image::ImageFormat::Png => Some("image/png"),
+                image::ImageFormat::Jpeg => Some("image/jpeg"),
+                image::ImageFormat::Gif => Some("image/gif"),
+                image::ImageFormat::WebP => Some("image/webp"),
+                _ => None,
+            };
+            if let Some(m) = mime {
+                return (m.to_string(), true);
+            }
+        }
+    }
+
+    let declared = declared_content_type.trim().to_ascii_lowercase();
+    let mime = if declared.contains('/')
+        && !declared.eq_ignore_ascii_case("application/octet-stream")
+    {
+        declared
+    } else {
+        mime_from_extension(file_name).to_string()
+    };
+
+    let is_image = mime.starts_with("image/")
+        || crate::img_preview::is_image_mime_or_name(&mime, Some(file_name));
+    (mime, is_image)
+}
+
+pub(crate) fn mime_from_extension(file_name: &str) -> &'static str {
+    let ext = Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "log") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        Some("html" | "htm") => "text/html",
+        Some("xml") => "application/xml",
+        Some("zip") => "application/zip",
+        Some("gz" | "tgz") => "application/gzip",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("mp4") => "video/mp4",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,8 +841,11 @@ mod tests {
             thumbnail_url: None,
         };
         let dl = client.download_attachment(&att, dir.path()).await.unwrap();
+        assert!(dl.path.is_absolute());
         assert_eq!(std::fs::read(&dl.path).unwrap(), b"external-payload-ok");
         assert_eq!(dl.bytes_written, 19);
+        assert_eq!(dl.mime_type, "text/plain");
+        assert!(!dl.is_image);
         assert_eq!(*saw_ext_auth.lock().unwrap(), None);
 
         // 2. 403 on /shares must NOT be swallowed or fall back to content_url

@@ -1,7 +1,8 @@
 //! Central `Action` enum and single `dispatch(action, app, ui) -> bool` reducer.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use ratatui::layout::Position;
@@ -15,6 +16,7 @@ use super::hitmap::{ButtonId, HitTarget, MessageScope};
 use super::nav_pane::{self, NavRow, TAB_CHATS, TAB_COUNT};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
 use super::overlays::image_preview::ImagePreviewOverlay;
+use super::overlays::links::{self, LinksOverlay};
 use super::overlays::search::SearchOverlay;
 use super::overlays::{Overlay, OverlayKind, OverlayOutcome};
 
@@ -177,12 +179,19 @@ pub enum Action {
     },
     DownloadLatest,
     OpenSendFile,
+    OpenFilePicker,
+    AttachPickedFile(String),
     SendAttachmentPath {
         path: String,
         caption: String,
     },
     AttachmentNext,
     AttachmentPrev,
+
+    // Links & href visibility
+    OpenLinks,
+    OpenUrl(String),
+    ToggleShowHrefs,
 
     // Search, sync & history
     Search(String),
@@ -956,6 +965,16 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenSendFile => {
             open_overlay(OverlayKind::PathInput, app, ui);
         }
+        Action::OpenFilePicker => {
+            open_overlay(OverlayKind::FilePicker, app, ui);
+        }
+        Action::AttachPickedFile(path) => {
+            let caption = ui.composer.text().trim().to_string();
+            if !caption.is_empty() {
+                app.clear_current_draft(ui);
+            }
+            app.send_file(ui, path, caption);
+        }
         Action::SendAttachmentPath { path, caption } => {
             app.send_file(ui, path, caption);
         }
@@ -964,6 +983,23 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::AttachmentPrev => {
             ui.attach_index = ui.attach_index.saturating_sub(1);
+        }
+
+        // Links & href visibility
+        Action::OpenLinks => {
+            open_links_overlay(app, ui);
+        }
+        Action::OpenUrl(url) => match open::that_detached(&url) {
+            Ok(()) => ui.info(format!("Opened link: {url}")),
+            Err(err) => ui.error(format!("Failed to open link: {err}")),
+        },
+        Action::ToggleShowHrefs => {
+            ui.show_hrefs = !ui.show_hrefs;
+            ui.info(if ui.show_hrefs {
+                "Link URLs (href): Shown"
+            } else {
+                "Link URLs (href): Hidden"
+            });
         }
 
         // Search, sync & history
@@ -1230,6 +1266,11 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
         }
         OverlayKind::Attachments => Overlay::attachments(),
         OverlayKind::PathInput => Overlay::path_input(),
+        OverlayKind::FilePicker => Overlay::file_picker(),
+        OverlayKind::Links => {
+            open_links_overlay(app, ui);
+            return;
+        }
         OverlayKind::NewChat => Overlay::new_chat(),
         OverlayKind::RoomInfo => Overlay::room_info(),
         OverlayKind::ImagePreview => {
@@ -1312,6 +1353,40 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
     };
 
     push_image_preview(preview, app, ui);
+}
+
+fn open_links_overlay(app: &AppState, ui: &mut UiState) {
+    let in_thread_context =
+        ui.focus() == Focus::Thread || (ui.composer_target_thread && ui.thread_drawer_open);
+
+    let (extracted, source_label) = if in_thread_context {
+        let mut found = selected_thread_scope_and_index(app, ui)
+            .and_then(|(scope, idx)| app.message_at(scope, idx))
+            .map(|msg| (links::extract_links_from_message(msg), msg.author_name.clone()))
+            .unwrap_or_else(|| (Vec::new(), String::new()));
+        if found.0.is_empty() {
+            if let Some(ref thread) = app.active_thread {
+                let mut msgs = Vec::with_capacity(1 + thread.replies.len());
+                msgs.push(&thread.root);
+                msgs.extend(thread.replies.iter());
+                found = (links::extract_links_from_messages(&msgs), "Thread".to_string());
+            }
+        }
+        found
+    } else {
+        selected_message_scope_and_index(app, ui)
+            .and_then(|(scope, idx)| app.message_at(scope, idx))
+            .map(|msg| (links::extract_links_from_message(msg), msg.author_name.clone()))
+            .unwrap_or_else(|| (Vec::new(), String::new()))
+    };
+
+    if extracted.is_empty() {
+        ui.info("No links found in focused message");
+        return;
+    }
+
+    ui.close_overlays_of(OverlayKind::Links);
+    ui.push_overlay(Overlay::links(LinksOverlay::new(extracted, source_label)));
 }
 
 fn cycle_focus(app: &AppState, ui: &mut UiState, forward: bool) {
@@ -1977,8 +2052,122 @@ fn paste_text_into_ui(text: String, app: &mut AppState, ui: &mut UiState) {
     ui.composer.reference_mentions(&app.members);
 }
 
+pub(crate) fn save_pasted_png_in_dir(
+    dir: &Path,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    unix_ms: u128,
+) -> Result<(PathBuf, Vec<u8>), String> {
+    let png_bytes = composer::encode_rgba_to_png(width, height, rgba)?;
+    let file_name = format!("teams-pasted-{unix_ms}.png");
+    let path = dir.join(&file_name);
+    std::fs::write(&path, &png_bytes)
+        .map_err(|err| format!("Failed to write {}: {err}", path.display()))?;
+    Ok((path, png_bytes))
+}
+
+fn current_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
+    let in_overlay = !ui.overlays.is_empty();
     let mut arboard_opened = false;
+
+    // In the composer, check clipboard image data first so pasted screenshots/images always attach cleanly.
+    if !in_overlay {
+        let img_res = with_clipboard(|cb| {
+            arboard_opened = true;
+            cb.get_image()
+        });
+        if let Ok(img) = img_res {
+            let width = img.width as u32;
+            let height = img.height as u32;
+            let rgba = img.bytes.into_owned();
+            let unix_ms = current_unix_ms();
+            let temp_dir = std::env::temp_dir();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let task_label = format!("Paste image ({width}x{height})");
+                ui.tasks.begin(task_label.clone());
+                ui.set_focus(Focus::Composer);
+                ui.info(format!("Encoding clipboard image ({width}x{height})…"));
+                let tx = app.ui_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    match save_pasted_png_in_dir(&temp_dir, width, height, rgba, unix_ms) {
+                        Ok((saved_path, png_bytes)) => {
+                            let file_name = saved_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("teams-pasted.png")
+                                .to_string();
+                            let preview = crate::img_preview::decode_and_render_halfblocks(
+                                &png_bytes,
+                                24,
+                                5,
+                                (20, 22, 26),
+                            )
+                            .ok();
+                            let toast_msg = format!(
+                                "Attached clipboard image: {} ({width}x{height})",
+                                saved_path.display()
+                            );
+                            let _ = tx.send(super::app::UiMsg::ClipboardImageEncoded {
+                                width,
+                                height,
+                                file_name,
+                                png_bytes,
+                                preview,
+                            });
+                            let _ = tx.send(super::app::UiMsg::TaskDone {
+                                label: task_label,
+                                error: None,
+                                toast: Some((toast_msg, super::toast::ToastKind::Info)),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(super::app::UiMsg::TaskDone {
+                                label: task_label,
+                                error: Some(err.clone()),
+                                toast: Some((
+                                    format!("Image encoding failed: {err}"),
+                                    super::toast::ToastKind::Error,
+                                )),
+                            });
+                        }
+                    }
+                });
+            } else {
+                match save_pasted_png_in_dir(&temp_dir, width, height, rgba, unix_ms) {
+                    Ok((saved_path, png_bytes)) => {
+                        let file_name = saved_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("teams-pasted.png")
+                            .to_string();
+                        ui.composer.stage_inline_image(
+                            png_bytes,
+                            "image/png",
+                            Some(file_name),
+                        );
+                        ui.set_focus(Focus::Composer);
+                        ui.info(format!(
+                            "Attached clipboard image: {} ({width}x{height})",
+                            saved_path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        ui.error(format!("Image encoding failed: {err}"));
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     if let Ok(text) = with_clipboard(|cb| {
         arboard_opened = true;
         cb.get_text()
@@ -2001,73 +2190,6 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
 
     if !arboard_opened {
         ui.info("Unable to open clipboard");
-        return;
-    }
-
-    if let Ok(img) = with_clipboard(|cb| cb.get_image()) {
-        let width = img.width as u32;
-        let height = img.height as u32;
-        let rgba = img.bytes.into_owned();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            let task_label = format!("Paste image ({width}x{height})");
-            ui.tasks.begin(task_label.clone());
-            ui.set_focus(Focus::Composer);
-            ui.info(format!("Encoding clipboard image ({width}x{height})…"));
-            let tx = app.ui_tx.clone();
-            tokio::task::spawn_blocking(move || {
-                match composer::encode_rgba_to_png(width, height, rgba) {
-                    Ok(png_bytes) => {
-                        let preview = crate::img_preview::decode_and_render_halfblocks(
-                            &png_bytes,
-                            24,
-                            5,
-                            (20, 22, 26),
-                        )
-                        .ok();
-                        let _ = tx.send(super::app::UiMsg::ClipboardImageEncoded {
-                            width,
-                            height,
-                            png_bytes,
-                            preview,
-                        });
-                        let _ = tx.send(super::app::UiMsg::TaskDone {
-                            label: task_label,
-                            error: None,
-                            toast: Some((
-                                format!("Attached clipboard image ({width}x{height})"),
-                                super::toast::ToastKind::Info,
-                            )),
-                        });
-                    }
-                    Err(err) => {
-                        let _ = tx.send(super::app::UiMsg::TaskDone {
-                            label: task_label,
-                            error: Some(err.clone()),
-                            toast: Some((
-                                format!("Image encoding failed: {err}"),
-                                super::toast::ToastKind::Error,
-                            )),
-                        });
-                    }
-                }
-            });
-        } else {
-            match composer::encode_rgba_to_png(width, height, rgba) {
-                Ok(png_bytes) => {
-                    let n = ui.composer.pending_images.len() + 1;
-                    ui.composer.stage_inline_image(
-                        png_bytes,
-                        "image/png",
-                        Some(format!("clipboard-{n}.png")),
-                    );
-                    ui.set_focus(Focus::Composer);
-                    ui.info(format!("Attached clipboard image ({width}x{height})"));
-                }
-                Err(err) => {
-                    ui.error(format!("Image encoding failed: {err}"));
-                }
-            }
-        }
     }
 }
 
@@ -2608,5 +2730,67 @@ mod tests {
             true,
         );
         assert_eq!(action, Some(Action::OpenImagePreview));
+    }
+
+    #[test]
+    fn save_pasted_png_in_dir_writes_valid_png_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
+        let (path, png_bytes) =
+            save_pasted_png_in_dir(dir.path(), 2, 2, rgba, 1_700_000_000_123).unwrap();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("teams-pasted-1700000000123.png")
+        );
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), png_bytes);
+        let decoded = image::load_from_memory(&png_bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn toggle_show_hrefs_and_open_links_dispatch() {
+        let (mut app, mut ui) = test_app_and_ui();
+        assert!(!ui.show_hrefs);
+        assert!(!dispatch(Action::ToggleShowHrefs, &mut app, &mut ui));
+        assert!(ui.show_hrefs);
+        assert!(!dispatch(Action::ToggleShowHrefs, &mut app, &mut ui));
+        assert!(!ui.show_hrefs);
+
+        app.messages.push(crate::models::MessageItem {
+            msg_key: "chat:c1|m-links".to_string(),
+            conv_key: "chat:c1".to_string(),
+            msg_id: "m-links".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-18T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: r#"<p>Check <a href="https://example.com/pr/42">PR #42</a></p>"#.to_string(),
+            body_plain: "Check PR #42".to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        });
+        ui.set_focus(Focus::Chat);
+        ui.chat_scroll.selected_idx = Some(0);
+
+        assert!(!dispatch(Action::OpenLinks, &mut app, &mut ui));
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::Links(l)) if l.links.len() == 1 && l.links[0].url == "https://example.com/pr/42"
+        ));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 }

@@ -580,7 +580,10 @@ async fn call_tool(
                 "ok": true,
                 "path": downloaded.path,
                 "file_name": downloaded.file_name,
+                "mime_type": downloaded.mime_type,
+                "size_bytes": downloaded.bytes_written,
                 "bytes_written": downloaded.bytes_written,
+                "is_image": downloaded.is_image,
             }))
         }
 
@@ -1015,15 +1018,15 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "download_attachment",
-            "description": "Download an attachment from a message to disk.",
+            "description": "Download a file attachment or inline Teams screenshot (hostedContents) from a message to local disk. Returns structured JSON { ok, path (absolute), file_name, mime_type, size_bytes, is_image } so multimodal agents can inspect images and files directly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "index": { "type": "integer", "minimum": 0, "default": 0 },
-                    "out_dir": { "type": "string" },
-                    "thread_root_id": { "type": "string" }
+                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
+                    "msg_id": { "type": "string", "minLength": 1, "description": "Message ID containing the attachment or inline image." },
+                    "index": { "type": "integer", "minimum": 0, "default": 0, "description": "0-based index into the message's attachments/hosted images." },
+                    "out_dir": { "type": "string", "description": "Optional output directory (defaults to configured downloads folder)." },
+                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID when msg_id is a thread reply." }
                 },
                 "required": ["target", "msg_id"],
                 "additionalProperties": false
@@ -2068,7 +2071,11 @@ mod tests {
                 .unwrap();
         assert_eq!(dl_payload["ok"], true);
         assert_eq!(dl_payload["bytes_written"], png_bytes.len());
+        assert_eq!(dl_payload["size_bytes"], png_bytes.len());
+        assert_eq!(dl_payload["mime_type"], "image/png");
+        assert_eq!(dl_payload["is_image"], true);
         let saved_path = dl_payload["path"].as_str().unwrap();
+        assert!(std::path::Path::new(saved_path).is_absolute());
         assert_eq!(std::fs::read(saved_path).unwrap(), png_bytes);
 
         mock_server.abort();

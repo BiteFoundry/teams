@@ -47,6 +47,7 @@ fn compute_thread_sig(
     my_presence: Option<&PresenceStatus>,
     image_cache_gen: u64,
     inline_images: bool,
+    show_hrefs: bool,
     theme: &Theme,
     width: usize,
 ) -> (u64, u64) {
@@ -88,6 +89,7 @@ fn compute_thread_sig(
         h.write_hash(&0u8);
     }
     h.write_hash(&inline_images);
+    h.write_hash(&show_hrefs);
     h.write_hash(&image_cache_gen);
     h.write_hash(&width);
     hash_theme_sig(&mut h, theme);
@@ -162,6 +164,7 @@ pub fn draw(
         thumbs,
         app.image_cache_gen,
         (thumb_cols, thumb_rows),
+        ui.show_hrefs,
         &ui.theme,
         width,
     );
@@ -373,6 +376,7 @@ pub fn build_thread_lines(
         None,
         0,
         (0, 0),
+        false,
         theme,
         width,
     );
@@ -401,6 +405,7 @@ fn build_thread_stream_cached(
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     image_cache_gen: u64,
     thumb_dims: (u16, u16),
+    show_hrefs: bool,
     theme: &Theme,
     width: usize,
 ) -> CachedStream {
@@ -414,6 +419,7 @@ fn build_thread_stream_cached(
         my_presence,
         image_cache_gen,
         image_cache.is_some(),
+        show_hrefs,
         theme,
         width,
     );
@@ -431,6 +437,7 @@ fn build_thread_stream_cached(
         my_presence,
         image_cache,
         thumb_dims,
+        show_hrefs,
         theme,
         width,
     );
@@ -454,6 +461,7 @@ fn build_thread_lines_uncached(
     my_presence: Option<&PresenceStatus>,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    show_hrefs: bool,
     theme: &Theme,
     width: usize,
 ) -> (Vec<RenderedLine>, Vec<(usize, usize)>) {
@@ -475,6 +483,7 @@ fn build_thread_lines_uncached(
         my_presence,
         image_cache,
         thumb_dims,
+        show_hrefs,
     };
     render_message_item_with_ctx(&mut out, &thread.root, 0, &root_ctx);
     let root_end = out.len();
@@ -519,6 +528,7 @@ fn build_thread_lines_uncached(
                 my_presence,
                 image_cache,
                 thumb_dims,
+                show_hrefs,
             };
             render_message_item_with_ctx(&mut out, reply, i, &reply_ctx);
             let reply_end = out.len();
@@ -621,6 +631,7 @@ mod tests {
             None,
             None,
             (0, 0),
+            false,
             &theme,
             80,
         );
@@ -641,6 +652,7 @@ mod tests {
             None,
             None,
             (0, 0),
+            false,
             &theme,
             80,
         );
