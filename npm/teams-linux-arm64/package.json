@@ -1,10 +1,10 @@
 {
-  "name": "@shinick/teams-linux-arm64",
-  "version": "0.7.4",
+  "name": "@bitefoundry/teams-linux-arm64",
+  "version": "0.1.0",
   "description": "Prebuilt teams binary for Linux arm64 (glibc)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shinick-dev/teams.git",
+    "url": "git+https://github.com/BiteFoundry/teams.git",
     "directory": "npm/teams-linux-arm64"
   },
   "license": "MIT",

@@ -4,7 +4,7 @@
 
 **Blazing-fast Microsoft Teams terminal client & AI agent toolkit — CLI, TUI, HTTP API, and MCP in one native Rust binary.**
 
-[![npm version](https://img.shields.io/npm/v/%40shinick%2Fteams?color=7aa2f7&label=%40shinick%2Fteams&logo=npm)](https://www.npmjs.com/package/@shinick/teams)
+[![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fteams?color=7aa2f7&label=%40bitefoundry%2Fteams&logo=npm)](https://www.npmjs.com/package/@bitefoundry/teams)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
@@ -32,7 +32,7 @@
 
 ```bash
 # 1. Install globally via npm (links prebuilt native binary, zero Node runtime overhead)
-npm i -g @shinick/teams
+npm i -g @bitefoundry/teams
 
 # 2. Authenticate with Microsoft Entra ID (PKCE browser login, or --device-code for SSH/headless)
 teams login
@@ -41,7 +41,7 @@ teams login
 teams
 ```
 
-> **Alternative installs:** Run one-off with `npx @shinick/teams`, download prebuilt binaries from [GitHub Releases](https://github.com/shinick-dev/teams/releases), or build from source with `cargo build --release` (Rust 1.80+, zero external OpenSSL/SQLite deps). Self-update anytime with `teams update`.
+> **Alternative installs:** Run one-off with `npx @bitefoundry/teams`, download prebuilt binaries from [GitHub Releases](https://github.com/BiteFoundry/teams/releases), or build from source with `cargo build --release` (Rust 1.80+, zero external OpenSSL/SQLite deps). Self-update anytime with `teams update`.
 >
 > **External Token Brokers & Custom Entra ID Apps:** Supports `TEAMS_ACCESS_TOKEN`, `TEAMS_TOKEN_FILE`, `TEAMS_TOKEN_REFRESH_CMD` (including `az account get-access-token`), and custom `--client-id` / `--tenant-id`. Run `teams whoami` or `teams doctor --probe` for instant JWT scope diagnostics.
 
@@ -125,16 +125,16 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 
 ---
 
-## `@shinick` Enterprise Terminal Suite
+## `@bitefoundry` Enterprise Terminal Suite
 
 | Package | Command | Domain | Interfaces |
 | --- | --- | --- | --- |
-| **`@shinick/teams`** *(this repo)* | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
-| [`@shinick/outlook`](https://github.com/shinick-dev/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
-| [`@shinick/onenote`](https://github.com/shinick-dev/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
-| [`@shinick/sharepoint`](https://github.com/shinick-dev/sharepoint) | `sharepoint` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
-| [`@shinick/atlassian`](https://github.com/shinick-dev/atlassian) | `atlassian` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
-| [`@shinick/notion`](https://github.com/shinick-dev/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| **`@bitefoundry/teams`** *(this repo)* | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/outlook`](https://github.com/BiteFoundry/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
 
 ---
 

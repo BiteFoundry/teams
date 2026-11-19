@@ -1,27 +1,27 @@
 # npm distribution
 
-`@shinick/teams` is distributed on npm as a small JavaScript launcher plus one
+`@bitefoundry/teams` is distributed on npm as a small JavaScript launcher plus one
 optional dependency per platform. The launcher resolves the prebuilt Rust binary
 and execs it directly (with `scripts/postinstall.mjs` linking the native binary
 into `bin/` and Windows shims for zero-Node-startup execution), so there is no
 compiler, Node native addon, or network download during install.
 
 The Rust crate is named `teams-cli` and produces the pure **Microsoft Teams**
-binary (`teams` / `teams.exe`). The npm package is scoped as `@shinick/teams`
+binary (`teams` / `teams.exe`). The npm package is scoped as `@bitefoundry/teams`
 and installs the **`teams`** command.
 
 ## Install and run
 
 ```sh
 # one-off
-npx @shinick/teams --version
+npx @bitefoundry/teams --version
 
 # global install (installs `teams`)
-npm install -g @shinick/teams
+npm install -g @bitefoundry/teams
 teams --version
 
 # project-local
-npm install @shinick/teams
+npm install @bitefoundry/teams
 npx teams chats
 ```
 
@@ -44,20 +44,20 @@ or run with zero Graph round-trips while the daemon is warm:
 
 | npm package                   | OS      | CPU   | Rust target                         |
 | ----------------------------- | ------- | ----- | ----------------------------------- |
-| `@shinick/teams-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
-| `@shinick/teams-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
-| `@shinick/teams-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
-| `@shinick/teams-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
-| `@shinick/teams-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
-| `@shinick/teams-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
+| `@bitefoundry/teams-win32-x64`    | Windows | x64   | `x86_64-pc-windows-msvc`            |
+| `@bitefoundry/teams-win32-arm64`  | Windows | arm64 | `aarch64-pc-windows-msvc`           |
+| `@bitefoundry/teams-darwin-x64`   | macOS   | x64   | `x86_64-apple-darwin`               |
+| `@bitefoundry/teams-darwin-arm64` | macOS   | arm64 | `aarch64-apple-darwin`              |
+| `@bitefoundry/teams-linux-x64`    | Linux   | x64   | `x86_64-unknown-linux-gnu` (2.28)   |
+| `@bitefoundry/teams-linux-arm64`  | Linux   | arm64 | `aarch64-unknown-linux-gnu` (2.28)  |
 
 Linux packages are cross-compiled in CI with `cargo-zigbuild` against **GLIBC 2.28** (`*.2.28`) and verified with `scripts/verify-glibc.mjs` plus an `almalinux:8` container smoke test, so prebuilt binaries run out of the box on **AlmaLinux 8 / RHEL 8+ / Rocky Linux 8+ / Ubuntu 20.04+ / Debian 10+**. Older glibc distributions (e.g., CentOS 7 with `GLIBC < 2.28`) and Alpine/musl Linux should build from source with Cargo (`cargo build --release`).
 
 ## How resolution works
 
-`bin/teams.js` looks up `@shinick/teams-<platform>-<arch>` through
+`bin/teams.js` looks up `@bitefoundry/teams-<platform>-<arch>` through
 `require.resolve`, then executes
-`node_modules/@shinick/teams-<platform>-<arch>/bin/teams` (or `teams.exe` on
+`node_modules/@bitefoundry/teams-<platform>-<arch>/bin/teams` (or `teams.exe` on
 Windows) with `stdio: 'inherit'`. On `npm install`, `scripts/postinstall.mjs`
 additionally replaces `bin/teams.js` (Unix) or rewrites `.bin/teams[.cmd|.ps1]`
 (Windows) to invoke the native Rust executable directly without spawning Node.
@@ -69,7 +69,7 @@ platforms and the `--include=optional` hint instead of a stack trace.
 ## Layout
 
 ```
-package.json                  # @shinick/teams launcher package (bin: teams)
+package.json                  # @bitefoundry/teams launcher package (bin: teams)
 bin/teams.js                  # teams launcher
 scripts/postinstall.mjs       # zero-Node native binary linker on npm install
 teams / teams.cmd             # repo-local Teams launchers
@@ -102,8 +102,8 @@ version because the root package pins its platform packages exactly.
 Tag the release with a matching `v` prefix:
 
 ```sh
-git tag v0.7.3
-git push origin v0.7.3
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Publishing
@@ -112,7 +112,7 @@ Publishing is automated by `.github/workflows/release.yml`, which is triggered
 by pushing a `v*` tag (or manually via `workflow_dispatch`).
 
 1. Add a repository secret `NPM_TOKEN` (an npm automation token with publish
-   rights for the `@shinick/teams` packages).
+   rights for the `@bitefoundry/teams` packages).
 2. Bump the version in `Cargo.toml`, run `node scripts/sync-version.mjs`,
    commit, and push `v<version>`.
 3. The workflow builds six targets, stages binaries into the platform
@@ -208,8 +208,8 @@ token_refresh_mins = 5
 
 - **`no prebuilt binary found for <platform>-<arch>`** — the optional
   dependency was skipped. Reinstall with
-  `npm install -g @shinick/teams --include=optional` or
-  `npm install @shinick/teams --include=optional`. Check that your npm config
+  `npm install -g @bitefoundry/teams --include=optional` or
+  `npm install @bitefoundry/teams --include=optional`. Check that your npm config
   does not set `omit=optional`.
 - **`EBADPLATFORM` / package skipped** — npm installs only the matching
   `os`/`cpu` package. Cross-installing (for example x64 Node on ARM Windows via
@@ -219,11 +219,11 @@ token_refresh_mins = 5
 - **macOS Gatekeeper** — npm-installed binaries are not notarized. If macOS
   blocks execution, allow the binary in System Settings → Privacy & Security, or
   build from source.
-- **Corporate proxy/firewall** — `npx @shinick/teams` performs a registry
+- **Corporate proxy/firewall** — `npx @bitefoundry/teams` performs a registry
   download each time unless cached; use a global install for offline-friendly
   use.
 - **Verify the binary** —
-  `node -p "require.resolve('@shinick/teams-win32-x64/package.json')"`
+  `node -p "require.resolve('@bitefoundry/teams-win32-x64/package.json')"`
   (adjust for your platform) shows which platform package npm selected.
 - **Tag push did not publish** — check the publish job log; a tag/version
   mismatch or a missing `NPM_TOKEN` fails the job before any publish.

@@ -7,9 +7,9 @@ if exist "%ROOT%target\release\teams.exe" goto run
 
 where gh >nul 2>nul
 if %errorlevel% equ 0 (
-    echo [teams] downloading prebuilt binary from GitHub Release ^(shinick-dev/teams^)... >&2
+    echo [teams] downloading prebuilt binary from GitHub Release ^(BiteFoundry/teams^)... >&2
     if not exist "%ROOT%target\release" mkdir "%ROOT%target\release"
-    gh release download -R shinick-dev/teams --pattern "teams.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
+    gh release download -R BiteFoundry/teams --pattern "teams.exe" --dir "%ROOT%target\release" --clobber >nul 2>&1
     if exist "%ROOT%target\release\teams.exe" goto run
 )
 

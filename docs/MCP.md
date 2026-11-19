@@ -6,7 +6,7 @@
 
 1. Build or install the `teams` binary:
    ```bash
-   npm install -g @shinick/teams
+   npm install -g @bitefoundry/teams
    # or from source:
    cargo build --release
    ```
@@ -78,7 +78,7 @@ args = ["mcp"]
 
 - **Transport**: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (one JSON object per line, no `Content-Length` headers; maximum `8 MiB` per request line).
 - **Supported `protocolVersion`s**: `2024-11-05`, `2025-03-26`, `2025-06-18` (unknown versions fall back to `2025-06-18`).
-- **`serverInfo`**: `{ "name": "teams", "version": "0.7.3" }` (matches `CARGO_PKG_VERSION`).
+- **`serverInfo`**: `{ "name": "teams", "version": "0.1.0" }` (matches `CARGO_PKG_VERSION`).
 - **Startup**: `initialize` responds immediately; on an empty cache, initial conversation bootstrap runs asynchronously in the background.
 - **Notifications**: requests without `id` or methods starting with `notifications/` (such as `notifications/initialized`) emit no response.
 - **`ping`**: returns `{}`.

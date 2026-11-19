@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: teams HTTP JSON API
-  version: 0.7.3
+  version: 0.1.0
   description: |
     Local HTTP/JSON contract exposed by `teams serve` (alias `api`).
 

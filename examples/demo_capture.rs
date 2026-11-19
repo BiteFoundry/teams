@@ -996,7 +996,7 @@ async fn main() {
 
     let spec = json!({
         "title": "teams — Acme Engineering",
-        "badge": "@shinick/teams v0.7.4",
+        "badge": "@bitefoundry/teams v0.1.0",
         "width": WIDTH,
         "height": HEIGHT,
         "bg": [20, 22, 32],

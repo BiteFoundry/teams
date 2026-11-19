@@ -1965,11 +1965,11 @@ async fn e2e_inline_image_preview_and_self_updater() {
 
     let gh_app = Router::new()
         .route(
-            "/repos/shinick-dev/teams/releases/latest",
+            "/repos/BiteFoundry/teams/releases/latest",
             get(|State(st): State<MockGhState>| async move {
                 Json(json!({
                     "tag_name": "v9.9.9",
-                    "html_url": format!("{}/shinick-dev/teams/releases/tag/v9.9.9", st.base_url),
+                    "html_url": format!("{}/BiteFoundry/teams/releases/tag/v9.9.9", st.base_url),
                     "assets": [
                         {
                             "name": st.asset_name,
@@ -2013,7 +2013,7 @@ async fn e2e_inline_image_preview_and_self_updater() {
 
     let result = updater::check_or_apply_update_with_api_base(
         &gh_base,
-        "shinick-dev/teams",
+        "BiteFoundry/teams",
         true,
         false,
     )

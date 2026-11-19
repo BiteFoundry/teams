@@ -20,7 +20,7 @@ pub const DEFAULT_AUTH_BASE_URL: &str = "https://login.microsoftonline.com";
 /// Users can always override via `--client-id`, `TEAMS_CLIENT_ID`, `AZURE_CLIENT_ID`, or `config.toml`.
 pub const DEFAULT_PUBLIC_CLIENT_ID: &str = "14d82eec-204b-4c2f-b7e8-296a70dab67e";
 pub const DEFAULT_TENANT_ID: &str = "common";
-pub const DEFAULT_GITHUB_REPO: &str = "shinick-dev/teams";
+pub const DEFAULT_GITHUB_REPO: &str = "BiteFoundry/teams";
 
 /// Message stream density mode in TUI (`Cozy` grouped default vs `Compact` single-line gutter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]

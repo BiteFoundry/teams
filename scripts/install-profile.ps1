@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Ensures <RepoRoot>\target\release\teams.exe exists (downloads the prebuilt
-       release binary from GitHub `shinick-dev/teams` via `gh` when missing, so
+       release binary from GitHub `BiteFoundry/teams` via `gh` when missing, so
        Rust/Cargo is NOT required on target PCs).
     2. Registers/updates `# >>> teams launcher >>>` (`function teams`) in PowerShell $PROFILE.
     3. If $HOME\Tools\bin exists, also writes `teams.cmd` there so already-open shells
@@ -37,9 +37,9 @@ $releaseExe = Join-Path $releaseDir 'teams.exe'
 if (-not (Test-Path -LiteralPath $releaseExe)) {
     $gh = Get-Command gh -ErrorAction SilentlyContinue
     if ($gh) {
-        Write-Output "[teams] Downloading prebuilt teams.exe from shinick-dev/teams GitHub Release..."
+        Write-Output "[teams] Downloading prebuilt teams.exe from BiteFoundry/teams GitHub Release..."
         New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-        & $gh.Source release download -R 'shinick-dev/teams' --pattern 'teams.exe' --dir $releaseDir --clobber
+        & $gh.Source release download -R 'BiteFoundry/teams' --pattern 'teams.exe' --dir $releaseDir --clobber
     }
 }
 
@@ -57,7 +57,7 @@ function teams {
         if (Get-Command gh -ErrorAction SilentlyContinue) {
             `$relDir = Split-Path -Parent `$exe
             New-Item -ItemType Directory -Force -Path `$relDir | Out-Null
-            gh release download -R 'shinick-dev/teams' --pattern 'teams.exe' --dir `$relDir --clobber 2>`$null
+            gh release download -R 'BiteFoundry/teams' --pattern 'teams.exe' --dir `$relDir --clobber 2>`$null
         }
     }
     if (-not (Test-Path -LiteralPath `$exe)) {
