@@ -18,7 +18,7 @@ use crate::img_preview::{self, RenderedTerminalImage, TerminalGraphicsCaps, Term
 use crate::models::{
     AttachmentInfo, ChannelSummary, ConversationKind, ConversationSummary, ConversationTarget,
     CoreEvent, DownloadedFile, MemberInfo, MessageItem, NotificationCandidate, OutgoingMessage,
-    PresenceStatus, QuotedReply, ReactionSummary, SearchHit, SyncCursor, TeamSummary, ThreadView,
+    PresenceStatus, QuotedReply, SearchHit, SyncCursor, TeamSummary, ThreadView,
     UpdateCheckResult, UserProfile,
 };
 use crate::parser;
@@ -556,6 +556,8 @@ pub struct AppState {
     pub image_raw_bytes: usize,
     /// Lazy localhost Axum server for viewing HTML documents in the default browser (`0 MB` idle).
     pub html_server: bitefoundry_html::NativeHtmlServer,
+    /// `(conv_key, read_at_rfc3339)` last marked read while active, guarding against stale Lane 2 unread flips.
+    pub active_marked_read_at: Option<(String, String)>,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
 }
 
@@ -621,6 +623,7 @@ impl AppState {
             image_raw_order: VecDeque::new(),
             image_raw_bytes: 0,
             html_server: bitefoundry_html::NativeHtmlServer::new(),
+            active_marked_read_at: None,
             ui_tx,
         }
     }
@@ -1066,6 +1069,7 @@ impl AppState {
         self.focus_conversation_pane(ui);
 
         let now_ts = Utc::now().to_rfc3339();
+        self.active_marked_read_at = Some((new_key.clone(), now_ts.clone()));
         if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == new_key) {
             conv.unread_count = 0;
             conv.last_read_at = Some(now_ts.clone());
@@ -1344,18 +1348,23 @@ impl AppState {
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match graph
-                .list_thread_replies(&team_id, &channel_id, &root_msg_id, 200)
+                .get_thread(&team_id, &channel_id, &root_msg_id, 200)
                 .await
             {
-                Ok(replies) => {
+                Ok(fetched_thread) => {
                     let db_storage = storage.clone();
                     let db_conv = conv_key.clone();
                     let db_root = root_msg_id.clone();
                     let thread_opt = tokio::task::spawn_blocking(move || {
-                        if !replies.is_empty() {
-                            let _ = db_storage.upsert_messages(&replies);
-                        }
-                        db_storage.get_thread(&db_conv, &db_root, 200).ok().flatten()
+                        let mut all = Vec::with_capacity(1 + fetched_thread.replies.len());
+                        all.push(fetched_thread.root.clone());
+                        all.extend(fetched_thread.replies.iter().cloned());
+                        let _ = db_storage.upsert_messages(&all);
+                        db_storage
+                            .get_thread(&db_conv, &db_root, 200)
+                            .ok()
+                            .flatten()
+                            .or(Some(fetched_thread))
                     })
                     .await
                     .ok()
@@ -1629,14 +1638,52 @@ impl AppState {
 
             let cursor_is_eof = cursor.as_ref().is_some_and(|c| c.is_history_eof());
             if local_older.len() >= batch_size || (!force_deep && cursor_is_eof) {
+                // Revalidate the cached older window against Graph online so edits, soft-deletes,
+                // and reactions on older history pages appear when re-opening them. Fall back to
+                // the cached local rows if offline or if the network request fails.
+                let refreshed_older = if !local_older.is_empty() || explicit {
+                    match graph
+                        .fetch_older_messages(&target, None, oldest_ts.as_deref(), batch_size)
+                        .await
+                    {
+                        Ok((fetched_msgs, _)) if !fetched_msgs.is_empty() => {
+                            let write_storage = storage.clone();
+                            let db_conv = conv_key.clone();
+                            let db_ts = oldest_ts.clone();
+                            let db_id = oldest_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = write_storage.upsert_messages(&fetched_msgs);
+                                match db_ts.as_deref() {
+                                    Some(ts) => write_storage
+                                        .list_older_root_messages(
+                                            &db_conv,
+                                            batch_size,
+                                            ts,
+                                            db_id.as_deref(),
+                                        )
+                                        .unwrap_or(fetched_msgs),
+                                    None => write_storage
+                                        .list_root_messages(&db_conv, batch_size, None)
+                                        .unwrap_or(fetched_msgs),
+                                }
+                            })
+                            .await
+                            .unwrap_or(local_older)
+                        }
+                        _ => local_older,
+                    }
+                } else {
+                    local_older
+                };
+
                 let reached_eof = if !cursor_is_eof {
                     false
-                } else if local_older.len() < batch_size {
+                } else if refreshed_older.len() < batch_size {
                     true
                 } else {
                     let check_storage = storage.clone();
                     let check_conv = conv_key.clone();
-                    let earliest_in_batch = local_older
+                    let earliest_in_batch = refreshed_older
                         .first()
                         .map(|m| (m.created_at.clone(), m.msg_id.clone()));
                     tokio::task::spawn_blocking(move || match earliest_in_batch {
@@ -1651,7 +1698,7 @@ impl AppState {
                 };
                 let _ = tx.send(UiMsg::OlderMessagesLoaded {
                     conv_key,
-                    messages: local_older,
+                    messages: refreshed_older,
                     reached_eof,
                 });
                 let _ = tx.send(UiMsg::TaskDone {
@@ -1866,8 +1913,10 @@ impl AppState {
         let enable = !currently_set;
 
         let graph = self.graph.clone();
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let msg_id = msg.msg_id.clone();
+        let my_name = self.my_profile.as_ref().map(|p| p.display_name.clone());
         let task_label = "Reaction".to_string();
         ui.tasks.begin(task_label.clone());
 
@@ -1883,6 +1932,19 @@ impl AppState {
                 .await
             {
                 Ok(()) => {
+                    let db_ck = conv_key.clone();
+                    let db_mid = msg_id.clone();
+                    let db_rx = reaction_type.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.apply_local_reaction(
+                            &db_ck,
+                            &db_mid,
+                            &db_rx,
+                            enable,
+                            my_name.as_deref(),
+                        );
+                    })
+                    .await;
                     let _ = tx.send(UiMsg::ReactionUpdated {
                         conv_key,
                         msg_id,
@@ -1917,6 +1979,7 @@ impl AppState {
             return;
         };
         let graph = self.graph.clone();
+        let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         let task_label = "Delete message".to_string();
         ui.tasks.begin(task_label.clone());
@@ -1927,6 +1990,13 @@ impl AppState {
                 .await
             {
                 Ok(()) => {
+                    let db_ck = conv_key.clone();
+                    let db_mid = msg_id.clone();
+                    let now = Utc::now().to_rfc3339();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.apply_local_soft_delete(&db_ck, &db_mid, &now);
+                    })
+                    .await;
                     let _ = tx.send(UiMsg::MessageDeleted {
                         conv_key,
                         msg_id,
@@ -2578,6 +2648,8 @@ impl AppState {
 
     pub fn set_presence(&mut self, ui: &mut UiState, availability: String, activity: String) {
         let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        let my_uid = self.my_user_id.clone();
         let tx = self.ui_tx.clone();
         let task_label = "Update presence".to_string();
         ui.tasks.begin(task_label.clone());
@@ -2585,11 +2657,21 @@ impl AppState {
         tokio::spawn(async move {
             match graph.set_my_presence(&availability, &activity, None).await {
                 Ok(()) => {
-                    let status = graph.get_my_presence().await.unwrap_or(PresenceStatus {
-                        user_id: String::new(),
+                    let mut status = graph.get_my_presence().await.unwrap_or(PresenceStatus {
+                        user_id: my_uid.clone(),
                         availability: availability.clone(),
                         activity,
                     });
+                    if status.user_id.is_empty() && !my_uid.is_empty() {
+                        status.user_id = my_uid;
+                    }
+                    if !status.user_id.is_empty() {
+                        let to_save = status.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = storage.upsert_presences(std::slice::from_ref(&to_save));
+                        })
+                        .await;
+                    }
                     let _ = tx.send(UiMsg::PresenceUpdated(status));
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
@@ -2612,12 +2694,21 @@ impl AppState {
         if messages.is_empty() {
             return 0;
         }
-        let existing_ids: HashSet<String> =
-            self.messages.iter().map(|m| m.msg_id.clone()).collect();
-        let mut new_older: Vec<MessageItem> = messages
-            .into_iter()
-            .filter(|m| !existing_ids.contains(&m.msg_id))
+        let mut existing_pos: HashMap<String, usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.msg_id.clone(), i))
             .collect();
+        let mut new_older = Vec::new();
+        for msg in messages {
+            if let Some(&pos) = existing_pos.get(&msg.msg_id) {
+                self.messages[pos] = msg;
+            } else {
+                existing_pos.insert(msg.msg_id.clone(), usize::MAX);
+                new_older.push(msg);
+            }
+        }
         if new_older.is_empty() {
             return 0;
         }
@@ -2666,8 +2757,27 @@ impl AppState {
             CoreEvent::SyncError(err) => {
                 ui.error(format!("Sync error: {err}"));
             }
-            CoreEvent::ConversationsUpdated(convs) => {
+            CoreEvent::ConversationsUpdated(mut convs) => {
                 ui.poll_retrying = false;
+                if let (Some(active_key), Some((read_key, read_at))) = (
+                    self.active_conv_key.as_deref(),
+                    self.active_marked_read_at.as_ref(),
+                ) {
+                    if active_key == read_key {
+                        if let Some(c) = convs.iter_mut().find(|c| c.conv_key == active_key) {
+                            let stale_unread = c
+                                .last_updated_at
+                                .as_deref()
+                                .is_none_or(|ts| ts <= read_at.as_str());
+                            if stale_unread {
+                                c.unread_count = 0;
+                                if c.last_read_at.as_deref().is_none_or(|r| r < read_at.as_str()) {
+                                    c.last_read_at = Some(read_at.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 self.conversations = convs;
             }
             CoreEvent::TeamsUpdated(teams) => {
@@ -2733,14 +2843,53 @@ impl AppState {
                     let appended_at_bottom = self.messages.len() > prev_len
                         || self.messages.last().map(|m| m.msg_id.as_str())
                             != prev_last_id.as_deref();
-                    if appended_at_bottom
-                        && !ui.chat_scroll.follow_tail
-                        && ui.chat_scroll.scroll_up > 0
-                        && ui.chat_scroll.total_lines > 0
-                        && ui.pending_prepend_anchor.is_none()
-                        && ui.pending_append_anchor.is_none()
-                    {
-                        ui.pending_append_anchor = Some(ui.chat_scroll.offset);
+                    if appended_at_bottom {
+                        if !ui.chat_scroll.follow_tail
+                            && ui.chat_scroll.scroll_up > 0
+                            && ui.chat_scroll.total_lines > 0
+                            && ui.pending_prepend_anchor.is_none()
+                            && ui.pending_append_anchor.is_none()
+                        {
+                            ui.pending_append_anchor = Some(ui.chat_scroll.offset);
+                        }
+                        if self
+                            .messages
+                            .last()
+                            .is_some_and(|m| !m.is_me && !m.deleted)
+                        {
+                            let read_ts = self
+                                .messages
+                                .last()
+                                .map(|m| m.created_at.clone())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| Utc::now().to_rfc3339());
+                            let now_ts = Utc::now().to_rfc3339();
+                            let effective_read = if now_ts >= read_ts { now_ts } else { read_ts };
+                            self.active_marked_read_at =
+                                Some((conv_key.clone(), effective_read.clone()));
+                            if let Some(conv) =
+                                self.conversations.iter_mut().find(|c| c.conv_key == conv_key)
+                            {
+                                conv.unread_count = 0;
+                                conv.last_read_at = Some(effective_read.clone());
+                            }
+                            if tokio::runtime::Handle::try_current().is_ok() {
+                                let mark_storage = self.storage.clone();
+                                let mark_key = conv_key.clone();
+                                let graph = self.graph.clone();
+                                let target = self.active_target.clone();
+                                tokio::spawn(async move {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let _ = mark_storage
+                                            .mark_conversation_read(&mark_key, &effective_read);
+                                    })
+                                    .await;
+                                    if let Some(ConversationTarget::Chat { chat_id }) = target {
+                                        let _ = graph.mark_chat_read(&chat_id).await;
+                                    }
+                                });
+                            }
+                        }
                     }
                     if let Some(root_id) =
                         self.active_thread.as_ref().map(|t| t.root.msg_id.clone())
@@ -2762,13 +2911,59 @@ impl AppState {
                 let mentions_may_have_changed = if changed_msg_ids.as_deref() == Some(&[]) {
                     false
                 } else {
+                    let touches_existing_mention = !self.activity_mentions.is_empty()
+                        && (changed_msg_ids.as_ref().is_some_and(|ids| {
+                            self.activity_mentions.iter().any(|am| {
+                                am.conv_key == conv_key
+                                    && ids.iter().any(|id| id == &am.msg_id)
+                            })
+                        }) || messages.iter().any(|m| {
+                            self.activity_mentions
+                                .iter()
+                                .any(|am| am.conv_key == conv_key && am.msg_id == m.msg_id)
+                        }));
                     fetched_mentions_or_deleted
+                        || touches_existing_mention
                         || messages.iter().any(|m| !m.mentions.is_empty() || m.deleted)
                 };
                 if !self.my_user_id.is_empty() && mentions_may_have_changed {
                     if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
                     {
                         self.activity_mentions = mentions;
+                    }
+                }
+                if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
+                    if let Some(newest_in_event) = messages.iter().max_by(|a, b| {
+                        a.created_at
+                            .cmp(&b.created_at)
+                            .then_with(|| a.msg_id.cmp(&b.msg_id))
+                    }) {
+                        let matches_last =
+                            conv.last_msg_id.as_deref() == Some(newest_in_event.msg_id.as_str());
+                        let is_newer = !newest_in_event.created_at.is_empty()
+                            && conv
+                                .last_updated_at
+                                .as_deref()
+                                .is_none_or(|ts| newest_in_event.created_at.as_str() > ts);
+                        if matches_last || is_newer {
+                            conv.last_msg_id = Some(newest_in_event.msg_id.clone());
+                            if !(newest_in_event.deleted && newest_in_event.author_name == "Unknown")
+                            {
+                                conv.last_msg_author = Some(newest_in_event.author_name.clone());
+                            }
+                            conv.last_msg_preview = Some(if newest_in_event.deleted {
+                                "(deleted message)".to_string()
+                            } else {
+                                newest_in_event
+                                    .body_plain
+                                    .split_whitespace()
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            });
+                            if is_newer {
+                                conv.last_updated_at = Some(newest_in_event.created_at.clone());
+                            }
+                        }
                     }
                 }
                 if let Some(candidate) = notify_candidate {
@@ -2974,7 +3169,11 @@ impl AppState {
                             }
                         }
                         if let Some(root) = self.messages.iter_mut().find(|m| m.msg_id == pid) {
-                            root.reply_count = root.reply_count.saturating_add(1);
+                            if let Ok(Some(db_root)) = self.storage.get_message(&conv_key, &pid) {
+                                root.reply_count = db_root.reply_count;
+                            } else {
+                                root.reply_count = root.reply_count.saturating_add(1);
+                            }
                         }
                     } else if let Some(opt_id) = optimistic_id.as_deref() {
                         if let Some(pos) = self.messages.iter().position(|m| m.msg_id == opt_id) {
@@ -3024,6 +3223,13 @@ impl AppState {
                                 thread.replies.push(sent);
                             }
                         }
+                        if let Some(root) = self.messages.iter_mut().find(|m| m.msg_id == pid) {
+                            if let Ok(Some(db_root)) = self.storage.get_message(&conv_key, &pid) {
+                                root.reply_count = db_root.reply_count;
+                            } else {
+                                root.reply_count = root.reply_count.saturating_add(1);
+                            }
+                        }
                     } else if !self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
                         self.messages.push(sent);
                         ui.chat_scroll.bottom();
@@ -3036,20 +3242,52 @@ impl AppState {
                 parent_msg_id,
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
-                    if parent_msg_id.is_some() {
+                    if let Some(ref pid) = parent_msg_id {
                         if let Some(thread) = self.active_thread.as_mut() {
                             for r in &mut thread.replies {
                                 if r.msg_id == msg_id {
                                     r.deleted = true;
+                                    r.body_html.clear();
+                                    r.body_plain = "(deleted message)".to_string();
                                 }
+                            }
+                        }
+                        if let Some(root) = self.messages.iter_mut().find(|m| &m.msg_id == pid) {
+                            if let Ok(Some(db_root)) = self.storage.get_message(&conv_key, pid) {
+                                root.reply_count = db_root.reply_count;
                             }
                         }
                     } else {
                         for m in &mut self.messages {
                             if m.msg_id == msg_id {
                                 m.deleted = true;
+                                m.body_html.clear();
+                                m.body_plain = "(deleted message)".to_string();
                             }
                         }
+                        if let Some(thread) = self.active_thread.as_mut() {
+                            if thread.root.msg_id == msg_id {
+                                thread.root.deleted = true;
+                                thread.root.body_html.clear();
+                                thread.root.body_plain = "(deleted message)".to_string();
+                            }
+                        }
+                    }
+                }
+                if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
+                    if conv.last_msg_id.as_deref() == Some(msg_id.as_str()) {
+                        conv.last_msg_preview = Some("(deleted message)".to_string());
+                    }
+                }
+                if !self.my_user_id.is_empty()
+                    && self
+                        .activity_mentions
+                        .iter()
+                        .any(|am| am.conv_key == conv_key && am.msg_id == msg_id)
+                {
+                    if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
+                    {
+                        self.activity_mentions = mentions;
                     }
                 }
             }
@@ -3060,37 +3298,26 @@ impl AppState {
                 added,
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
-                    let apply = |msg: &mut MessageItem| {
-                        if let Some(r) = msg
-                            .reactions
-                            .iter_mut()
-                            .find(|r| r.reaction_type == reaction_type)
-                        {
-                            r.me_reacted = added;
-                            if added {
-                                r.count = r.count.saturating_add(1);
-                            } else {
-                                r.count = r.count.saturating_sub(1);
-                            }
-                            msg.reactions.retain(|r| r.count > 0);
-                        } else if added {
-                            msg.reactions.push(ReactionSummary {
-                                reaction_type: reaction_type.clone(),
-                                count: 1,
-                                me_reacted: true,
-                                users: Vec::new(),
-                            });
-                        }
-                    };
+                    let my_name = self.my_profile.as_ref().map(|p| p.display_name.as_str());
                     if let Some(m) = self.messages.iter_mut().find(|m| m.msg_id == msg_id) {
-                        apply(m);
+                        crate::storage::apply_reaction_toggle(m, &reaction_type, added, my_name);
                     }
                     if let Some(thread) = self.active_thread.as_mut() {
                         if thread.root.msg_id == msg_id {
-                            apply(&mut thread.root);
+                            crate::storage::apply_reaction_toggle(
+                                &mut thread.root,
+                                &reaction_type,
+                                added,
+                                my_name,
+                            );
                         }
                         if let Some(r) = thread.replies.iter_mut().find(|r| r.msg_id == msg_id) {
-                            apply(r);
+                            crate::storage::apply_reaction_toggle(
+                                r,
+                                &reaction_type,
+                                added,
+                                my_name,
+                            );
                         }
                     }
                 }
@@ -4422,6 +4649,113 @@ mod tests {
         );
         assert_eq!(app.active_thread.as_ref().unwrap().replies.len(), 1);
         assert_eq!(app.active_thread.as_ref().unwrap().replies[0].msg_id, "r1-rep1");
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn tui_preview_mention_removal_delete_and_active_read_guard() {
+        use crate::storage::repo::{mapped_message_rows, reset_mapped_message_rows};
+
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chat:c-tui";
+        app.my_user_id = "me-1".to_string();
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(ConversationTarget::Chat {
+            chat_id: "c-tui".to_string(),
+        });
+        let summary = ConversationSummary {
+            conv_key: conv.to_string(),
+            target: ConversationTarget::Chat {
+                chat_id: "c-tui".to_string(),
+            },
+            kind: ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: "Alice".to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: Some("2026-11-20T05:00:00Z".to_string()),
+            last_msg_id: Some("m1".to_string()),
+            last_msg_author: Some("Alice".to_string()),
+            last_msg_preview: Some("@Me original".to_string()),
+            last_updated_at: Some("2026-11-20T05:00:00Z".to_string()),
+            pinned: false,
+            peer_user_id: Some("u2".to_string()),
+            web_url: None,
+        };
+        app.storage
+            .upsert_conversations(std::slice::from_ref(&summary))
+            .unwrap();
+        app.conversations = vec![summary];
+
+        // 1) Message with @me mention -> edited to remove @me -> activity_mentions must clear!
+        let mut m1 = make_test_msg(conv, "m1", "2026-11-20T05:00:00Z", "@Me original");
+        m1.mentions.push(crate::models::MentionInfo {
+            id: 0,
+            user_id: "me-1".to_string(),
+            display_name: "Me".to_string(),
+        });
+        app.storage.upsert_messages(std::slice::from_ref(&m1)).unwrap();
+        app.messages = vec![m1.clone()];
+        app.activity_mentions = vec![m1.clone()];
+
+        let mut m1_no_mention = m1.clone();
+        m1_no_mention.mentions.clear();
+        m1_no_mention.body_plain = "edited without mention".to_string();
+        m1_no_mention.body_html = "<p>edited without mention</p>".to_string();
+        m1_no_mention.last_modified_at = Some("2026-11-20T05:01:00Z".to_string());
+        app.storage
+            .upsert_messages(std::slice::from_ref(&m1_no_mention))
+            .unwrap();
+
+        reset_mapped_message_rows();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![m1_no_mention],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["m1".to_string()]),
+            },
+        );
+        assert_eq!(mapped_message_rows(), 1, "single edited row must read 1 message row");
+        assert!(
+            app.activity_mentions.is_empty(),
+            "removing @me via edit must clear activity_mentions"
+        );
+        assert_eq!(app.messages[0].body_plain, "edited without mention");
+
+        // 2) Active read guard: stale ConversationsUpdated with unread_count=1 must not resurrect UNREAD.
+        app.active_marked_read_at = Some((conv.to_string(), "2026-11-20T05:05:00Z".to_string()));
+        let mut stale_conv = app.conversations[0].clone();
+        stale_conv.unread_count = 1;
+        stale_conv.last_updated_at = Some("2026-11-20T05:00:00Z".to_string());
+        app.handle_core_event(&mut ui, CoreEvent::ConversationsUpdated(vec![stale_conv]));
+        assert_eq!(app.conversations[0].unread_count, 0);
+
+        // 3) UiMsg::MessageDeleted updates active message, thread root, and conversation preview.
+        app.active_thread = Some(ThreadView {
+            conv_key: conv.to_string(),
+            root: app.messages[0].clone(),
+            replies: Vec::new(),
+        });
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageDeleted {
+                conv_key: conv.to_string(),
+                msg_id: "m1".to_string(),
+                parent_msg_id: None,
+            },
+        );
+        assert!(app.messages[0].deleted);
+        assert_eq!(app.messages[0].body_plain, "(deleted message)");
+        assert!(app.active_thread.as_ref().unwrap().root.deleted);
+        assert_eq!(
+            app.conversations[0].last_msg_preview.as_deref(),
+            Some("(deleted message)")
+        );
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

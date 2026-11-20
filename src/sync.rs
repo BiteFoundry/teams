@@ -34,8 +34,21 @@ const DEEP_IDLE_THRESHOLD_SECS: u64 = 600;
 const AUTH_EXPIRY_PAUSE_SECS: u64 = 30;
 const MAX_ERROR_BACKOFF_MS: u64 = 300_000;
 const MAX_POLLED_PRESENCE_PEERS: usize = 60;
+const MAX_TIER2_BATCH_SUBREQS: usize = 20;
+const ROLLING_CHAT_REVALIDATE_BATCH: usize = 5;
+const MIN_ROLLING_CHAT_SLOTS: usize = 2;
+const MAX_REFRESH_CHANNELS: usize = 20;
 
-type ChatPollCache = HashMap<String, (Option<String>, Option<String>, String, i32)>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatPollCacheEntry {
+    last_msg_id: Option<String>,
+    last_updated_at: Option<String>,
+    last_msg_preview: Option<String>,
+    title: String,
+    unread_count: i32,
+}
+
+type ChatPollCache = HashMap<String, ChatPollCacheEntry>;
 type PresencePollCache = HashMap<String, (String, String)>;
 
 pub(crate) struct SyncSharedState {
@@ -321,9 +334,35 @@ fn compute_messages_signature(messages: &[MessageItem]) -> u64 {
         m.last_modified_at.hash(&mut hasher);
         m.deleted.hash(&mut hasher);
         m.reply_count.hash(&mut hasher);
+        m.body_plain.hash(&mut hasher);
+        m.subject.hash(&mut hasher);
+        m.attachments.len().hash(&mut hasher);
+        m.mentions.len().hash(&mut hasher);
+        for mt in &m.mentions {
+            mt.id.hash(&mut hasher);
+            mt.user_id.hash(&mut hasher);
+            mt.display_name.hash(&mut hasher);
+        }
         m.reactions.len().hash(&mut hasher);
+        for r in &m.reactions {
+            r.reaction_type.hash(&mut hasher);
+            r.count.hash(&mut hasher);
+            r.me_reacted.hash(&mut hasher);
+            r.users.hash(&mut hasher);
+        }
     }
     hasher.finish()
+}
+
+fn filter_changed_messages_ref(messages: &[MessageItem], changed_ids: &[String]) -> Vec<MessageItem> {
+    if changed_ids.is_empty() {
+        return Vec::new();
+    }
+    messages
+        .iter()
+        .filter(|m| changed_ids.iter().any(|id| id == &m.msg_id))
+        .cloned()
+        .collect()
 }
 
 fn filter_changed_messages(messages: Vec<MessageItem>, changed_ids: &[String]) -> Vec<MessageItem> {
@@ -606,6 +645,7 @@ pub fn spawn_sync_engine(
 
     // Lane 2: Background Poll Lane (chat preview diff + $batch, presence polling, bulk refreshes)
     let bg_shared = Arc::clone(&shared);
+    let bg_focus_rx = focus_tx.subscribe();
     tokio::spawn(async move {
         let mut chat_tick = time::interval(Duration::from_millis(chat_ms));
         chat_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -617,6 +657,7 @@ pub fn spawn_sync_engine(
         let mut chat_cache: ChatPollCache = HashMap::new();
         let mut chat_cache_seeded = false;
         let mut chats_cursor_initialized = false;
+        let mut rolling_chat_cursor: usize = 0;
         let mut presence_cache: PresencePollCache = HashMap::new();
         let mut presence_disabled_for_token: Option<String> = None;
         let mut chat_err_backoff = ErrorBackoffState::new(chat_ms);
@@ -645,6 +686,11 @@ pub fn spawn_sync_engine(
                             presence_disabled_for_token = None;
                             chat_err_backoff.reset_window();
                             presence_err_backoff.reset_window();
+                            let active_key = bg_focus_rx
+                                .borrow()
+                                .target
+                                .as_ref()
+                                .map(ConversationTarget::conv_key);
                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: true,
                                 summary: "Syncing conversations...".to_string(),
@@ -656,6 +702,8 @@ pub fn spawn_sync_engine(
                                 &mut chat_cache,
                                 &mut chat_cache_seeded,
                                 &mut chats_cursor_initialized,
+                                &mut rolling_chat_cursor,
+                                active_key.as_deref(),
                             ).await {
                                 Ok(()) => {
                                     chat_err_backoff.record_success();
@@ -685,13 +733,14 @@ pub fn spawn_sync_engine(
                         && !bg_shared.is_auth_paused(now)
                         && !chat_err_backoff.is_backed_off(now)
                     {
-                        match poll_chats_tier2_with_cache(
+                        match poll_chats_tier2_with_rolling_cache(
                             &graph,
                             &storage,
                             &event_tx,
                             &mut chat_cache,
                             &mut chat_cache_seeded,
                             &mut chats_cursor_initialized,
+                            &mut rolling_chat_cursor,
                         ).await {
                             Ok(()) => {
                                 let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
@@ -903,10 +952,10 @@ async fn sync_active_focus_with_state(
 
             let key_for_db = conv_key.clone();
             let (changed_ids, changed_messages) = run_storage(storage, move |st| {
-                let changed = st.upsert_messages_returning_changed_ids(&messages)?;
+                let outcome = st.upsert_messages_detailed(&messages)?;
                 save_initial_history_cursor_if_absent(st, &key_for_db, &messages, next_link)?;
-                let filtered = filter_changed_messages(messages, &changed);
-                Ok((changed, filtered))
+                let filtered = filter_changed_messages(messages, &outcome.changed_ids);
+                Ok((outcome.changed_ids, filtered))
             })
             .await?;
             last_active_sig.insert(conv_key.clone(), sig);
@@ -965,31 +1014,35 @@ async fn sync_active_focus_with_state(
 
                     let sig = compute_messages_signature(&messages);
                     let prev_sig = last_active_sig.get(&conv_key).copied();
-                    let skip_msg_update =
-                        is_periodic && !messages.is_empty() && prev_sig == Some(sig);
 
                     let msgs_for_db = messages.clone();
-                    let changed_rows = run_storage(storage, move |st| {
-                        st.save_sync_cursor(&new_cursor)?;
-                        if !msgs_for_db.is_empty() && !skip_msg_update {
-                            st.upsert_messages(&msgs_for_db)
+                    let outcome = run_storage(storage, move |st| {
+                        // Commit message upserts BEFORE advancing the delta cursor so delta updates
+                        // can never be skipped or permanently lost.
+                        let outcome = if !msgs_for_db.is_empty() {
+                            st.upsert_messages_detailed(&msgs_for_db)?
                         } else {
-                            Ok(0)
-                        }
+                            Default::default()
+                        };
+                        st.save_sync_cursor(&new_cursor)?;
+                        Ok(outcome)
                     })
                     .await?;
 
                     if !messages.is_empty() {
                         last_active_sig.insert(conv_key.clone(), sig);
-                        if !skip_msg_update
-                            && (!is_periodic || prev_sig.is_none() || changed_rows > 0)
-                        {
+                        if !is_periodic || prev_sig.is_none() || !outcome.changed_ids.is_empty() {
+                            let changed_ids = if outcome.changed_ids.is_empty() {
+                                None
+                            } else {
+                                Some(outcome.changed_ids)
+                            };
                             let _ = event_tx.send(CoreEvent::MessagesUpdated {
                                 conv_key: conv_key.clone(),
                                 parent_msg_id: None,
                                 messages,
                                 notify_candidate: None,
-                                changed_msg_ids: None,
+                                changed_msg_ids: changed_ids,
                             });
                         }
                     }
@@ -1072,6 +1125,7 @@ async fn sync_active_focus_with_state(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn poll_chats_tier2_with_cache(
     graph: &GraphClient,
     storage: &Storage,
@@ -1080,18 +1134,42 @@ async fn poll_chats_tier2_with_cache(
     chat_cache_seeded: &mut bool,
     chats_cursor_initialized: &mut bool,
 ) -> Result<()> {
-    if !*chat_cache_seeded {
+    let mut rolling_cursor = 0usize;
+    poll_chats_tier2_with_rolling_cache(
+        graph,
+        storage,
+        event_tx,
+        chat_cache,
+        chat_cache_seeded,
+        chats_cursor_initialized,
+        &mut rolling_cursor,
+    )
+    .await
+}
+
+async fn poll_chats_tier2_with_rolling_cache(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    chat_cache: &mut ChatPollCache,
+    chat_cache_seeded: &mut bool,
+    chats_cursor_initialized: &mut bool,
+    rolling_cursor: &mut usize,
+) -> Result<()> {
+    // Seed known conversations at startup, and refresh newly-discovered DB chats at the start
+    // of each rotation cycle so older chats loaded beyond page 1 also enter rotation.
+    if !*chat_cache_seeded || *rolling_cursor == 0 {
         let existing = run_storage(storage, |st| st.list_conversations()).await?;
         for conv in existing {
-            chat_cache.insert(
-                conv.conv_key,
-                (
-                    conv.last_msg_id,
-                    conv.last_updated_at,
-                    conv.title,
-                    conv.unread_count,
-                ),
-            );
+            if !conv.kind.is_channel() {
+                chat_cache.entry(conv.conv_key).or_insert(ChatPollCacheEntry {
+                    last_msg_id: conv.last_msg_id,
+                    last_updated_at: conv.last_updated_at,
+                    last_msg_preview: conv.last_msg_preview,
+                    title: conv.title,
+                    unread_count: conv.unread_count,
+                });
+            }
         }
         *chat_cache_seeded = true;
     }
@@ -1099,14 +1177,18 @@ async fn poll_chats_tier2_with_cache(
     let (chats, next_link) = graph.list_chats_page(50, None).await?;
 
     let mut dirty_ids = Vec::new();
+    let mut dirty_set = HashSet::new();
+    let mut clean_pool = Vec::new();
+    let mut clean_seen = HashSet::new();
     let mut changed_chats = Vec::new();
     for chat in &chats {
-        let next_entry = (
-            chat.last_msg_id.clone(),
-            chat.last_updated_at.clone(),
-            chat.title.clone(),
-            chat.unread_count,
-        );
+        let next_entry = ChatPollCacheEntry {
+            last_msg_id: chat.last_msg_id.clone(),
+            last_updated_at: chat.last_updated_at.clone(),
+            last_msg_preview: chat.last_msg_preview.clone(),
+            title: chat.title.clone(),
+            unread_count: chat.unread_count,
+        };
         let cached = chat_cache.get(&chat.conv_key);
         let changed = cached != Some(&next_entry);
         if changed {
@@ -1116,16 +1198,64 @@ async fn poll_chats_tier2_with_cache(
         if let ConversationTarget::Chat { chat_id } = &chat.target {
             let is_dirty = match cached {
                 None => chat.last_msg_id.is_some() || chat.last_updated_at.is_some(),
-                Some((cached_msg_id, cached_updated_at, _, _)) => {
-                    (chat.last_msg_id.is_some() && &chat.last_msg_id != cached_msg_id)
+                Some(entry) => {
+                    (chat.last_msg_id.is_some() && chat.last_msg_id != entry.last_msg_id)
                         || (chat.last_updated_at.is_some()
-                            && &chat.last_updated_at != cached_updated_at)
+                            && chat.last_updated_at != entry.last_updated_at)
+                        || (chat.last_msg_preview != entry.last_msg_preview)
                 }
             };
             if is_dirty {
-                dirty_ids.push(chat_id.clone());
+                if dirty_set.insert(chat_id.clone()) {
+                    dirty_ids.push(chat_id.clone());
+                }
+            } else if clean_seen.insert(chat_id.clone()) {
+                clean_pool.push(chat_id.clone());
             }
         }
+    }
+
+    // Include known cached chats beyond page 1 of `/me/chats?$top=50` in deterministic order
+    // so older cached inactive conversations also get bounded rotating turns without extra pages.
+    let mut beyond_page1_ids: Vec<String> = chat_cache
+        .keys()
+        .filter_map(|conv_key| conv_key.strip_prefix("chat:").map(str::to_string))
+        .filter(|cid| !dirty_set.contains(cid) && !clean_seen.contains(cid))
+        .collect();
+    beyond_page1_ids.sort();
+    clean_pool.extend(beyond_page1_ids);
+
+    // Keep each tick strictly bounded to one `$batch` request (<= MAX_TIER2_BATCH_SUBREQS = 20)
+    // while always reserving rotating slots so 20+ dirty chats cannot starve inactive rotation.
+    let rolling_slots = if clean_pool.is_empty() {
+        0
+    } else if dirty_ids.len() + ROLLING_CHAT_REVALIDATE_BATCH <= MAX_TIER2_BATCH_SUBREQS {
+        ROLLING_CHAT_REVALIDATE_BATCH.min(clean_pool.len())
+    } else {
+        MIN_ROLLING_CHAT_SLOTS.min(clean_pool.len())
+    };
+    let dirty_budget = MAX_TIER2_BATCH_SUBREQS.saturating_sub(rolling_slots);
+
+    let mut fetch_ids = Vec::with_capacity(MAX_TIER2_BATCH_SUBREQS);
+    let mut deferred_dirty_keys: HashSet<String> = HashSet::new();
+    for (idx, cid) in dirty_ids.iter().enumerate() {
+        if idx < dirty_budget {
+            fetch_ids.push(cid.clone());
+        } else {
+            deferred_dirty_keys.insert(
+                ConversationTarget::Chat {
+                    chat_id: cid.clone(),
+                }
+                .conv_key(),
+            );
+        }
+    }
+    if rolling_slots > 0 {
+        let start = *rolling_cursor % clean_pool.len();
+        for offset in 0..rolling_slots {
+            fetch_ids.push(clean_pool[(start + offset) % clean_pool.len()].clone());
+        }
+        *rolling_cursor = (start + rolling_slots) % clean_pool.len();
     }
 
     let chat_by_id: HashMap<String, &ConversationSummary> = chats
@@ -1152,8 +1282,9 @@ async fn poll_chats_tier2_with_cache(
         *chats_cursor_initialized = true;
     }
 
-    if !dirty_ids.is_empty() {
-        let fetched = graph.batch_fetch_chat_messages(&dirty_ids, 20).await?;
+    let mut any_preview_updated = false;
+    if !fetch_ids.is_empty() {
+        let fetched = graph.batch_fetch_chat_messages(&fetch_ids, 20).await?;
         for (chat_id, messages) in fetched {
             let conv_key = ConversationTarget::Chat {
                 chat_id: chat_id.clone(),
@@ -1162,42 +1293,60 @@ async fn poll_chats_tier2_with_cache(
             let conv_title = chat_by_id
                 .get(&chat_id)
                 .map(|c| c.title.clone())
+                .or_else(|| chat_cache.get(&conv_key).map(|e| e.title.clone()))
                 .unwrap_or_else(|| conv_key.clone());
-            let notify_candidate =
-                build_notification_candidate(&conv_key, &conv_title, &messages);
 
-            let (changed_ids, changed_messages) = run_storage(storage, move |st| {
-                let changed = st.upsert_messages_returning_changed_ids(&messages)?;
-                let filtered = filter_changed_messages(messages, &changed);
-                Ok((changed, filtered))
-            })
-            .await?;
-            if !changed_ids.is_empty() {
+            let (outcome, changed_messages, newly_inserted_messages) =
+                run_storage(storage, move |st| {
+                    let outcome = st.upsert_messages_detailed(&messages)?;
+                    let inserted = filter_changed_messages_ref(&messages, &outcome.inserted_ids);
+                    let changed = filter_changed_messages(messages, &outcome.changed_ids);
+                    Ok((outcome, changed, inserted))
+                })
+                .await?;
+            if !outcome.preview_updated_convs.is_empty() {
+                any_preview_updated = true;
+            }
+            if !outcome.changed_ids.is_empty() {
+                let notify_candidate =
+                    build_notification_candidate(&conv_key, &conv_title, &newly_inserted_messages);
                 let _ = event_tx.send(CoreEvent::MessagesUpdated {
                     conv_key,
                     parent_msg_id: None,
                     messages: changed_messages,
                     notify_candidate,
-                    changed_msg_ids: Some(changed_ids),
+                    changed_msg_ids: Some(outcome.changed_ids),
                 });
             }
         }
     }
 
     for chat in &changed_chats {
+        // Keep deferred dirty chats marked stale in `chat_cache` so the next tick fetches them.
+        if deferred_dirty_keys.contains(&chat.conv_key) {
+            continue;
+        }
         chat_cache.insert(
             chat.conv_key.clone(),
-            (
-                chat.last_msg_id.clone(),
-                chat.last_updated_at.clone(),
-                chat.title.clone(),
-                chat.unread_count,
-            ),
+            ChatPollCacheEntry {
+                last_msg_id: chat.last_msg_id.clone(),
+                last_updated_at: chat.last_updated_at.clone(),
+                last_msg_preview: chat.last_msg_preview.clone(),
+                title: chat.title.clone(),
+                unread_count: chat.unread_count,
+            },
         );
     }
 
-    if !changed_chats.is_empty() {
+    if !changed_chats.is_empty() || any_preview_updated {
         let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
+        if any_preview_updated {
+            for conv in &all_convs {
+                if let Some(entry) = chat_cache.get_mut(&conv.conv_key) {
+                    entry.last_msg_preview = conv.last_msg_preview.clone();
+                }
+            }
+        }
         let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
     }
 
@@ -1261,28 +1410,150 @@ async fn refresh_all_conversations_with_cache(
     chat_cache: &mut ChatPollCache,
     chat_cache_seeded: &mut bool,
     chats_cursor_initialized: &mut bool,
+    rolling_cursor: &mut usize,
+    active_conv_key: Option<&str>,
 ) -> Result<()> {
     let (chats_res, teams_res) = tokio::join!(
-        poll_chats_tier2_with_cache(
+        poll_chats_tier2_with_rolling_cache(
             graph,
             storage,
             event_tx,
             chat_cache,
             chat_cache_seeded,
             chats_cursor_initialized,
+            rolling_cursor,
         ),
         graph.list_joined_teams_with_channels(),
     );
     chats_res?;
     if let Ok(teams) = teams_res {
         let teams_for_db = teams.clone();
-        let all_convs = run_storage(storage, move |st| {
-            st.upsert_teams(&teams_for_db)?;
-            st.list_conversations()
-        })
-        .await?;
+        run_storage(storage, move |st| st.upsert_teams(&teams_for_db)).await?;
+
+        // Explicit refresh also reconciles inactive joined channels via delta so new posts,
+        // @me mentions, deletions, and unread counts surface without focusing each channel.
+        let mut refreshed_channels = 0usize;
+        for team in &teams {
+            for ch in &team.channels {
+                if refreshed_channels >= MAX_REFRESH_CHANNELS {
+                    break;
+                }
+                refreshed_channels += 1;
+                let conv_key = ch.conv_key();
+                let is_active = active_conv_key == Some(conv_key.as_str());
+                let conv_title = format!("{} › #{}", team.display_name, ch.display_name);
+                let _ = refresh_channel_delta_once(
+                    graph,
+                    storage,
+                    event_tx,
+                    &ch.team_id,
+                    &ch.id,
+                    &conv_key,
+                    &conv_title,
+                    !is_active,
+                )
+                .await;
+            }
+        }
+
+        let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
         let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
         let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
+    }
+    Ok(())
+}
+
+async fn refresh_channel_delta_once(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    team_id: &str,
+    channel_id: &str,
+    conv_key: &str,
+    conv_title: &str,
+    mark_unread_on_new: bool,
+) -> Result<()> {
+    let ck = conv_key.to_string();
+    let (cursor, had_local_msgs) = run_storage(storage, move |st| {
+        let cur = st.get_sync_cursor(&ck)?;
+        let has_msgs = !st.list_root_messages(&ck, 1, None)?.is_empty();
+        Ok((cur, has_msgs))
+    })
+    .await?;
+    let had_prior_state = cursor.is_some() || had_local_msgs;
+
+    let delta_res = graph
+        .sync_channel_messages_delta(
+            team_id,
+            channel_id,
+            cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
+        )
+        .await;
+
+    let (messages, new_delta_link) = match delta_res {
+        Ok(res) => res,
+        Err(err) if is_expired_delta_error(&err) => {
+            let target = ConversationTarget::Channel {
+                team_id: team_id.to_string(),
+                channel_id: channel_id.to_string(),
+            };
+            let (msgs, _) = graph.list_messages_page(&target, 50, None).await?;
+            (msgs, None)
+        }
+        Err(err) => return Err(err),
+    };
+
+    let oldest_ts = messages
+        .iter()
+        .map(|m| m.created_at.as_str())
+        .min()
+        .map(str::to_string)
+        .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()));
+    let effective_delta_link =
+        new_delta_link.or_else(|| cursor.as_ref().and_then(|c| c.delta_link.clone()));
+    let new_cursor = SyncCursor {
+        scope_key: conv_key.to_string(),
+        delta_link: effective_delta_link,
+        oldest_msg_ts: oldest_ts,
+        synced_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let ck_db = conv_key.to_string();
+    let msgs_for_db = messages.clone();
+    let (outcome, newly_inserted) = run_storage(storage, move |st| {
+        let outcome = if !msgs_for_db.is_empty() {
+            st.upsert_messages_detailed(&msgs_for_db)?
+        } else {
+            Default::default()
+        };
+        st.save_sync_cursor(&new_cursor)?;
+        let inserted = filter_changed_messages_ref(&msgs_for_db, &outcome.inserted_ids);
+        if mark_unread_on_new && had_prior_state {
+            let unread_delta = inserted
+                .iter()
+                .filter(|m| !m.is_me && !m.deleted)
+                .count() as i32;
+            if unread_delta > 0 {
+                st.increment_conversation_unread(&ck_db, unread_delta)?;
+            }
+        }
+        Ok((outcome, inserted))
+    })
+    .await?;
+
+    if !outcome.changed_ids.is_empty() {
+        let notify_candidate = if mark_unread_on_new && had_prior_state {
+            build_notification_candidate(conv_key, conv_title, &newly_inserted)
+        } else {
+            None
+        };
+        let _ = event_tx.send(CoreEvent::MessagesUpdated {
+            conv_key: conv_key.to_string(),
+            parent_msg_id: None,
+            messages,
+            notify_candidate,
+            changed_msg_ids: Some(outcome.changed_ids),
+        });
     }
     Ok(())
 }
@@ -1333,6 +1604,7 @@ pub(crate) fn collect_dirty_chat_ids(
                 (chat.last_msg_id.is_some() && chat.last_msg_id != cached.last_msg_id)
                     || (chat.last_updated_at.is_some()
                         && chat.last_updated_at != cached.last_updated_at)
+                    || (chat.last_msg_preview != cached.last_msg_preview)
             }
         };
         if is_dirty {
@@ -2445,6 +2717,652 @@ mod tests {
             }
         }
         assert!(saw_batch_update, "expected tier-2 MessagesUpdated event");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_rolling_batch_inactive_edit_reaction_signature_and_channel_refresh() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        let stage = Arc::new(AtomicUsize::new(0));
+        let st_chats = Arc::clone(&stage);
+        let st_batch = Arc::clone(&stage);
+        let st_active = Arc::clone(&stage);
+        let st_delta = Arc::clone(&stage);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let delta_base = format!("http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta");
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(move || {
+                    let st = Arc::clone(&st_chats);
+                    async move {
+                        let s = st.load(Ordering::SeqCst);
+                        // Keep lastMessagePreview.id AND lastUpdatedDateTime identical across stages
+                        // to prove rolling batch still catches edits/deletes on inactive chats.
+                        let preview_body = if s == 0 {
+                            "<p>bg-last-original</p>"
+                        } else {
+                            "<p>bg-last-original</p>"
+                        };
+                        Json(serde_json::json!({
+                            "value": [
+                                {
+                                    "id": "c-bg-1",
+                                    "chatType": "oneOnOne",
+                                    "lastUpdatedDateTime": "2026-11-20T03:02:00Z",
+                                    "members": [
+                                        { "userId": "u1", "displayName": "Me" },
+                                        { "userId": "u2", "displayName": "Alice" }
+                                    ],
+                                    "lastMessagePreview": {
+                                        "id": "bg-2",
+                                        "createdDateTime": "2026-11-20T03:02:00Z",
+                                        "isDeleted": false,
+                                        "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                        "body": { "contentType": "html", "content": preview_body }
+                                    }
+                                },
+                                {
+                                    "id": "c-bg-2",
+                                    "chatType": "oneOnOne",
+                                    "lastUpdatedDateTime": "2026-11-20T02:00:00Z",
+                                    "members": [
+                                        { "userId": "u1", "displayName": "Me" },
+                                        { "userId": "u3", "displayName": "Bob" }
+                                    ],
+                                    "lastMessagePreview": {
+                                        "id": "b2-1",
+                                        "createdDateTime": "2026-11-20T02:00:00Z",
+                                        "isDeleted": false,
+                                        "from": { "user": { "id": "u3", "displayName": "Bob" } },
+                                        "body": { "contentType": "html", "content": "<p>b2-initial</p>" }
+                                    }
+                                }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(req): Json<serde_json::Value>| {
+                    let st = Arc::clone(&st_batch);
+                    async move {
+                        let s = st.load(Ordering::SeqCst);
+                        let mut responses = Vec::new();
+                        for sub in req["requests"].as_array().cloned().unwrap_or_default() {
+                            let id = sub["id"].as_str().unwrap_or("0").to_string();
+                            let url = sub["url"].as_str().unwrap_or("");
+                            if url.contains("/teams/t1/channels") {
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [{
+                                            "id": "ch1",
+                                            "displayName": "General",
+                                            "membershipType": "standard"
+                                        }]
+                                    }
+                                }));
+                            } else if url.contains("/chats/c-bg-1/messages") {
+                                let bg2_body = if s >= 1 {
+                                    "<p>bg-last-EDITED</p>"
+                                } else {
+                                    "<p>bg-last-original</p>"
+                                };
+                                let bg1_body = if s >= 1 {
+                                    "<p>bg-older-EDITED</p>"
+                                } else {
+                                    "<p>bg-older-original</p>"
+                                };
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [
+                                            {
+                                                "id": "bg-2",
+                                                "createdDateTime": "2026-11-20T03:02:00Z",
+                                                "lastModifiedDateTime": if s >= 1 { serde_json::json!("2026-11-20T03:05:00Z") } else { serde_json::Value::Null },
+                                                "messageType": "message",
+                                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                                "body": { "contentType": "html", "content": bg2_body }
+                                            },
+                                            {
+                                                "id": "bg-1",
+                                                "createdDateTime": "2026-11-20T03:01:00Z",
+                                                "lastModifiedDateTime": if s >= 1 { serde_json::json!("2026-11-20T03:05:00Z") } else { serde_json::Value::Null },
+                                                "messageType": "message",
+                                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                                "body": { "contentType": "html", "content": bg1_body }
+                                            }
+                                        ]
+                                    }
+                                }));
+                            } else {
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [{
+                                            "id": "b2-1",
+                                            "createdDateTime": "2026-11-20T02:00:00Z",
+                                            "messageType": "message",
+                                            "from": { "user": { "id": "u3", "displayName": "Bob" } },
+                                            "body": { "contentType": "html", "content": "<p>b2-initial</p>" }
+                                        }]
+                                    }
+                                }));
+                            }
+                        }
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/chats/c-rx/messages",
+                get(move || {
+                    let st = Arc::clone(&st_active);
+                    async move {
+                        let s = st.load(Ordering::SeqCst);
+                        let reactions = match s {
+                            0 => vec![serde_json::json!({
+                                "reactionType": "like",
+                                "user": { "user": { "id": "u2", "displayName": "Alice" } }
+                            })],
+                            _ => vec![
+                                serde_json::json!({
+                                    "reactionType": "like",
+                                    "user": { "user": { "id": "u2", "displayName": "Alice" } }
+                                }),
+                                serde_json::json!({
+                                    "reactionType": "like",
+                                    "user": { "user": { "id": "u3", "displayName": "Bob" } }
+                                }),
+                            ],
+                        };
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "rx-1",
+                                "createdDateTime": "2026-11-20T04:00:00Z",
+                                "messageType": "message",
+                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": "<p>react target</p>" },
+                                "reactions": reactions
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "t1", "displayName": "Eng" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages/delta",
+                get(move || {
+                    let st = Arc::clone(&st_delta);
+                    let delta_base = delta_base.clone();
+                    async move {
+                        let s = st.load(Ordering::SeqCst);
+                        let value = match s {
+                            0 => vec![serde_json::json!({
+                                "id": "cm-1",
+                                "createdDateTime": "2026-11-20T05:00:00Z",
+                                "messageType": "message",
+                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": "<p>chan post</p>" },
+                                "reactions": [{
+                                    "reactionType": "like",
+                                    "user": { "user": { "id": "u2", "displayName": "Alice" } }
+                                }]
+                            })],
+                            1 => vec![serde_json::json!({
+                                "id": "cm-1",
+                                "createdDateTime": "2026-11-20T05:00:00Z",
+                                "messageType": "message",
+                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": "<p>chan post</p>" },
+                                "reactions": [
+                                    { "reactionType": "like", "user": { "user": { "id": "u2", "displayName": "Alice" } } },
+                                    { "reactionType": "like", "user": { "user": { "id": "u3", "displayName": "Bob" } } }
+                                ]
+                            })],
+                            _ => vec![
+                                serde_json::json!({
+                                    "id": "cm-1",
+                                    "@removed": { "reason": "deleted" }
+                                }),
+                                serde_json::json!({
+                                    "id": "cm-2",
+                                    "createdDateTime": "2026-11-20T05:10:00Z",
+                                    "messageType": "message",
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "html", "content": "<p>@Me ping</p>" },
+                                    "mentions": [{
+                                        "id": 0,
+                                        "mentionText": "Me",
+                                        "mentioned": { "user": { "id": "u1", "displayName": "Me" } }
+                                    }]
+                                }),
+                            ],
+                        };
+                        Json(serde_json::json!({
+                            "value": value,
+                            "@odata.deltaLink": format!("{delta_base}?s={s}")
+                        }))
+                    }
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Me".to_string()),
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // 1) Initial tier-2 poll seeds c-bg-1 & c-bg-2.
+        let mut chat_cache = HashMap::new();
+        let mut seeded = false;
+        let mut cursor_init = false;
+        let mut rolling = 0usize;
+        poll_chats_tier2_with_rolling_cache(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut chat_cache,
+            &mut seeded,
+            &mut cursor_init,
+            &mut rolling,
+        )
+        .await
+        .unwrap();
+        while event_rx.try_recv().is_ok() {}
+
+        // 2) Stage 1: remote edits BOTH bg-1 and bg-2 while /me/chats stays identical.
+        // Rolling batch must catch both edits, update preview, and emit notify_candidate: None!
+        stage.store(1, Ordering::SeqCst);
+        poll_chats_tier2_with_rolling_cache(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut chat_cache,
+            &mut seeded,
+            &mut cursor_init,
+            &mut rolling,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_message("chat:c-bg-1", "bg-1").unwrap().unwrap().body_plain,
+            "bg-older-EDITED"
+        );
+        assert_eq!(
+            storage.get_message("chat:c-bg-1", "bg-2").unwrap().unwrap().body_plain,
+            "bg-last-EDITED"
+        );
+        assert_eq!(
+            storage
+                .get_conversation("chat:c-bg-1")
+                .unwrap()
+                .unwrap()
+                .last_msg_preview
+                .as_deref(),
+            Some("bg-last-EDITED")
+        );
+        let mut saw_bg_edit_event = false;
+        let mut saw_conv_preview_event = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                CoreEvent::MessagesUpdated {
+                    conv_key,
+                    notify_candidate,
+                    changed_msg_ids,
+                    ..
+                } if conv_key == "chat:c-bg-1" => {
+                    assert!(
+                        notify_candidate.is_none(),
+                        "edits in rolling batch must not trigger notifications"
+                    );
+                    assert_eq!(
+                        changed_msg_ids,
+                        Some(vec!["bg-1".to_string(), "bg-2".to_string()])
+                    );
+                    saw_bg_edit_event = true;
+                }
+                CoreEvent::ConversationsUpdated(_) => saw_conv_preview_event = true,
+                _ => {}
+            }
+        }
+        assert!(saw_bg_edit_event);
+        assert!(saw_conv_preview_event);
+
+        // 3) Active chat reaction count 1 -> 2 must NOT collide in compute_messages_signature.
+        stage.store(0, Ordering::SeqCst);
+        let mut sigs = HashMap::new();
+        let rx_focus = FocusTarget {
+            target: Some(ConversationTarget::Chat {
+                chat_id: "c-rx".to_string(),
+            }),
+            thread_root_id: None,
+        };
+        sync_active_focus_with_state(&rx_focus, &graph, &storage, &event_tx, &mut sigs, false)
+            .await
+            .unwrap();
+        while event_rx.try_recv().is_ok() {}
+        stage.store(1, Ordering::SeqCst);
+        sync_active_focus_with_state(&rx_focus, &graph, &storage, &event_tx, &mut sigs, true)
+            .await
+            .unwrap();
+        let rx_msg = storage.get_message("chat:c-rx", "rx-1").unwrap().unwrap();
+        assert_eq!(rx_msg.reactions.len(), 1);
+        assert_eq!(rx_msg.reactions[0].count, 2);
+
+        // 4) Channel delta: stage 0 initial -> stage 1 reaction count 1->2 -> stage 2 @removed + @me mention via explicit RefreshConversations!
+        stage.store(0, Ordering::SeqCst);
+        let ch_focus = FocusTarget {
+            target: Some(ConversationTarget::Channel {
+                team_id: "t1".to_string(),
+                channel_id: "ch1".to_string(),
+            }),
+            thread_root_id: None,
+        };
+        sync_active_focus_with_state(&ch_focus, &graph, &storage, &event_tx, &mut sigs, false)
+            .await
+            .unwrap();
+        stage.store(1, Ordering::SeqCst);
+        sync_active_focus_with_state(&ch_focus, &graph, &storage, &event_tx, &mut sigs, true)
+            .await
+            .unwrap();
+        let cm1 = storage.get_message("chan:t1:ch1", "cm-1").unwrap().unwrap();
+        assert_eq!(cm1.reactions[0].count, 2);
+
+        // Now channel is inactive (active is chat:c-rx); explicit RefreshConversations syncs delta stage 2.
+        stage.store(2, Ordering::SeqCst);
+        // Reset delta_link to point at our mock server URL so refresh_channel_delta_once hits it.
+        storage
+            .save_sync_cursor(&SyncCursor {
+                scope_key: "chan:t1:ch1".to_string(),
+                delta_link: Some(format!("http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta?s=1")),
+                oldest_msg_ts: None,
+                synced_at: "2026-11-20T05:00:00Z".to_string(),
+            })
+            .unwrap();
+        refresh_all_conversations_with_cache(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut chat_cache,
+            &mut seeded,
+            &mut cursor_init,
+            &mut rolling,
+            Some("chat:c-rx"),
+        )
+        .await
+        .unwrap();
+        let cm1_after = storage.get_message("chan:t1:ch1", "cm-1").unwrap().unwrap();
+        assert!(cm1_after.deleted, "@removed tombstone must mark cm-1 deleted");
+        assert_eq!(cm1_after.author_name, "Alice", "tombstone must preserve author");
+        let cm2 = storage.get_message("chan:t1:ch1", "cm-2").unwrap().unwrap();
+        assert_eq!(cm2.mentions.len(), 1);
+        let ch_conv = storage.get_conversation("chan:t1:ch1").unwrap().unwrap();
+        assert_eq!(ch_conv.unread_count, 1, "inactive channel must record unread_count on new message");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tier2_rotation_reaches_cached_chat_beyond_page1_even_under_20_plus_dirty_chats() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::{atomic::AtomicUsize, Mutex};
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let bs_clone = Arc::clone(&batch_sizes);
+        let tick_num = Arc::new(AtomicUsize::new(0));
+        let tn_chats = Arc::clone(&tick_num);
+
+        // Page 1 returns 24 chats: 22 continuously dirty chats + 2 clean chats.
+        // Older cached chats `c-beyond-1` and `c-beyond-2` are NOT in `/me/chats` page 1!
+        let app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(move || {
+                    let tn = Arc::clone(&tn_chats);
+                    async move {
+                        let t = tn.fetch_add(1, Ordering::SeqCst) + 1;
+                        let mut chats = Vec::new();
+                        for i in 0..22 {
+                            let msg_id = format!("d-{i}-t{t}");
+                            let ts = format!("2026-11-20T09:{:02}:{:02}Z", t, i);
+                            chats.push(serde_json::json!({
+                                "id": format!("c-dirty-{i:02}"),
+                                "chatType": "oneOnOne",
+                                "lastUpdatedDateTime": ts,
+                                "members": [
+                                    { "userId": "u1", "displayName": "Me" },
+                                    { "userId": format!("u-d-{i}"), "displayName": format!("Dirty {i}") }
+                                ],
+                                "lastMessagePreview": {
+                                    "id": msg_id,
+                                    "createdDateTime": ts,
+                                    "isDeleted": false,
+                                    "from": { "user": { "id": format!("u-d-{i}"), "displayName": format!("Dirty {i}") } },
+                                    "body": { "contentType": "html", "content": format!("<p>dirty {i} tick {t}</p>") }
+                                }
+                            }));
+                        }
+                        for i in 0..2 {
+                            chats.push(serde_json::json!({
+                                "id": format!("c-clean-{i:02}"),
+                                "chatType": "oneOnOne",
+                                "lastUpdatedDateTime": "2026-11-20T01:00:00Z",
+                                "members": [
+                                    { "userId": "u1", "displayName": "Me" },
+                                    { "userId": format!("u-c-{i}"), "displayName": format!("Clean {i}") }
+                                ],
+                                "lastMessagePreview": {
+                                    "id": format!("cl-{i}"),
+                                    "createdDateTime": "2026-11-20T01:00:00Z",
+                                    "isDeleted": false,
+                                    "from": { "user": { "id": format!("u-c-{i}"), "displayName": format!("Clean {i}") } },
+                                    "body": { "contentType": "html", "content": "<p>clean</p>" }
+                                }
+                            }));
+                        }
+                        Json(serde_json::json!({ "value": chats }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(req): Json<serde_json::Value>| {
+                    let bs = Arc::clone(&bs_clone);
+                    async move {
+                        let reqs = req["requests"].as_array().cloned().unwrap_or_default();
+                        bs.lock().unwrap().push(reqs.len());
+                        let mut responses = Vec::new();
+                        for sub in reqs {
+                            let id = sub["id"].as_str().unwrap_or("0").to_string();
+                            let url = sub["url"].as_str().unwrap_or("");
+                            if url.contains("/chats/c-beyond-2/messages") {
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [{
+                                            "id": "old-msg-2",
+                                            "createdDateTime": "2026-11-19T12:00:00Z",
+                                            "lastModifiedDateTime": "2026-11-20T10:00:00Z",
+                                            "messageType": "message",
+                                            "from": { "user": { "id": "u-old", "displayName": "OldPeer" } },
+                                            "body": { "contentType": "html", "content": "<p>EDITED-BEYOND-PAGE-1</p>" }
+                                        }]
+                                    }
+                                }));
+                            } else {
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 200,
+                                    "body": { "value": [] }
+                                }));
+                            }
+                        }
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Me".to_string()),
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // Pre-cache clean page-1 chats AND 2 older chats beyond page 1 in SQLite.
+        let mut seed_convs = Vec::new();
+        for i in 0..2 {
+            let mut c = chat_summary(
+                &format!("c-clean-{i:02}"),
+                Some(&format!("cl-{i}")),
+                Some("2026-11-20T01:00:00Z"),
+            );
+            c.title = format!("Clean {i}");
+            c.last_msg_preview = Some("clean".to_string());
+            seed_convs.push(c);
+        }
+        for i in 1..=2 {
+            let mut c = chat_summary(
+                &format!("c-beyond-{i}"),
+                Some(&format!("old-msg-{i}")),
+                Some("2026-11-19T12:00:00Z"),
+            );
+            c.title = format!("Beyond {i}");
+            c.last_msg_preview = Some("original-beyond".to_string());
+            seed_convs.push(c);
+        }
+        storage.upsert_conversations(&seed_convs).unwrap();
+        let mut orig_msg = sample_msg("chat:c-beyond-2", "old-msg-2", "2026-11-19T12:00:00Z");
+        orig_msg.body_plain = "original-beyond".to_string();
+        orig_msg.body_html = "<p>original-beyond</p>".to_string();
+        storage.upsert_messages(&[orig_msg]).unwrap();
+
+        let mut chat_cache = HashMap::new();
+        let mut seeded = false;
+        let mut cursor_init = false;
+        let mut rolling = 0usize;
+
+        // Clean pool has 4 chats (c-clean-00, c-clean-01, c-beyond-1, c-beyond-2).
+        // Under 22 continuously dirty chats, MIN_ROLLING_CHAT_SLOTS = 2 guarantees reaching
+        // c-beyond-2 in 2 ticks while keeping every single $batch <= 20 sub-requests.
+        for _ in 0..2 {
+            poll_chats_tier2_with_rolling_cache(
+                &graph,
+                &storage,
+                &event_tx,
+                &mut chat_cache,
+                &mut seeded,
+                &mut cursor_init,
+                &mut rolling,
+            )
+            .await
+            .unwrap();
+        }
+
+        let recorded_sizes = batch_sizes.lock().unwrap().clone();
+        assert_eq!(recorded_sizes.len(), 2, "must emit exactly 1 $batch per tick");
+        assert!(
+            recorded_sizes.iter().all(|&n| n <= MAX_TIER2_BATCH_SUBREQS),
+            "every $batch must stay within 20-subrequest budget: {recorded_sizes:?}"
+        );
+
+        let updated_msg = storage
+            .get_message("chat:c-beyond-2", "old-msg-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_msg.body_plain, "EDITED-BEYOND-PAGE-1");
+        assert_eq!(
+            storage
+                .get_conversation("chat:c-beyond-2")
+                .unwrap()
+                .unwrap()
+                .last_msg_preview
+                .as_deref(),
+            Some("EDITED-BEYOND-PAGE-1")
+        );
+
+        // Verify edit on beyond-page-1 chat emitted MessagesUpdated with notify_candidate == None.
+        let mut saw_beyond_event = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated {
+                conv_key,
+                notify_candidate,
+                changed_msg_ids,
+                ..
+            } = ev
+            {
+                if conv_key == "chat:c-beyond-2" {
+                    assert!(notify_candidate.is_none());
+                    assert_eq!(changed_msg_ids, Some(vec!["old-msg-2".to_string()]));
+                    saw_beyond_event = true;
+                }
+            }
+        }
+        assert!(saw_beyond_event, "expected MessagesUpdated for beyond-page-1 chat");
 
         server.abort();
     }

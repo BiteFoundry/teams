@@ -593,7 +593,7 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
     let (last_msg_id, last_msg_author, last_msg_preview, last_msg_created, last_msg_sender_id) =
         if let Some(preview) = chat.last_message_preview {
             let preview_text = if preview.is_deleted == Some(true) {
-                Some("[deleted message]".to_string())
+                Some("(deleted message)".to_string())
             } else {
                 let raw_html = preview
                     .body
@@ -641,7 +641,21 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
         0
     };
 
-    let last_updated_at = last_msg_created.or(chat.last_updated_date_time);
+    let last_updated_at = match (
+        last_msg_created.as_deref(),
+        chat.last_updated_date_time.as_deref(),
+    ) {
+        (Some(msg_ts), Some(chat_ts)) => {
+            if compare_rfc3339_gt(Some(chat_ts), Some(msg_ts)) {
+                chat.last_updated_date_time
+            } else {
+                last_msg_created
+            }
+        }
+        (Some(_), None) => last_msg_created,
+        (None, Some(_)) => chat.last_updated_date_time,
+        (None, None) => None,
+    };
 
     ConversationSummary {
         conv_key,

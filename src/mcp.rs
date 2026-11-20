@@ -610,6 +610,20 @@ async fn call_tool(
             )
             .await?;
 
+            let my_name = graph
+                .auth()
+                .current_tokens()
+                .await
+                .and_then(|t| t.user_display_name);
+            let ck = conv.conv_key.clone();
+            let mid = msg_id.clone();
+            let rx = reaction.clone();
+            let _ = with_storage(storage, move |s| {
+                s.apply_local_reaction(&ck, &mid, &rx, enable, my_name.as_deref())
+                    .map(|_| ())
+            })
+            .await;
+
             Ok(json!({
                 "ok": true,
                 "conv_key": conv.conv_key,
@@ -647,6 +661,15 @@ async fn call_tool(
             )
             .await?;
 
+            let ck = conv.conv_key.clone();
+            let mid = msg_id.clone();
+            let html = compiled.body_html.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = with_storage(storage, move |s| {
+                s.apply_local_edit(&ck, &mid, &html, &now).map(|_| ())
+            })
+            .await;
+
             Ok(json!({
                 "ok": true,
                 "conv_key": conv.conv_key,
@@ -668,6 +691,14 @@ async fn call_tool(
                     .await,
             )
             .await?;
+
+            let ck = conv.conv_key.clone();
+            let mid = msg_id.clone();
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = with_storage(storage, move |s| {
+                s.apply_local_soft_delete(&ck, &mid, &now).map(|_| ())
+            })
+            .await;
 
             Ok(json!({
                 "ok": true,
@@ -770,6 +801,26 @@ async fn call_tool(
                     .await,
             )
             .await?;
+
+            let my_uid = match graph.my_user_id().map(str::to_string) {
+                Some(id) if !id.is_empty() => Some(id),
+                _ => graph
+                    .auth()
+                    .current_tokens()
+                    .await
+                    .and_then(|t| t.user_id),
+            };
+            if let Some(uid) = my_uid.filter(|id| !id.is_empty()) {
+                let status = crate::models::PresenceStatus {
+                    user_id: uid,
+                    availability: availability.clone(),
+                    activity: activity.clone(),
+                };
+                let _ = with_storage(storage, move |s| {
+                    s.upsert_presences(std::slice::from_ref(&status))
+                })
+                .await;
+            }
 
             Ok(json!({
                 "ok": true,

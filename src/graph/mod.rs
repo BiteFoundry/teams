@@ -109,6 +109,48 @@ impl GraphClient {
         }
     }
 
+    /// Fetches up to `limit` newest root messages (plus any expanded channel replies) across
+    /// one or more Graph pages, preserving the final `@odata.nextLink` for history cursors.
+    pub async fn list_messages_with_cursor(
+        &self,
+        target: &ConversationTarget,
+        limit: usize,
+    ) -> Result<(Vec<MessageItem>, Option<String>)> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+        let mut items = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut root_count = 0usize;
+        let mut next_link: Option<String> = None;
+
+        loop {
+            let page_top = if next_link.is_none() && limit <= 50 {
+                limit
+            } else {
+                50
+            };
+            let (page_items, next) = self
+                .list_messages_page(target, page_top, next_link.as_deref())
+                .await?;
+            for item in page_items {
+                if seen_ids.insert(item.msg_id.clone()) {
+                    if item.parent_msg_id.is_none() {
+                        root_count += 1;
+                    }
+                    items.push(item);
+                }
+            }
+            next_link = next;
+            if root_count >= limit || next_link.is_none() {
+                break;
+            }
+        }
+
+        client::sort_messages_chronologically(&mut items);
+        Ok((items, next_link))
+    }
+
     /// Fetches a single page of root messages (oldest-first within the returned batch) and returns `(messages, next_link)`.
     pub async fn list_messages_page(
         &self,

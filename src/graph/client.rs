@@ -729,6 +729,8 @@ pub(crate) struct GraphChatMessage {
     pub last_modified_date_time: Option<String>,
     #[serde(rename = "deletedDateTime", default)]
     pub deleted_date_time: Option<String>,
+    #[serde(rename = "@removed", default)]
+    pub removed: Option<serde_json::Value>,
     #[serde(default)]
     pub subject: Option<String>,
     #[serde(default)]
@@ -759,7 +761,7 @@ pub(crate) fn normalize_chat_message(
 ) -> MessageItem {
     let msg_id = raw.id;
     let msg_key = MessageItem::make_msg_key(conv_key, &msg_id);
-    let deleted = raw.deleted_date_time.is_some();
+    let deleted = raw.deleted_date_time.is_some() || raw.removed.is_some();
     let message_type = raw
         .message_type
         .filter(|s| !s.trim().is_empty())

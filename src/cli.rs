@@ -1717,7 +1717,9 @@ async fn cmd_chats(
         .filter(|c| !c.kind.is_channel())
         .collect();
 
-    let mut chats = if refresh || (!cached && cached_chats.len() < limit) || cached_chats.is_empty() {
+    let cache_usable = !refresh
+        && (cached || daemon_warm || (ttl > 0 && is_cursor_fresh(&storage, &["cli:chats"], ttl)));
+    let mut chats = if !cache_usable || (!cached && cached_chats.len() < limit) || cached_chats.is_empty() {
         let fetched = match graph.list_chats(limit).await {
             Ok(items) => items,
             Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
@@ -1857,7 +1859,11 @@ async fn cmd_teams(cfg: &AppConfig, refresh: bool, cached: bool, json_out: bool)
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
+    let force_fetch = refresh
+        || (!cached
+            && !daemon_warm
+            && !(ttl > 0 && is_cursor_fresh(&storage, &["cli:teams"], ttl)));
+    let teams = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
     print_teams_output(&teams, json_out)
 }
 
@@ -1884,7 +1890,11 @@ async fn cmd_channels(
     }
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let teams = load_teams_with_refresh(&graph, &storage, refresh).await?;
+    let force_fetch = refresh
+        || (!cached
+            && !daemon_warm
+            && !(ttl > 0 && is_cursor_fresh(&storage, &["cli:teams"], ttl)));
+    let teams = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
     let team = resolve_team_from_slice(&teams, team_query)?;
 
     let channels = if refresh && team.channels.is_empty() {
@@ -2407,11 +2417,22 @@ async fn cmd_react(
     json_out: bool,
 ) -> Result<()> {
     let normalized = normalize_reaction(reaction)?;
-    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let (auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
     graph
         .set_reaction(&conv.target, msg_id, thread, &normalized, enable)
         .await?;
+    let my_name = auth
+        .current_tokens()
+        .await
+        .and_then(|t| t.user_display_name);
+    let _ = storage.apply_local_reaction(
+        &conv.conv_key,
+        msg_id,
+        &normalized,
+        enable,
+        my_name.as_deref(),
+    );
 
     if json_out {
         println!(
@@ -2454,6 +2475,12 @@ async fn cmd_edit(
     graph
         .edit_message(&conv.target, msg_id, thread, &compiled.body_html)
         .await?;
+    let _ = storage.apply_local_edit(
+        &conv.conv_key,
+        msg_id,
+        &compiled.body_html,
+        &Utc::now().to_rfc3339(),
+    );
 
     if json_out {
         println!(
@@ -2496,6 +2523,7 @@ async fn cmd_delete(
     delete_gate(yes, json_out, answer.as_deref())?;
 
     graph.delete_message(&conv.target, msg_id, thread).await?;
+    let _ = storage.apply_local_soft_delete(&conv.conv_key, msg_id, &Utc::now().to_rfc3339());
 
     if json_out {
         println!(
@@ -2637,67 +2665,72 @@ async fn sync_conversation_depth(
     } else {
         storage.upsert_messages(&latest_msgs).unwrap_or(latest_msgs.len())
     };
+    let mut fetched_roots = latest_msgs
+        .iter()
+        .filter(|m| m.parent_msg_id.is_none())
+        .count();
 
     let scope_key = SyncCursor::history_scope(&conv.conv_key);
-    if storage.get_sync_cursor(&scope_key)?.is_none() {
-        let oldest_ts = if first_next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            latest_msgs.first().map(|m| m.created_at.clone())
-        };
-        let _ = storage.save_sync_cursor(&SyncCursor {
-            scope_key: scope_key.clone(),
-            delta_link: first_next_link,
-            oldest_msg_ts: oldest_ts,
-            synced_at: Utc::now().to_rfc3339(),
-        });
-    }
+    let mut current_next_link = first_next_link;
+    let mut oldest_seen_ts = latest_msgs
+        .iter()
+        .filter(|m| m.parent_msg_id.is_none())
+        .map(|m| m.created_at.clone())
+        .min();
 
-    let mut local_count = storage
-        .list_root_messages(&conv.conv_key, depth, None)
-        .map(|v| v.len())
-        .unwrap_or(0);
-
-    while local_count < depth {
-        let cursor = storage.get_sync_cursor(&scope_key)?;
-        if cursor.as_ref().is_some_and(SyncCursor::is_history_eof) {
+    while fetched_roots < depth {
+        let Some(link) = current_next_link.clone() else {
             break;
-        }
-        let saved_link = cursor.as_ref().and_then(|c| c.delta_link.clone());
-        let (older_msgs, new_next_link) = match graph
-            .fetch_older_messages(&conv.target, saved_link.as_deref(), None, depth - local_count)
+        };
+        let page_top = (depth - fetched_roots).min(50);
+        let (page_msgs, new_next_link) = match graph
+            .list_messages_page(&conv.target, page_top, Some(&link))
             .await
         {
             Ok(res) => res,
             Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
         };
-        if !older_msgs.is_empty() {
-            synced_count += storage.upsert_messages(&older_msgs).unwrap_or(older_msgs.len());
-        }
-        let oldest_ts = if new_next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            older_msgs
-                .first()
+        if !page_msgs.is_empty() {
+            synced_count += storage.upsert_messages(&page_msgs).unwrap_or(page_msgs.len());
+            fetched_roots += page_msgs
+                .iter()
+                .filter(|m| m.parent_msg_id.is_none())
+                .count();
+            if let Some(page_oldest) = page_msgs
+                .iter()
+                .filter(|m| m.parent_msg_id.is_none())
                 .map(|m| m.created_at.clone())
-                .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
-        };
-        let _ = storage.save_sync_cursor(&SyncCursor {
-            scope_key: scope_key.clone(),
-            delta_link: new_next_link.clone(),
-            oldest_msg_ts: oldest_ts,
-            synced_at: Utc::now().to_rfc3339(),
-        });
-
-        local_count = storage
-            .list_root_messages(&conv.conv_key, depth, None)
-            .map(|v| v.len())
-            .unwrap_or(local_count);
-
-        if new_next_link.is_none() || (older_msgs.is_empty() && new_next_link == saved_link) {
+                .min()
+            {
+                oldest_seen_ts = match oldest_seen_ts {
+                    Some(prev) if prev < page_oldest => Some(prev),
+                    _ => Some(page_oldest),
+                };
+            }
+        }
+        let no_progress = page_msgs.is_empty() && new_next_link.as_deref() == Some(link.as_str());
+        current_next_link = new_next_link;
+        if current_next_link.is_none() || no_progress {
             break;
         }
     }
+
+    let oldest_ts = if current_next_link.is_none() {
+        Some(SyncCursor::HISTORY_EOF.to_string())
+    } else {
+        oldest_seen_ts
+    };
+    let _ = storage.save_sync_cursor(&SyncCursor {
+        scope_key,
+        delta_link: current_next_link,
+        oldest_msg_ts: oldest_ts,
+        synced_at: Utc::now().to_rfc3339(),
+    });
+
+    let local_count = storage
+        .list_root_messages(&conv.conv_key, depth, None)
+        .map(|v| v.len())
+        .unwrap_or(0);
 
     Ok(synced_count.max(local_count))
 }
@@ -2998,7 +3031,7 @@ async fn cmd_presence(
     expiration_mins: Option<u32>,
     json_out: bool,
 ) -> Result<()> {
-    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    let (auth, graph, storage) = open_runtime(cfg, true).await?;
 
     if let Some(raw_avail) = set {
         let availability = normalize_presence_availability(raw_avail)?;
@@ -3011,6 +3044,23 @@ async fn cmd_presence(
             .await?;
 
         let latest = graph.get_my_presence().await.ok();
+        let my_uid = latest
+            .as_ref()
+            .map(|p| p.user_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| graph.my_user_id().map(str::to_string));
+        let my_uid = match my_uid {
+            Some(id) => Some(id),
+            None => auth.current_tokens().await.and_then(|t| t.user_id),
+        };
+        if let Some(uid) = my_uid.filter(|id| !id.is_empty()) {
+            let status = latest.clone().unwrap_or(crate::models::PresenceStatus {
+                user_id: uid,
+                availability: availability.clone(),
+                activity: act.to_string(),
+            });
+            let _ = storage.upsert_presences(std::slice::from_ref(&status));
+        }
         if json_out {
             println!(
                 "{}",
@@ -3212,34 +3262,29 @@ pub(crate) async fn read_conversation_messages(
     let scope_key = SyncCursor::history_scope(&conv.conv_key);
     match before {
         None => {
-            let fetched = if limit <= 50 {
-                let (msgs, next_link) = match graph.list_messages_page(&conv.target, limit, None).await {
-                    Ok(res) => res,
-                    Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-                };
-                storage.upsert_messages(&msgs)?;
-                if storage.get_sync_cursor(&scope_key)?.is_none() {
-                    let oldest_ts = if next_link.is_none() {
-                        Some(SyncCursor::HISTORY_EOF.to_string())
-                    } else {
-                        msgs.first().map(|m| m.created_at.clone())
-                    };
-                    let _ = storage.save_sync_cursor(&SyncCursor {
-                        scope_key: scope_key.clone(),
-                        delta_link: next_link,
-                        oldest_msg_ts: oldest_ts,
-                        synced_at: Utc::now().to_rfc3339(),
-                    });
-                }
-                msgs
-            } else {
-                let msgs = match graph.list_messages(&conv.target, limit).await {
-                    Ok(res) => res,
-                    Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
-                };
-                storage.upsert_messages(&msgs)?;
-                msgs
+            let (fetched, next_link) = match graph.list_messages_with_cursor(&conv.target, limit).await
+            {
+                Ok(res) => res,
+                Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
             };
+            storage.upsert_messages(&fetched)?;
+            if storage.get_sync_cursor(&scope_key)?.is_none() || limit > 50 {
+                let oldest_ts = if next_link.is_none() {
+                    Some(SyncCursor::HISTORY_EOF.to_string())
+                } else {
+                    fetched
+                        .iter()
+                        .filter(|m| m.parent_msg_id.is_none())
+                        .map(|m| m.created_at.clone())
+                        .min()
+                };
+                let _ = storage.save_sync_cursor(&SyncCursor {
+                    scope_key: scope_key.clone(),
+                    delta_link: next_link.clone(),
+                    oldest_msg_ts: oldest_ts,
+                    synced_at: Utc::now().to_rfc3339(),
+                });
+            }
 
             let rows = storage.list_root_messages(&conv.conv_key, limit + 1, None)?;
             let (mut messages, mut has_more) = trim_older_window(rows, limit);
@@ -3247,11 +3292,12 @@ pub(crate) async fn read_conversation_messages(
                 messages = fetched;
             }
             if !has_more {
-                has_more = storage
-                    .get_sync_cursor(&scope_key)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
+                has_more = next_link.is_some()
+                    || storage
+                        .get_sync_cursor(&scope_key)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|c| !c.is_history_eof() && c.delta_link.is_some());
             }
             hydrate_messages_attachments(&mut messages);
             let next_before = messages.first().map(|m| m.msg_id.clone());
@@ -3264,59 +3310,94 @@ pub(crate) async fn read_conversation_messages(
         Some(raw_before) => {
             let (before_ts, before_id) = resolve_before_cursor(storage, &conv.conv_key, raw_before)?;
             if fetch_older {
+                let cursor = storage.get_sync_cursor(&scope_key)?;
+                let cursor_is_eof = cursor.as_ref().is_some_and(SyncCursor::is_history_eof);
                 let mut local = storage.list_older_root_messages(
                     &conv.conv_key,
                     limit,
                     &before_ts,
                     before_id.as_deref(),
                 )?;
-                while local.len() < limit {
-                    let cursor = storage.get_sync_cursor(&scope_key)?;
-                    if cursor.as_ref().is_some_and(SyncCursor::is_history_eof) {
-                        break;
-                    }
-                    let saved_link = cursor.as_ref().and_then(|c| c.delta_link.clone());
+                if local.len() >= limit || cursor_is_eof {
+                    // Online history revalidation: reconcile the requested older window against Graph
+                    // so edits/deletes/reactions in previously cached older pages are reflected.
                     let (fetched, new_next_link) = match graph
-                        .fetch_older_messages(
-                            &conv.target,
-                            saved_link.as_deref(),
-                            Some(&before_ts),
-                            limit - local.len(),
-                        )
+                        .fetch_older_messages(&conv.target, None, Some(&before_ts), limit)
                         .await
                     {
                         Ok(res) => res,
                         Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
                     };
-
                     if !fetched.is_empty() {
                         storage.upsert_messages(&fetched)?;
                     }
-                    let oldest_ts = if new_next_link.is_none() {
-                        Some(SyncCursor::HISTORY_EOF.to_string())
-                    } else {
-                        fetched
-                            .first()
-                            .map(|m| m.created_at.clone())
-                            .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
-                    };
-                    let _ = storage.save_sync_cursor(&SyncCursor {
-                        scope_key: scope_key.clone(),
-                        delta_link: new_next_link.clone(),
-                        oldest_msg_ts: oldest_ts,
-                        synced_at: Utc::now().to_rfc3339(),
-                    });
+                    if new_next_link.is_none() || !cursor_is_eof {
+                        let oldest_ts = if new_next_link.is_none() {
+                            Some(SyncCursor::HISTORY_EOF.to_string())
+                        } else {
+                            fetched
+                                .iter()
+                                .filter(|m| m.parent_msg_id.is_none())
+                                .map(|m| m.created_at.clone())
+                                .min()
+                                .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
+                        };
+                        let _ = storage.save_sync_cursor(&SyncCursor {
+                            scope_key: scope_key.clone(),
+                            delta_link: new_next_link,
+                            oldest_msg_ts: oldest_ts,
+                            synced_at: Utc::now().to_rfc3339(),
+                        });
+                    }
+                } else {
+                    while local.len() < limit {
+                        let cur = storage.get_sync_cursor(&scope_key)?;
+                        if cur.as_ref().is_some_and(SyncCursor::is_history_eof) {
+                            break;
+                        }
+                        let saved_link = cur.as_ref().and_then(|c| c.delta_link.clone());
+                        let (fetched, new_next_link) = match graph
+                            .fetch_older_messages(
+                                &conv.target,
+                                saved_link.as_deref(),
+                                Some(&before_ts),
+                                limit - local.len(),
+                            )
+                            .await
+                        {
+                            Ok(res) => res,
+                            Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
+                        };
 
-                    local = storage.list_older_root_messages(
-                        &conv.conv_key,
-                        limit,
-                        &before_ts,
-                        before_id.as_deref(),
-                    )?;
-                    if new_next_link.is_none()
-                        || (fetched.is_empty() && new_next_link == saved_link)
-                    {
-                        break;
+                        if !fetched.is_empty() {
+                            storage.upsert_messages(&fetched)?;
+                        }
+                        let oldest_ts = if new_next_link.is_none() {
+                            Some(SyncCursor::HISTORY_EOF.to_string())
+                        } else {
+                            fetched
+                                .first()
+                                .map(|m| m.created_at.clone())
+                                .or_else(|| cur.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
+                        };
+                        let _ = storage.save_sync_cursor(&SyncCursor {
+                            scope_key: scope_key.clone(),
+                            delta_link: new_next_link.clone(),
+                            oldest_msg_ts: oldest_ts,
+                            synced_at: Utc::now().to_rfc3339(),
+                        });
+
+                        local = storage.list_older_root_messages(
+                            &conv.conv_key,
+                            limit,
+                            &before_ts,
+                            before_id.as_deref(),
+                        )?;
+                        if new_next_link.is_none()
+                            || (fetched.is_empty() && new_next_link == saved_link)
+                        {
+                            break;
+                        }
                     }
                 }
             }

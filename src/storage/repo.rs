@@ -227,6 +227,24 @@ pub fn mark_conversation_read(conn: &Connection, conv_key: &str, read_at: &str) 
     Ok(())
 }
 
+pub fn increment_conversation_unread(conn: &Connection, conv_key: &str, delta: i32) -> Result<()> {
+    if delta <= 0 {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare_cached(
+        "UPDATE conversations SET unread_count = MAX(0, unread_count) + ?1 WHERE conv_key = ?2",
+    )?;
+    stmt.execute(params![delta, conv_key])?;
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpsertMessagesOutcome {
+    pub changed_ids: Vec<String>,
+    pub inserted_ids: Vec<String>,
+    pub preview_updated_convs: Vec<String>,
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_MAPPED_MESSAGE_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -258,15 +276,24 @@ pub fn upsert_messages_returning_changed_ids(
     conn: &mut Connection,
     messages: &[MessageItem],
 ) -> Result<Vec<String>> {
-    let mut changed_ids = Vec::new();
-    upsert_messages_inner(conn, messages, Some(&mut changed_ids))?;
-    Ok(changed_ids)
+    let mut outcome = UpsertMessagesOutcome::default();
+    upsert_messages_inner(conn, messages, Some(&mut outcome))?;
+    Ok(outcome.changed_ids)
+}
+
+pub fn upsert_messages_detailed(
+    conn: &mut Connection,
+    messages: &[MessageItem],
+) -> Result<UpsertMessagesOutcome> {
+    let mut outcome = UpsertMessagesOutcome::default();
+    upsert_messages_inner(conn, messages, Some(&mut outcome))?;
+    Ok(outcome)
 }
 
 fn upsert_messages_inner(
     conn: &mut Connection,
     messages: &[MessageItem],
-    mut changed_ids: Option<&mut Vec<String>>,
+    mut outcome: Option<&mut UpsertMessagesOutcome>,
 ) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
@@ -276,6 +303,7 @@ fn upsert_messages_inner(
     let mut changed_count = 0usize;
     let mut touched_threads: HashSet<(String, String)> = HashSet::new();
     let mut newest_by_conv: HashMap<String, &MessageItem> = HashMap::new();
+    let mut empty_ts_tombstones: Vec<(String, String)> = Vec::new();
 
     {
         let mut check_stmt = tx.prepare_cached(
@@ -307,11 +335,20 @@ fn upsert_messages_inner(
                 reply_to_author = excluded.reply_to_author,
                 reply_to_preview = excluded.reply_to_preview,
                 subject = excluded.subject,
-                author_id = excluded.author_id,
-                author_name = excluded.author_name,
-                is_me = excluded.is_me,
-                created_at = excluded.created_at,
-                last_modified_at = excluded.last_modified_at,
+                author_id = COALESCE(excluded.author_id, messages.author_id),
+                author_name = CASE
+                    WHEN excluded.deleted = 1 AND excluded.author_name = 'Unknown' THEN messages.author_name
+                    ELSE excluded.author_name
+                END,
+                is_me = CASE
+                    WHEN excluded.deleted = 1 AND excluded.author_id IS NULL THEN messages.is_me
+                    ELSE excluded.is_me
+                END,
+                created_at = CASE
+                    WHEN excluded.created_at = '' THEN messages.created_at
+                    ELSE excluded.created_at
+                END,
+                last_modified_at = COALESCE(excluded.last_modified_at, messages.last_modified_at),
                 deleted = excluded.deleted,
                 importance = excluded.importance,
                 message_type = excluded.message_type,
@@ -385,11 +422,14 @@ fn upsert_messages_inner(
                 ref ex_mentions_json,
             )) = existing
             {
-                let scalars_unchanged = *ex_last_mod == msg.last_modified_at
+                let effective_author_same = (msg.deleted && msg.author_name == "Unknown")
+                    || *ex_author_name == msg.author_name;
+                let scalars_unchanged = (*ex_last_mod == msg.last_modified_at
+                    || (msg.deleted && msg.last_modified_at.is_none()))
                     && ex_deleted == deleted_int
                     && reply_count_i64 <= ex_reply_count
                     && *ex_body_plain == msg.body_plain
-                    && *ex_author_name == msg.author_name
+                    && effective_author_same
                     && *ex_subject == msg.subject;
                 if scalars_unchanged {
                     let rj = serialize_json_slice(&msg.reactions)?;
@@ -410,7 +450,7 @@ fn upsert_messages_inner(
                     }
                 }
                 ex_deleted == deleted_int
-                    && *ex_author_name == msg.author_name
+                    && effective_author_same
                     && *ex_body_plain == msg.body_plain
                     && *ex_subject == msg.subject
             } else {
@@ -458,9 +498,12 @@ fn upsert_messages_inner(
                 has_mentions_int,
             ])?;
             changed_count += 1;
-            if let Some(ids) = changed_ids.as_deref_mut() {
-                if !ids.iter().any(|id| id == &msg.msg_id) {
-                    ids.push(msg.msg_id.clone());
+            if let Some(out) = outcome.as_deref_mut() {
+                if !out.changed_ids.iter().any(|id| id == &msg.msg_id) {
+                    out.changed_ids.push(msg.msg_id.clone());
+                }
+                if existing.is_none() && !out.inserted_ids.iter().any(|id| id == &msg.msg_id) {
+                    out.inserted_ids.push(msg.msg_id.clone());
                 }
             }
 
@@ -479,14 +522,17 @@ fn upsert_messages_inner(
                 }
             }
 
-            if !msg.deleted {
+            if msg.deleted && msg.created_at.is_empty() {
+                empty_ts_tombstones.push((msg.conv_key.clone(), msg.msg_id.clone()));
+            } else {
                 newest_by_conv
                     .entry(msg.conv_key.clone())
-                    .and_modify(|existing| {
-                        if msg.created_at > existing.created_at
-                            || (msg.created_at == existing.created_at && msg.msg_id > existing.msg_id)
+                    .and_modify(|existing_newest| {
+                        if msg.created_at > existing_newest.created_at
+                            || (msg.created_at == existing_newest.created_at
+                                && msg.msg_id > existing_newest.msg_id)
                         {
-                            *existing = msg;
+                            *existing_newest = msg;
                         }
                     })
                     .or_insert(msg);
@@ -523,22 +569,73 @@ fn upsert_messages_inner(
             UPDATE conversations
             SET
                 last_msg_id = ?1,
-                last_msg_author = ?2,
+                last_msg_author = CASE
+                    WHEN ?6 = 1 AND ?2 = 'Unknown' THEN last_msg_author
+                    ELSE ?2
+                END,
                 last_msg_preview = ?3,
-                last_updated_at = ?4
+                last_updated_at = CASE
+                    WHEN ?4 != '' AND (last_updated_at IS NULL OR last_updated_at < ?4) THEN ?4
+                    ELSE last_updated_at
+                END
             WHERE conv_key = ?5
-              AND (last_updated_at IS NULL OR last_updated_at < ?4)
+              AND (
+                  (
+                      last_msg_id = ?1
+                      AND (
+                          last_msg_preview IS NOT ?3
+                          OR (
+                              CASE
+                                  WHEN ?6 = 1 AND ?2 = 'Unknown' THEN last_msg_author
+                                  ELSE ?2
+                              END
+                          ) IS NOT last_msg_author
+                      )
+                  )
+                  OR (
+                      ?4 != ''
+                      AND (last_updated_at IS NULL OR last_updated_at < ?4)
+                  )
+              )
             ",
         )?;
         for (conv_key, msg) in newest_by_conv {
             let preview = build_message_preview(msg);
-            conv_update_stmt.execute(params![
+            let rows = conv_update_stmt.execute(params![
                 msg.msg_id,
                 msg.author_name,
                 preview,
                 msg.created_at,
                 conv_key,
+                if msg.deleted { 1i32 } else { 0i32 },
             ])?;
+            if rows > 0 {
+                if let Some(out) = outcome.as_deref_mut() {
+                    if !out.preview_updated_convs.iter().any(|c| c == &conv_key) {
+                        out.preview_updated_convs.push(conv_key);
+                    }
+                }
+            }
+        }
+    }
+
+    if !empty_ts_tombstones.is_empty() {
+        let mut tombstone_stmt = tx.prepare_cached(
+            "
+            UPDATE conversations
+            SET last_msg_preview = '(deleted message)'
+            WHERE conv_key = ?1 AND last_msg_id = ?2
+            ",
+        )?;
+        for (conv_key, msg_id) in empty_ts_tombstones {
+            let rows = tombstone_stmt.execute(params![conv_key, msg_id])?;
+            if rows > 0 {
+                if let Some(out) = outcome.as_deref_mut() {
+                    if !out.preview_updated_convs.iter().any(|c| c == &conv_key) {
+                        out.preview_updated_convs.push(conv_key);
+                    }
+                }
+            }
         }
     }
 
@@ -655,7 +752,7 @@ pub fn list_thread_replies(
             reactions_json, reply_count, web_url
         FROM messages
         WHERE conv_key = ?1 AND parent_msg_id = ?2
-        ORDER BY created_at ASC, msg_id ASC
+        ORDER BY created_at DESC, msg_id DESC
         LIMIT ?3
         ",
     )?;
@@ -664,6 +761,7 @@ pub fn list_thread_replies(
     for row in rows {
         out.push(row?);
     }
+    out.reverse();
     Ok(out)
 }
 
@@ -1004,6 +1102,9 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 fn build_message_preview(msg: &MessageItem) -> String {
+    if msg.deleted {
+        return "(deleted message)".to_string();
+    }
     const MAX_CHARS: usize = 120;
     let mut single_line = String::with_capacity(MAX_CHARS.min(msg.body_plain.len()));
     let mut char_count = 0usize;

@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/teams",
-  "version": "0.1.0",
+  "version": "0.7.5",
   "description": "Ultra-fast Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",
@@ -34,11 +34,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/teams-win32-x64": "0.1.0",
-    "@bitefoundry/teams-win32-arm64": "0.1.0",
-    "@bitefoundry/teams-darwin-x64": "0.1.0",
-    "@bitefoundry/teams-darwin-arm64": "0.1.0",
-    "@bitefoundry/teams-linux-x64": "0.1.0",
-    "@bitefoundry/teams-linux-arm64": "0.1.0"
+    "@bitefoundry/teams-win32-x64": "0.7.5",
+    "@bitefoundry/teams-win32-arm64": "0.7.5",
+    "@bitefoundry/teams-darwin-x64": "0.7.5",
+    "@bitefoundry/teams-darwin-arm64": "0.7.5",
+    "@bitefoundry/teams-linux-x64": "0.7.5",
+    "@bitefoundry/teams-linux-arm64": "0.7.5"
   }
 }

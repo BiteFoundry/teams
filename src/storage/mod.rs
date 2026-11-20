@@ -13,9 +13,11 @@ use std::{
 use anyhow::Result;
 
 use crate::models::{
-    ConversationSummary, MemberInfo, MessageItem, PresenceStatus, SearchHit, SyncCursor,
-    TeamSummary, ThreadView,
+    ConversationSummary, MemberInfo, MessageItem, PresenceStatus, ReactionSummary, SearchHit,
+    SyncCursor, TeamSummary, ThreadView,
 };
+
+pub use repo::UpsertMessagesOutcome;
 
 const MAX_READER_POOL_SIZE: usize = 4;
 
@@ -203,6 +205,11 @@ impl Storage {
         repo::mark_conversation_read(&conn, conv_key, read_at)
     }
 
+    pub fn increment_conversation_unread(&self, conv_key: &str, delta: i32) -> Result<()> {
+        let conn = self.lock_conn()?;
+        repo::increment_conversation_unread(&conn, conv_key, delta)
+    }
+
     // --- Messages & Threads ---
     pub fn upsert_messages(&self, messages: &[MessageItem]) -> Result<usize> {
         let mut conn = self.lock_conn()?;
@@ -215,6 +222,73 @@ impl Storage {
     ) -> Result<Vec<String>> {
         let mut conn = self.lock_conn()?;
         repo::upsert_messages_returning_changed_ids(&mut conn, messages)
+    }
+
+    pub fn upsert_messages_detailed(
+        &self,
+        messages: &[MessageItem],
+    ) -> Result<repo::UpsertMessagesOutcome> {
+        let mut conn = self.lock_conn()?;
+        repo::upsert_messages_detailed(&mut conn, messages)
+    }
+
+    /// Applies an accepted remote edit to a cached message via the standard upsert path
+    /// (updating `messages`, `messages_fts`, and `conversations.last_msg_preview`).
+    pub fn apply_local_edit(
+        &self,
+        conv_key: &str,
+        msg_id: &str,
+        new_body_html: &str,
+        edited_at: &str,
+    ) -> Result<Option<(MessageItem, repo::UpsertMessagesOutcome)>> {
+        let mut conn = self.lock_conn()?;
+        let Some(mut msg) = repo::get_message(&conn, conv_key, msg_id)? else {
+            return Ok(None);
+        };
+        msg.body_html = new_body_html.to_string();
+        msg.body_plain = crate::parser::html_and_cards_to_plain(new_body_html, &msg.attachments);
+        msg.last_modified_at = Some(edited_at.to_string());
+        msg.deleted = false;
+        let outcome = repo::upsert_messages_detailed(&mut conn, std::slice::from_ref(&msg))?;
+        Ok(Some((msg, outcome)))
+    }
+
+    /// Applies an accepted remote soft-delete to a cached message via the standard upsert path
+    /// (removing from `messages_fts`, recalculating `reply_count`, and updating `last_msg_preview`).
+    pub fn apply_local_soft_delete(
+        &self,
+        conv_key: &str,
+        msg_id: &str,
+        deleted_at: &str,
+    ) -> Result<Option<(MessageItem, repo::UpsertMessagesOutcome)>> {
+        let mut conn = self.lock_conn()?;
+        let Some(mut msg) = repo::get_message(&conn, conv_key, msg_id)? else {
+            return Ok(None);
+        };
+        msg.deleted = true;
+        msg.body_html.clear();
+        msg.body_plain = "(deleted message)".to_string();
+        msg.last_modified_at = Some(deleted_at.to_string());
+        let outcome = repo::upsert_messages_detailed(&mut conn, std::slice::from_ref(&msg))?;
+        Ok(Some((msg, outcome)))
+    }
+
+    /// Applies an accepted remote reaction toggle to a cached message via the standard upsert path.
+    pub fn apply_local_reaction(
+        &self,
+        conv_key: &str,
+        msg_id: &str,
+        reaction_type: &str,
+        enable: bool,
+        my_display_name: Option<&str>,
+    ) -> Result<Option<(MessageItem, repo::UpsertMessagesOutcome)>> {
+        let mut conn = self.lock_conn()?;
+        let Some(mut msg) = repo::get_message(&conn, conv_key, msg_id)? else {
+            return Ok(None);
+        };
+        apply_reaction_toggle(&mut msg, reaction_type, enable, my_display_name);
+        let outcome = repo::upsert_messages_detailed(&mut conn, std::slice::from_ref(&msg))?;
+        Ok(Some((msg, outcome)))
     }
 
     /// Lists root messages in chronological order (oldest first, newest last), limited to newest `limit`.
@@ -327,6 +401,51 @@ impl Storage {
     pub fn save_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
         repo::save_sync_cursor(&conn, cursor)
+    }
+}
+
+pub(crate) fn apply_reaction_toggle(
+    msg: &mut MessageItem,
+    reaction_type: &str,
+    enable: bool,
+    my_display_name: Option<&str>,
+) {
+    let clean_name = my_display_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(r) = msg
+        .reactions
+        .iter_mut()
+        .find(|r| r.reaction_type == reaction_type)
+    {
+        if enable {
+            if !r.me_reacted {
+                r.me_reacted = true;
+                r.count = r.count.saturating_add(1);
+            }
+            if let Some(name) = clean_name {
+                if !r.users.iter().any(|u| u == name) {
+                    r.users.push(name.to_string());
+                }
+            }
+        } else {
+            if r.me_reacted {
+                r.me_reacted = false;
+                r.count = r.count.saturating_sub(1);
+            }
+            if let Some(name) = clean_name {
+                r.users.retain(|u| u != name);
+            }
+        }
+        msg.reactions.retain(|r| r.count > 0);
+    } else if enable {
+        let users = clean_name.map(|s| vec![s.to_string()]).unwrap_or_default();
+        msg.reactions.push(ReactionSummary {
+            reaction_type: reaction_type.to_string(),
+            count: 1,
+            me_reacted: true,
+            users,
+        });
     }
 }
 
@@ -1075,5 +1194,104 @@ mod tests {
         assert_eq!(fetched[0].body_plain, "one edited");
         assert_eq!(fetched[1].msg_id, "m2");
         assert!(fetched[1].deleted);
+    }
+
+    #[test]
+    fn test_local_edit_soft_delete_reaction_and_stable_last_msg_preview() {
+        let storage = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c-local", "Local Write Room", false, None);
+        let conv_key = chat.conv_key.clone();
+        storage.upsert_conversations(&[chat]).unwrap();
+
+        let m1 = sample_msg(&conv_key, "m1", None, "Alice", "older-token", None, "2026-11-20T01:00:00Z");
+        let m2 = sample_msg(&conv_key, "m2", None, "Alice", "alpha-before-edit", None, "2026-11-20T02:00:00Z");
+        storage.upsert_messages(&[m1, m2]).unwrap();
+        assert_eq!(
+            storage.get_conversation(&conv_key).unwrap().unwrap().last_msg_preview.as_deref(),
+            Some("alpha-before-edit")
+        );
+
+        // 1) Editing an older message keeps last_msg_preview pointing at m2.
+        storage
+            .apply_local_edit(&conv_key, "m1", "<p>older-edited</p>", "2026-11-20T02:05:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.get_conversation(&conv_key).unwrap().unwrap().last_msg_preview.as_deref(),
+            Some("alpha-before-edit")
+        );
+        assert!(storage.search_messages("older-token", None, 10).unwrap().is_empty());
+        assert_eq!(storage.search_messages("older-edited", None, 10).unwrap().len(), 1);
+
+        // 2) Editing the newest message updates FTS5 and conversations.last_msg_preview.
+        let (_, edit_out) = storage
+            .apply_local_edit(&conv_key, "m2", "<p>beta-after-edit</p>", "2026-11-20T02:10:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(edit_out.changed_ids, vec!["m2".to_string()]);
+        assert_eq!(edit_out.preview_updated_convs, vec![conv_key.clone()]);
+        assert!(storage.search_messages("alpha-before-edit", None, 10).unwrap().is_empty());
+        assert_eq!(storage.search_messages("beta-after-edit", None, 10).unwrap().len(), 1);
+        assert_eq!(
+            storage.get_conversation(&conv_key).unwrap().unwrap().last_msg_preview.as_deref(),
+            Some("beta-after-edit")
+        );
+
+        // 3) Reaction toggle is persisted and idempotent.
+        storage
+            .apply_local_reaction(&conv_key, "m2", "heart", true, Some("Me"))
+            .unwrap()
+            .unwrap();
+        storage
+            .apply_local_reaction(&conv_key, "m2", "heart", true, Some("Me"))
+            .unwrap()
+            .unwrap();
+        let after_rx = storage.get_message(&conv_key, "m2").unwrap().unwrap();
+        assert_eq!(after_rx.reactions.len(), 1);
+        assert_eq!(after_rx.reactions[0].count, 1);
+        assert!(after_rx.reactions[0].me_reacted);
+        storage
+            .apply_local_reaction(&conv_key, "m2", "heart", false, Some("Me"))
+            .unwrap()
+            .unwrap();
+        assert!(storage.get_message(&conv_key, "m2").unwrap().unwrap().reactions.is_empty());
+
+        // 4) Soft-deleting the newest message clears FTS5 and sets preview to "(deleted message)".
+        storage
+            .apply_local_soft_delete(&conv_key, "m2", "2026-11-20T02:15:00Z")
+            .unwrap()
+            .unwrap();
+        assert!(storage.search_messages("beta-after-edit", None, 10).unwrap().is_empty());
+        let deleted_m2 = storage.get_message(&conv_key, "m2").unwrap().unwrap();
+        assert!(deleted_m2.deleted);
+        assert_eq!(deleted_m2.body_plain, "(deleted message)");
+        assert_eq!(
+            storage.get_conversation(&conv_key).unwrap().unwrap().last_msg_preview.as_deref(),
+            Some("(deleted message)")
+        );
+    }
+
+    #[test]
+    fn test_list_thread_replies_returns_newest_limit_in_chronological_order() {
+        let storage = Storage::open_in_memory().unwrap();
+        let conv_key = "chan:t1:ch1";
+        let root = sample_msg(conv_key, "root", None, "Alice", "root post", None, "2026-11-20T05:00:00Z");
+        let mut all = vec![root];
+        for i in 1..=12 {
+            all.push(sample_msg(
+                conv_key,
+                &format!("rep-{i:02}"),
+                Some("root"),
+                "Bob",
+                &format!("reply {i:02}"),
+                None,
+                &format!("2026-11-20T05:{i:02}:00Z"),
+            ));
+        }
+        storage.upsert_messages(&all).unwrap();
+
+        let newest_5 = storage.list_thread_replies(conv_key, "root", 5).unwrap();
+        let ids: Vec<&str> = newest_5.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["rep-08", "rep-09", "rep-10", "rep-11", "rep-12"]);
     }
 }
