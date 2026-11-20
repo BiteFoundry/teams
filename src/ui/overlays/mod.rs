@@ -189,8 +189,13 @@ impl Overlay {
     }
 
     pub fn handle(&mut self, action: &Action, app: &AppState, ui: &UiState) -> OverlayOutcome {
+        let wheel_step = match action {
+            Action::MouseScroll { delta, .. } if *delta < 0 => Some(Action::MoveUp),
+            Action::MouseScroll { delta, .. } if *delta > 0 => Some(Action::MoveDown),
+            _ => None,
+        };
         match self {
-            Overlay::ContextMenu(menu) => match action {
+            Overlay::ContextMenu(menu) => match wheel_step.as_ref().unwrap_or(action) {
                 Action::MoveUp => {
                     menu.prev();
                     OverlayOutcome::Handled
@@ -204,29 +209,31 @@ impl Overlay {
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
                 _ => OverlayOutcome::Handled,
             },
-            Overlay::CommandPalette(palette) => match action {
+            Overlay::CommandPalette(palette) => match wheel_step.as_ref().unwrap_or(action) {
                 Action::Tab => palette.handle(&Action::MoveDown, app, ui),
                 Action::PrevFocus => palette.handle(&Action::MoveUp, app, ui),
                 other => palette.handle(other, app, ui),
             },
-            Overlay::Settings(settings) => match action {
+            Overlay::Settings(settings) => match wheel_step.as_ref().unwrap_or(action) {
                 Action::Tab => settings.handle(&Action::MoveDown, app),
                 Action::PrevFocus => settings.handle(&Action::MoveUp, app),
                 other => settings.handle(other, app),
             },
-            Overlay::Search(search) => search.handle(action, app),
-            Overlay::Presence(presence) => presence.handle(action),
-            Overlay::Reactions(reactions) => reactions.handle(action),
-            Overlay::Attachments(tray) => tray.handle(action, app),
+            Overlay::Search(search) => search.handle(wheel_step.as_ref().unwrap_or(action), app),
+            Overlay::Presence(presence) => presence.handle(wheel_step.as_ref().unwrap_or(action)),
+            Overlay::Reactions(reactions) => {
+                reactions.handle(wheel_step.as_ref().unwrap_or(action))
+            }
+            Overlay::Attachments(tray) => tray.handle(wheel_step.as_ref().unwrap_or(action), app),
             Overlay::PathInput(input) => input.handle(action),
-            Overlay::FilePicker(picker) => picker.handle(action),
-            Overlay::Links(links) => links.handle(action),
-            Overlay::NewChat(new_chat) => match action {
+            Overlay::FilePicker(picker) => picker.handle(wheel_step.as_ref().unwrap_or(action)),
+            Overlay::Links(links) => links.handle(wheel_step.as_ref().unwrap_or(action)),
+            Overlay::NewChat(new_chat) => match wheel_step.as_ref().unwrap_or(action) {
                 Action::Tab => new_chat.handle(&Action::MoveDown, app),
                 Action::PrevFocus => new_chat.handle(&Action::MoveUp, app),
                 other => new_chat.handle(other, app),
             },
-            Overlay::RoomInfo(info) => info.handle(action),
+            Overlay::RoomInfo(info) => info.handle(wheel_step.as_ref().unwrap_or(action)),
             Overlay::ImagePreview(preview) => preview.handle(action),
             Overlay::HtmlPreview(preview) => preview.handle(action),
             Overlay::Help(_) => match action {

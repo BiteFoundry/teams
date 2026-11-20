@@ -2561,6 +2561,31 @@ mod tests {
         assert_eq!(ui.focus(), Focus::Composer);
         assert_eq!(ui.chat_scroll.scroll_up, 3);
 
+        // Overscrolling past the top clamps to max_off (80), so a single wheel-down immediately moves.
+        for _ in 0..40 {
+            dispatch(
+                Action::MouseScroll {
+                    delta: -3,
+                    column: 10,
+                    row: 10,
+                },
+                &mut app,
+                &mut ui,
+            );
+        }
+        assert_eq!(ui.chat_scroll.scroll_up, 80);
+        dispatch(
+            Action::MouseScroll {
+                delta: 3,
+                column: 10,
+                row: 10,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(ui.chat_scroll.scroll_up, 77);
+        assert_eq!(ui.chat_scroll.offset(20), 3);
+
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 

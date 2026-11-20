@@ -43,6 +43,22 @@ use crate::ui::{
 
 static KITTY_USED_GLOBAL: AtomicBool = AtomicBool::new(false);
 
+/// VT DECSET sequences for X10 + button-motion + SGR mouse reporting.
+/// `crossterm 0.28` skips ANSI mouse codes on Windows, so writing these explicitly
+/// ensures ConPTY / Windows Terminal / xterm.js report mouse wheel events cleanly.
+pub(crate) const VT_ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+pub(crate) const VT_DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+pub(crate) fn write_vt_mouse_enable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_ENABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
+pub(crate) fn write_vt_mouse_disable(w: &mut impl io::Write) -> io::Result<()> {
+    w.write_all(VT_DISABLE_MOUSE.as_bytes())?;
+    w.flush()
+}
+
 #[cfg(windows)]
 mod win_console {
     use std::ptr::null_mut;
@@ -290,7 +306,10 @@ impl TerminalGuard {
             EnableBracketedPaste
         )?;
         #[cfg(windows)]
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        {
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            write_vt_mouse_enable(&mut stdout)?;
+        }
 
         let keyboard_enhanced = if supports_keyboard_enhancement().unwrap_or(false) {
             execute!(
@@ -306,7 +325,10 @@ impl TerminalGuard {
         };
 
         #[cfg(windows)]
-        win_console::enforce_windows_mouse_capture();
+        {
+            win_console::enforce_windows_mouse_capture();
+            let _ = write_vt_mouse_enable(&mut stdout);
+        }
 
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -345,7 +367,10 @@ impl TerminalGuard {
             LeaveAlternateScreen
         );
         #[cfg(windows)]
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        {
+            let _ = write_vt_mouse_disable(&mut stdout);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
         #[cfg(windows)]
         win_console::restore_console_mode(self.orig_conin_mode);
@@ -381,7 +406,10 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
             LeaveAlternateScreen
         );
         #[cfg(windows)]
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        {
+            let _ = write_vt_mouse_disable(&mut stdout);
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+        }
         let _ = disable_raw_mode();
         #[cfg(windows)]
         win_console::restore_console_mode(orig_conin_mode);
@@ -1035,7 +1063,10 @@ pub async fn run_with_persona(
                 EnableBracketedPaste
             )?;
             #[cfg(windows)]
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            {
+                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                write_vt_mouse_enable(&mut stdout)?;
+            }
             if guard.keyboard_enhanced {
                 let _ = execute!(
                     stdout,
@@ -1046,7 +1077,10 @@ pub async fn run_with_persona(
                 );
             }
             #[cfg(windows)]
-            win_console::enforce_windows_mouse_capture();
+            {
+                win_console::enforce_windows_mouse_capture();
+                let _ = write_vt_mouse_enable(&mut stdout);
+            }
             terminal.clear()?;
             dirty = true;
 
@@ -1330,5 +1364,22 @@ mod tests {
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE, 0x0098);
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0040, 0); // QuickEdit cleared
         assert_eq!(win_console::TUI_MOUSE_CAPTURE_MODE & 0x0200, 0); // VTInput cleared
+    }
+
+    #[test]
+    fn test_vt_mouse_enable_and_disable_ansi_sequences() {
+        let mut enable_buf = Vec::new();
+        write_vt_mouse_enable(&mut enable_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(enable_buf).unwrap(),
+            "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+        );
+
+        let mut disable_buf = Vec::new();
+        write_vt_mouse_disable(&mut disable_buf).unwrap();
+        assert_eq!(
+            String::from_utf8(disable_buf).unwrap(),
+            "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+        );
     }
 }

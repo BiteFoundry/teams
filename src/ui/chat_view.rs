@@ -184,6 +184,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     apply_prepend_anchor(ui, cached.lines.len(), height);
     apply_append_anchor(ui, cached.lines.len(), height);
     ui.chat_scroll.total_lines = cached.lines.len();
+    ui.chat_scroll.clamp_to_viewport(height);
     let offset = ui.chat_scroll.offset(height);
     ui.chat_scroll.offset = offset;
 

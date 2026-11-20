@@ -79,9 +79,25 @@ impl Default for ScrollState {
 }
 
 impl ScrollState {
+    pub fn clamp_to_viewport(&mut self, height: usize) {
+        let max_off = self
+            .total_lines
+            .saturating_sub(height)
+            .min(u16::MAX as usize) as u16;
+        if self.scroll_up > max_off {
+            self.scroll_up = max_off;
+        }
+        if self.scroll_up == 0 {
+            self.follow_tail = true;
+        }
+    }
+
     pub fn scroll_up(&mut self, lines: u16) {
         self.follow_tail = false;
         self.scroll_up = self.scroll_up.saturating_add(lines);
+        if self.area.height > 0 && self.total_lines > 0 {
+            self.clamp_to_viewport(self.area.height as usize);
+        }
     }
 
     pub fn scroll_down(&mut self, lines: u16) {
@@ -100,7 +116,16 @@ impl ScrollState {
 
     pub fn top(&mut self) {
         self.follow_tail = false;
-        self.scroll_up = self.total_lines.min(u16::MAX as usize) as u16;
+        let h = self.area.height as usize;
+        let max_off = if h > 0 {
+            self.total_lines.saturating_sub(h)
+        } else {
+            self.total_lines
+        };
+        self.scroll_up = max_off.min(u16::MAX as usize) as u16;
+        if self.scroll_up == 0 && h > 0 && self.total_lines > 0 {
+            self.follow_tail = true;
+        }
     }
 
     pub fn offset(&self, height: usize) -> usize {
