@@ -15,6 +15,7 @@ use super::composer::{self, ReplyPreview};
 use super::hitmap::{ButtonId, HitTarget, MessageScope};
 use super::nav_pane::{self, NavRow, TAB_CHATS, TAB_COUNT};
 use super::overlays::context_menu::{ContextMenu, ContextTarget};
+use super::overlays::html_preview::{adaptive_card_to_html, HtmlPreviewOverlay};
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::links::{self, LinksOverlay};
 use super::overlays::search::SearchOverlay;
@@ -234,12 +235,18 @@ pub enum Action {
     },
     ShowToast(String),
 
-    // Inline Images & Updater
+    // Inline Images, Interactive HTML Preview & Updater
     ToggleInlineImages,
     OpenImagePreview,
     LoadPreviewImage,
     CycleImageProtocol,
     DownloadPreviewImage,
+    OpenHtmlPreview,
+    OpenHtmlPreviewForMessage {
+        scope: MessageScope,
+        msg_index: usize,
+    },
+    ServeHtmlPreview,
     CheckForUpdates,
     ApplySelfUpdate,
 }
@@ -1236,6 +1243,15 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 });
             }
         }
+        Action::OpenHtmlPreview => {
+            open_html_preview(app, ui);
+        }
+        Action::OpenHtmlPreviewForMessage { scope, msg_index } => {
+            open_html_preview_for_message(scope, msg_index, app, ui);
+        }
+        Action::ServeHtmlPreview => {
+            serve_active_html_preview(app, ui);
+        }
         Action::CheckForUpdates => {
             app.check_for_updates(ui, true, false);
         }
@@ -1275,6 +1291,10 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
         OverlayKind::RoomInfo => Overlay::room_info(),
         OverlayKind::ImagePreview => {
             open_image_preview(app, ui);
+            return;
+        }
+        OverlayKind::HtmlPreview => {
+            open_html_preview(app, ui);
             return;
         }
         OverlayKind::Help => Overlay::help(),
@@ -1353,6 +1373,77 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
     };
 
     push_image_preview(preview, app, ui);
+}
+
+fn open_html_preview(app: &mut AppState, ui: &mut UiState) {
+    let in_thread_context =
+        ui.focus() == Focus::Thread || (ui.composer_target_thread && ui.thread_drawer_open);
+    let target = if in_thread_context {
+        selected_thread_scope_and_index(app, ui)
+            .or_else(|| app.active_thread.as_ref().map(|_| (MessageScope::ThreadRoot, 0)))
+    } else {
+        selected_message_scope_and_index(app, ui).or_else(|| {
+            (!app.messages.is_empty()).then_some((MessageScope::Chat, app.messages.len() - 1))
+        })
+    };
+
+    let Some((scope, msg_index)) = target else {
+        ui.info("No message selected for HTML preview");
+        return;
+    };
+
+    open_html_preview_for_message(scope, msg_index, app, ui);
+}
+
+fn open_html_preview_for_message(
+    scope: MessageScope,
+    msg_index: usize,
+    app: &mut AppState,
+    ui: &mut UiState,
+) {
+    let Some(msg) = app.message_at(scope, msg_index).cloned() else {
+        ui.info("No message selected for HTML preview");
+        return;
+    };
+
+    let eff = msg.effective_attachments();
+    if let Some(html_att) = eff
+        .iter()
+        .find(|att| HtmlPreviewOverlay::is_html_attachment(att) && att.content_url.is_some())
+        .cloned()
+    {
+        let body_trimmed = msg.body_html.trim();
+        let body_is_empty_or_placeholder = body_trimmed.is_empty()
+            || (body_trimmed.starts_with("<attachment")
+                && body_trimmed.ends_with("</attachment>")
+                && !body_trimmed.contains("<p")
+                && !body_trimmed.contains("<div"));
+        if body_is_empty_or_placeholder {
+            app.fetch_html_attachment(ui, html_att);
+            return;
+        }
+    }
+
+    if let Some(overlay) = HtmlPreviewOverlay::from_teams_message(&msg) {
+        ui.close_overlays_of(OverlayKind::HtmlPreview);
+        ui.push_overlay(Overlay::HtmlPreview(overlay));
+    } else {
+        ui.info("No HTML content or Adaptive Card in this message");
+    }
+}
+
+fn serve_active_html_preview(app: &mut AppState, ui: &mut UiState) {
+    let payload = ui.overlays.last().and_then(|top| {
+        if let Overlay::HtmlPreview(preview) = top {
+            Some((preview.title().to_string(), preview.raw_html().to_string()))
+        } else {
+            None
+        }
+    });
+    let Some((title, html)) = payload else {
+        return;
+    };
+    app.serve_html_preview(ui, title, html);
 }
 
 fn open_links_overlay(app: &AppState, ui: &mut UiState) {
@@ -1819,12 +1910,29 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 ui.close_top_overlay();
                 return false;
             }
-            Some(HitTarget::OverlayBody) => return false,
-            None => {
+            Some(HitTarget::Button(ButtonId::HtmlToggleRaw)) => {
+                if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last_mut() {
+                    preview.toggle_raw_mode();
+                }
+                return false;
+            }
+            Some(HitTarget::Button(ButtonId::HtmlOpenBrowser)) => {
+                return dispatch(Action::ServeHtmlPreview, app, ui);
+            }
+            Some(HitTarget::OverlayBody) => {
+                if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last_mut() {
+                    let outcome = preview.handle_screen_click(column, row);
+                    if let OverlayOutcome::Dispatch(next) = outcome {
+                        return dispatch(next, app, ui);
+                    }
+                }
+                return false;
+            }
+            // Clicking outside the modal (either empty background or an underlying pane target) closes the top overlay.
+            _ => {
                 ui.close_top_overlay();
                 return false;
             }
-            _ => return false,
         }
     }
 
@@ -1895,6 +2003,31 @@ fn click_attachment(
     let _ = dispatch(Action::SelectMessage { scope, msg_index }, app, ui);
     ui.attach_index = attach_index;
 
+    let clicked_att = app
+        .message_at(scope, msg_index)
+        .and_then(|msg| msg.effective_attachments().get(attach_index).cloned());
+
+    if let Some(att) = clicked_att {
+        if HtmlPreviewOverlay::is_html_attachment(&att) {
+            if att.content_url.is_some() {
+                app.fetch_html_attachment(ui, att);
+                return;
+            }
+            if let Some(inline_html) = att.content_json.as_deref().filter(|s| !s.trim().is_empty()) {
+                ui.close_overlays_of(OverlayKind::HtmlPreview);
+                ui.push_overlay(Overlay::html_preview(att.name, inline_html.to_string()));
+                return;
+            }
+        }
+        if HtmlPreviewOverlay::is_card_attachment(&att) {
+            if let Some((title, html)) = adaptive_card_to_html(&att) {
+                ui.close_overlays_of(OverlayKind::HtmlPreview);
+                ui.push_overlay(Overlay::html_preview(Some(title), html));
+                return;
+            }
+        }
+    }
+
     let preview_opt = app.message_at(scope, msg_index).and_then(|msg| {
         let eff = msg.effective_attachments();
         let is_img = eff.get(attach_index).is_some_and(|att| {
@@ -1956,6 +2089,9 @@ fn action_for_target(target: HitTarget) -> Action {
             ButtonId::NarrowChat => Action::SelectNarrowPane(NarrowPane::Chat),
             ButtonId::NarrowThread => Action::SelectNarrowPane(NarrowPane::Thread),
             ButtonId::ImagePreview => Action::OpenImagePreview,
+            ButtonId::HtmlPreview => Action::OpenHtmlPreview,
+            ButtonId::HtmlToggleRaw => Action::Input('m'),
+            ButtonId::HtmlOpenBrowser => Action::ServeHtmlPreview,
             ButtonId::CommandPalette => Action::OpenOverlay(OverlayKind::CommandPalette),
             ButtonId::DensityToggle => Action::ToggleDensity,
             ButtonId::Help => Action::OpenOverlay(OverlayKind::Help),
@@ -1971,6 +2107,9 @@ fn action_for_target(target: HitTarget) -> Action {
             super::hitmap::InlineActionKind::Reply => Action::ReplyTo { scope, msg_index },
             super::hitmap::InlineActionKind::Thread => Action::OpenThread { msg_index },
             super::hitmap::InlineActionKind::React => Action::OpenReactions { scope, msg_index },
+            super::hitmap::InlineActionKind::HtmlPreview => {
+                Action::OpenHtmlPreviewForMessage { scope, msg_index }
+            }
             super::hitmap::InlineActionKind::More => Action::SelectMessage { scope, msg_index },
         },
         HitTarget::SubjectInput => Action::FocusSubject,
@@ -2586,6 +2725,7 @@ mod tests {
                 lines: Vec::new(),
                 protocol: expected_next,
                 pixel_payload: Some("PIXEL_PAYLOAD".to_string()),
+                scroll_backing: None,
             },
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -2789,6 +2929,482 @@ mod tests {
         assert!(matches!(
             ui.overlays.last(),
             Some(Overlay::Links(l)) if l.links.len() == 1 && l.links[0].url == "https://example.com/pr/42"
+        ));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn wired_buttons_register_in_hitmap_and_dispatch_on_click() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = test_app_and_ui();
+        let ch_target = ConversationTarget::Channel {
+            team_id: "t1".into(),
+            channel_id: "ch1".into(),
+        };
+        app.conversations.push(crate::models::ConversationSummary {
+            conv_key: "channel:t1:ch1".into(),
+            target: ch_target.clone(),
+            kind: crate::models::ConversationKind::Channel,
+            team_id: Some("t1".into()),
+            team_name: Some("Engineering".into()),
+            title: "General".into(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        });
+        app.active_conv_key = Some("channel:t1:ch1".into());
+        app.active_target = Some(ch_target);
+        app.messages.push(crate::models::MessageItem {
+            msg_key: "channel:t1:ch1|m1".into(),
+            conv_key: "channel:t1:ch1".into(),
+            msg_id: "m1".into(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".into(),
+            is_me: false,
+            created_at: "2026-11-18T00:00:00Z".into(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".into(),
+            message_type: "message".into(),
+            body_html: String::new(),
+            body_plain: "Here is a screenshot".into(),
+            attachments: vec![crate::models::AttachmentInfo {
+                id: "att-1".into(),
+                content_type: "image/png".into(),
+                content_url: None,
+                name: Some("shot.png".into()),
+                content_json: None,
+                thumbnail_url: None,
+            }],
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        });
+        ui.set_focus(Focus::Chat);
+
+        // Draw Wide layout (140x40) and verify SendFile, Settings, Presence, SubjectToggle, ImagePreview
+        let mut wide_term = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        wide_term
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        let click_btn = |btn: ButtonId, app: &mut AppState, ui: &mut UiState| {
+            let rect = ui
+                .hitmap
+                .region_of(HitTarget::Button(btn))
+                .unwrap_or_else(|| panic!("expected ButtonId::{btn:?} in hitmap"));
+            dispatch(
+                Action::Click {
+                    column: rect.x,
+                    row: rect.y,
+                },
+                app,
+                ui,
+            );
+        };
+
+        // 1. SendFile -> opens PathInput overlay
+        click_btn(ButtonId::SendFile, &mut app, &mut ui);
+        assert_eq!(
+            ui.overlays.last().map(Overlay::kind),
+            Some(OverlayKind::PathInput)
+        );
+        ui.close_top_overlay();
+
+        // 2. Settings -> opens Settings overlay
+        click_btn(ButtonId::Settings, &mut app, &mut ui);
+        assert_eq!(
+            ui.overlays.last().map(Overlay::kind),
+            Some(OverlayKind::Settings)
+        );
+        ui.close_top_overlay();
+
+        // 3. Presence -> opens Presence overlay
+        click_btn(ButtonId::Presence, &mut app, &mut ui);
+        assert_eq!(
+            ui.overlays.last().map(Overlay::kind),
+            Some(OverlayKind::Presence)
+        );
+        ui.close_top_overlay();
+
+        // 4. SubjectToggle -> toggles ui.show_subject on channel root post
+        assert!(!ui.show_subject);
+        click_btn(ButtonId::SubjectToggle, &mut app, &mut ui);
+        assert!(ui.show_subject);
+
+        // 5. ImagePreview -> opens ImagePreview overlay
+        click_btn(ButtonId::ImagePreview, &mut app, &mut ui);
+        assert_eq!(
+            ui.overlays.last().map(Overlay::kind),
+            Some(OverlayKind::ImagePreview)
+        );
+        ui.close_top_overlay();
+
+        // 6. Narrow layout (70x24) -> NarrowToggle pill registered and toggles narrow_pane
+        ui.narrow_pane = NarrowPane::List;
+        let mut narrow_term = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        narrow_term
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        click_btn(ButtonId::NarrowToggle, &mut app, &mut ui);
+        assert_eq!(ui.narrow_pane, NarrowPane::Chat);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn html_preview_entry_points_onclick_raw_toggle_and_native_axum_serving() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let cfg = crate::config::AppConfig::default();
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl =
+            crate::sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        app.active_conv_key = Some("chat:c-html".into());
+        app.active_target = Some(ConversationTarget::Chat {
+            chat_id: "c-html".into(),
+        });
+        app.messages.push(crate::models::MessageItem {
+            msg_key: "chat:c-html|m1".into(),
+            conv_key: "chat:c-html".into(),
+            msg_id: "m1".into(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: Some("Release Report".into()),
+            author_id: None,
+            author_name: "Alice".into(),
+            is_me: false,
+            created_at: "2026-11-20T00:00:00Z".into(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".into(),
+            message_type: "message".into(),
+            body_html: r#"<div><p id="status">Pending</p><button onclick="document.getElementById('status').textContent='Approved';">Approve</button></div>"#.into(),
+            body_plain: "Pending Approve".into(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        });
+        ui.set_focus(Focus::Chat);
+        ui.chat_scroll.selected_idx = Some(0);
+
+        // Draw chat and verify both header `[H: HTML]` pill and inline `[H: HTML]` pill exist
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+        let header_btn = ui
+            .hitmap
+            .region_of(HitTarget::Button(ButtonId::HtmlPreview))
+            .expect("expected header [H: HTML] ButtonId::HtmlPreview");
+        let inline_chip = ui
+            .hitmap
+            .region_of(HitTarget::InlineAction {
+                scope: MessageScope::Chat,
+                msg_index: 0,
+                action: crate::ui::hitmap::InlineActionKind::HtmlPreview,
+            })
+            .expect("expected inline [H: HTML] chip on selected message");
+        assert!(inline_chip.width > 0);
+
+        // Click header `[H: HTML]` pill -> opens Overlay::HtmlPreview with QuickJS active
+        dispatch(
+            Action::Click {
+                column: header_btn.x,
+                row: header_btn.y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert_eq!(
+            ui.overlays.last().map(Overlay::kind),
+            Some(OverlayKind::HtmlPreview)
+        );
+
+        // Draw overlay so hitmap and last_content_area are populated
+        terminal
+            .draw(|frame| {
+                let _ = crate::ui::draw(frame, &mut app, &mut ui);
+            })
+            .unwrap();
+
+        // Click the <button onclick> using screen coordinates -> Action::Click -> click_at
+        let (btn_x, btn_y) = match ui.overlays.last_mut().unwrap() {
+            Overlay::HtmlPreview(preview) => {
+                assert!(preview.session.js_active);
+                let theme = HtmlPreviewOverlay::html_theme(&ui.theme);
+                let ctrl = preview
+                    .session
+                    .render(preview.last_content_area.width, &theme, false)
+                    .controls[0]
+                    .clone();
+                (
+                    preview.last_content_area.x + ctrl.col_start + 1,
+                    preview.last_content_area.y + (ctrl.line as u16),
+                )
+            }
+            _ => unreachable!(),
+        };
+        dispatch(
+            Action::Click {
+                column: btn_x,
+                row: btn_y,
+            },
+            &mut app,
+            &mut ui,
+        );
+
+        // Verify DOM updated from "Pending" to "Approved"
+        match ui.overlays.last_mut().unwrap() {
+            Overlay::HtmlPreview(preview) => {
+                let theme = HtmlPreviewOverlay::html_theme(&ui.theme);
+                let r = preview.session.render(80, &theme, false);
+                let text: String = r
+                    .lines
+                    .iter()
+                    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("Approved"), "expected Approved in:\n{text}");
+            }
+            _ => unreachable!(),
+        }
+
+        // Toggle Raw mode via `m` (ContextMenuCurrent from keymap) and back
+        dispatch(Action::ContextMenuCurrent, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::HtmlPreview(p)) if p.session.raw_mode
+        ));
+        dispatch(Action::Input('m'), &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::HtmlPreview(p)) if !p.session.raw_mode
+        ));
+
+        // Press `o` -> native Axum serving via NativeHtmlServer::serve_html
+        dispatch(Action::Input('o'), &mut app, &mut ui);
+        let mut served_url = None;
+        for _ in 0..10 {
+            if let Some(msg) = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                ui_rx.recv(),
+            )
+            .await
+            .ok()
+            .flatten()
+            {
+                if let crate::ui::app::UiMsg::HtmlServed { ref url } = msg {
+                    served_url = Some(url.clone());
+                }
+                app.handle_ui_msg(&mut ui, msg);
+                if served_url.is_some() {
+                    break;
+                }
+            }
+        }
+        let url = served_url.expect("expected UiMsg::HtmlServed from NativeHtmlServer");
+        assert!(url.starts_with("http://127.0.0.1:"));
+
+        // Fetch the served URL over TCP and confirm 200 OK + HTML payload
+        let without_scheme = url.strip_prefix("http://").unwrap();
+        let (host_port, path_tail) = without_scheme.split_once('/').unwrap();
+        let mut stream = TcpStream::connect(host_port).await.unwrap();
+        let req = format!("GET /{path_tail} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "unexpected response: {resp}");
+        assert!(resp.contains("Release Report"));
+        assert!(resp.contains("Approve"));
+
+        // Click outside modal -> closes HtmlPreview (dropping QuickJS session)
+        dispatch(Action::Click { column: 0, row: 0 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty());
+
+        app.html_server.shutdown();
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn image_preview_sniffs_html_bytes_and_auto_routes_to_html_preview() {
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let mock_app = Router::new()
+            .route(
+                "/fake-image.png",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        "<!DOCTYPE html><html><head><title>SSO Gate</title></head><body><h1>Sign in required</h1></body></html>",
+                    )
+                }),
+            )
+            .route(
+                "/report.html",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        "<!DOCTYPE html><html><head><title>Weekly HTML</title></head><body><p>Attached report</p></body></html>",
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = format!("http://127.0.0.1:{}", addr.port());
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl =
+            crate::sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), event_tx);
+        let (ui_tx, mut ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+
+        // 1. Image attachment whose URL actually serves HTML -> must auto-route to Overlay::HtmlPreview
+        let fake_png_url = format!("http://127.0.0.1:{}/fake-image.png", addr.port());
+        let html_att_url = format!("http://127.0.0.1:{}/report.html", addr.port());
+        app.messages.push(crate::models::MessageItem {
+            msg_key: "chat:c1|m-sniff".into(),
+            conv_key: "chat:c1".into(),
+            msg_id: "m-sniff".into(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".into(),
+            is_me: false,
+            created_at: "2026-11-20T00:00:00Z".into(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".into(),
+            message_type: "message".into(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: vec![
+                crate::models::AttachmentInfo {
+                    id: "hosted:fake1".into(),
+                    content_type: "hostedContent".into(),
+                    content_url: Some(fake_png_url),
+                    name: Some("screenshot.png".into()),
+                    content_json: None,
+                    thumbnail_url: None,
+                },
+                crate::models::AttachmentInfo {
+                    id: "att-html".into(),
+                    content_type: "text/html".into(),
+                    content_url: Some(html_att_url),
+                    name: Some("report.html".into()),
+                    content_json: None,
+                    thumbnail_url: None,
+                },
+            ],
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        });
+        ui.set_focus(Focus::Chat);
+        ui.chat_scroll.selected_idx = Some(0);
+
+        // Open ImagePreview for fake PNG attachment
+        dispatch(Action::OpenImagePreview, &mut app, &mut ui);
+        assert_eq!(
+            ui.overlays.last().map(Overlay::kind),
+            Some(OverlayKind::ImagePreview)
+        );
+
+        // Pump UiMsgs until ImageAutoRoutedToHtml switches overlay to HtmlPreview
+        for _ in 0..10 {
+            if let Some(msg) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), ui_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                app.handle_ui_msg(&mut ui, msg);
+                if ui.overlays.last().map(Overlay::kind) == Some(OverlayKind::HtmlPreview) {
+                    break;
+                }
+            }
+        }
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::HtmlPreview(p)) if p.raw_html().contains("Sign in required")
+        ));
+
+        // 2. Clicking an explicit `.html` attachment fetches and opens Overlay::HtmlPreview
+        ui.overlays.clear();
+        ui.hitmap.clear();
+        ui.hitmap.add_line(
+            4,
+            6,
+            20,
+            HitTarget::Attachment {
+                scope: MessageScope::Chat,
+                msg_index: 0,
+                attach_index: 1,
+            },
+        );
+        dispatch(Action::Click { column: 6, row: 6 }, &mut app, &mut ui);
+        for _ in 0..10 {
+            if let Some(msg) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), ui_rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                app.handle_ui_msg(&mut ui, msg);
+                if ui.overlays.last().map(Overlay::kind) == Some(OverlayKind::HtmlPreview) {
+                    break;
+                }
+            }
+        }
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::HtmlPreview(p)) if p.raw_html().contains("Attached report")
         ));
 
         app.sync_ctrl.request(SyncCommand::Shutdown);

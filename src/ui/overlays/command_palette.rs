@@ -78,6 +78,7 @@ fn palette_commands() -> Vec<PaletteItem> {
             Action::OpenOverlay(OverlayKind::Presence),
         ),
         ("Preview Image Attachment", "v", Action::OpenImagePreview),
+        ("Inspect Message HTML (Interactive)", "H", Action::OpenHtmlPreview),
         ("Send File", "Ctrl+O", Action::OpenSendFile),
         (
             "View Attachments",
@@ -111,7 +112,7 @@ fn palette_commands() -> Vec<PaletteItem> {
             Action::ClearPendingImages,
         ),
         ("Refresh Conversations", "F5 / R", Action::RefreshAll),
-        ("Sync Deep History (150)", "H / s", Action::SyncHistory),
+        ("Sync Deep History (150)", "s", Action::SyncHistory),
         ("Load Older Messages", "o", Action::LoadOlder),
         ("Download Latest Attachment", "d", Action::DownloadLatest),
         ("Focus Composer", "i", Action::OpenComposer),

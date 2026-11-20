@@ -31,8 +31,13 @@ pub struct AttachmentRow {
 impl AttachmentRow {
     pub fn icon(&self) -> &'static str {
         let ct = self.content_type.to_ascii_lowercase();
-        if ct.contains("image") {
+        if ct.contains("image") && !ct.contains("svg") {
             "[IMG]"
+        } else if ct.contains("html")
+            || self.name.to_ascii_lowercase().ends_with(".html")
+            || self.name.to_ascii_lowercase().ends_with(".htm")
+        {
+            "[HTML]"
         } else if ct.contains("card") {
             "[CARD]"
         } else {

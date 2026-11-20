@@ -5,6 +5,7 @@ pub mod command_palette;
 pub mod confirm;
 pub mod context_menu;
 pub mod file_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod mentions;
@@ -31,9 +32,10 @@ use crate::ui::{
     overlays::{
         attachments::AttachmentsState, command_palette::CommandPalette, confirm::ConfirmDialog,
         context_menu::ContextMenu, file_picker::FilePickerOverlay,
-        image_preview::ImagePreviewOverlay, links::LinksOverlay, new_chat::NewChatState,
-        path_input::PathInputState, presence::PresenceOverlay, reactions::ReactionsOverlay,
-        room_info::RoomInfoState, search::SearchOverlay, settings::SettingsState,
+        html_preview::HtmlPreviewOverlay, image_preview::ImagePreviewOverlay, links::LinksOverlay,
+        new_chat::NewChatState, path_input::PathInputState, presence::PresenceOverlay,
+        reactions::ReactionsOverlay, room_info::RoomInfoState, search::SearchOverlay,
+        settings::SettingsState,
     },
 };
 
@@ -52,6 +54,7 @@ pub enum OverlayKind {
     NewChat,
     RoomInfo,
     ImagePreview,
+    HtmlPreview,
     Help,
     Confirm,
 }
@@ -71,7 +74,7 @@ pub enum OverlayOutcome {
     NotHandled,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     ContextMenu(ContextMenu),
     CommandPalette(CommandPalette),
@@ -86,6 +89,7 @@ pub enum Overlay {
     NewChat(NewChatState),
     RoomInfo(RoomInfoState),
     ImagePreview(ImagePreviewOverlay),
+    HtmlPreview(HtmlPreviewOverlay),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -106,20 +110,26 @@ impl Overlay {
             Overlay::NewChat(_) => OverlayKind::NewChat,
             Overlay::RoomInfo(_) => OverlayKind::RoomInfo,
             Overlay::ImagePreview(_) => OverlayKind::ImagePreview,
+            Overlay::HtmlPreview(_) => OverlayKind::HtmlPreview,
             Overlay::Help(_) => OverlayKind::Help,
             Overlay::Confirm(_) => OverlayKind::Confirm,
         }
     }
 
     pub fn accepts_text(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Overlay::Search(_)
-                | Overlay::CommandPalette(_)
-                | Overlay::PathInput(_)
-                | Overlay::FilePicker(_)
-                | Overlay::NewChat(_)
-        )
+            | Overlay::CommandPalette(_)
+            | Overlay::PathInput(_)
+            | Overlay::FilePicker(_)
+            | Overlay::NewChat(_) => true,
+            Overlay::HtmlPreview(preview) => preview.is_editing_input(),
+            _ => false,
+        }
+    }
+
+    pub fn html_preview(title: Option<String>, raw_html: String) -> Self {
+        Overlay::HtmlPreview(HtmlPreviewOverlay::new(title, raw_html))
     }
 
     pub fn context_menu(menu: ContextMenu) -> Self {
@@ -218,6 +228,7 @@ impl Overlay {
             },
             Overlay::RoomInfo(info) => info.handle(action),
             Overlay::ImagePreview(preview) => preview.handle(action),
+            Overlay::HtmlPreview(preview) => preview.handle(action),
             Overlay::Help(_) => match action {
                 Action::CloseOverlay | Action::Activate => OverlayOutcome::Close,
                 Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
@@ -240,12 +251,16 @@ impl Overlay {
             Overlay::Links(links) => links.select(index),
             Overlay::NewChat(new_chat) => new_chat.select(index),
             Overlay::RoomInfo(info) => info.select(index),
-            Overlay::ImagePreview(_) | Overlay::PathInput(_) | Overlay::Help(_) | Overlay::Confirm(_) => {}
+            Overlay::ImagePreview(_)
+            | Overlay::HtmlPreview(_)
+            | Overlay::PathInput(_)
+            | Overlay::Help(_)
+            | Overlay::Confirm(_) => {}
         }
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         app: &AppState,
@@ -266,6 +281,7 @@ impl Overlay {
             Overlay::NewChat(new_chat) => new_chat.draw(frame, area, app, ui, hitmap),
             Overlay::RoomInfo(info) => info.draw(frame, area, app, ui, hitmap),
             Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
+            Overlay::HtmlPreview(preview) => preview.draw(frame, area, ui, hitmap),
             Overlay::Help(_) => draw_help(frame, area, ui, hitmap),
             Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
         }
@@ -299,11 +315,11 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
             ("↑/↓, j/k", "Select messages / navigate list"),
             ("PgUp / PgDn", "Scroll history (stays in Composer)"),
             ("Ctrl+↑ / Ctrl+↓", "Scroll 3 lines from Composer"),
-            ("o / H / s", "Load older (50) / deep history sync"),
+            ("o / s", "Load older (50) / deep history sync"),
             ("t / + / e", "Open channel thread / add reaction"),
             ("r / y / Del", "Reply / copy / delete message"),
             ("u / h", "Extract links / toggle inline href URLs"),
-            ("v / d / m", "Preview image / download / menu"),
+            ("v / H / d / m", "Preview image / HTML / download / menu"),
         ],
     ),
     (
@@ -399,10 +415,11 @@ pub fn draw_stack(
     frame: &mut Frame,
     area: Rect,
     app: &AppState,
-    ui: &UiState,
+    ui: &mut UiState,
     hitmap: &mut HitMap,
 ) {
-    if let Some(overlay) = ui.overlays.last() {
+    if let Some(mut overlay) = ui.overlays.pop() {
         overlay.draw(frame, area, app, ui, hitmap);
+        ui.overlays.push(overlay);
     }
 }

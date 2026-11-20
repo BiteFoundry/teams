@@ -249,6 +249,7 @@ impl Keymap {
             map.bind(Some(focus), Char('r'), M::NONE, Action::ReplyToSelected);
             map.bind(Some(focus), Char('u'), M::NONE, Action::OpenLinks);
             map.bind(Some(focus), Char('h'), M::NONE, Action::ToggleShowHrefs);
+            map.bind(Some(focus), Char('H'), M::NONE, Action::OpenHtmlPreview);
         }
         map.bind(
             Some(Focus::Chat),
@@ -301,6 +302,7 @@ impl Keymap {
         map.bind(any, Char('3'), M::CONTROL, Action::SelectNavTab(2));
         map.bind(any, Char('v'), M::NONE, Action::OpenImagePreview);
         map.bind(any, Char('v'), M::ALT, Action::OpenImagePreview);
+        map.bind(any, Char('H'), M::ALT, Action::OpenHtmlPreview);
 
         // Overlays & Teams actions
         map.bind(
@@ -529,6 +531,18 @@ mod tests {
         );
         assert_eq!(
             map.resolve(Focus::Chat, key(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(Action::OpenHtmlPreview)
+        );
+        assert_eq!(
+            map.resolve(Focus::Thread, key(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(Action::OpenHtmlPreview)
+        );
+        assert_eq!(
+            map.resolve(Focus::Nav, key(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(Action::SyncHistory)
+        );
+        assert_eq!(
+            map.resolve(Focus::Chat, key(KeyCode::Char('s'), KeyModifiers::NONE)),
             Some(Action::SyncHistory)
         );
         assert_eq!(

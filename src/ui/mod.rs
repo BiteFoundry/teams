@@ -452,11 +452,15 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     draw_status_bar(frame, plan.status, app, ui, &mut hitmap);
     draw_toasts(frame, area, ui);
 
-    let overlays = std::mem::take(&mut ui.overlays);
-    for overlay in &overlays {
+    let mut overlays = std::mem::take(&mut ui.overlays);
+    for overlay in &mut overlays {
         match overlay {
             overlays::Overlay::ImagePreview(preview) => {
                 preview.draw_sync(frame, area, app, ui, &mut hitmap);
+            }
+            overlays::Overlay::HtmlPreview(preview) => {
+                ui.pending_pixel_graphic = None;
+                preview.draw(frame, area, ui, &mut hitmap);
             }
             other => {
                 ui.pending_pixel_graphic = None;
@@ -546,6 +550,7 @@ fn draw_compact_bar(
             ui.narrow_pane == NarrowPane::Thread,
         ));
     }
+    pills.push((" ⇄ ", HitTarget::Button(ButtonId::NarrowToggle), false));
     pills.push((
         " [Jump] ",
         HitTarget::Button(ButtonId::CommandPalette),
@@ -662,11 +667,15 @@ fn draw_status_bar(
             (density_hint.as_str(), Some(ButtonId::DensityToggle)),
             (" · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
+            (" · ", None),
+            ("Settings", Some(ButtonId::Settings)),
             (" · Esc Browse ", None),
         ],
         Focus::Chat => vec![
             ("1-3 Tab · j/k Select · i Compose · r Reply · t Thread · + React · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
+            (" · ", None),
+            ("Settings", Some(ButtonId::Settings)),
             (" · ", None),
             ("?", Some(ButtonId::Help)),
             (" ", None),
@@ -675,12 +684,16 @@ fn draw_status_bar(
             ("1-3 Tab · j/k Move · Enter Open · u Unread · p Pin · f Filter · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
             (" · ", None),
+            ("Settings", Some(ButtonId::Settings)),
+            (" · ", None),
             ("?", Some(ButtonId::Help)),
             (" ", None),
         ],
         Focus::Thread => vec![
             ("j/k Select · i Reply · Alt+T Target · Esc Close · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
+            (" · ", None),
+            ("Settings", Some(ButtonId::Settings)),
             (" · ", None),
             ("?", Some(ButtonId::Help)),
             (" ", None),
@@ -693,11 +706,15 @@ fn draw_status_bar(
             (density_hint.as_str(), Some(ButtonId::DensityToggle)),
             (" · ", None),
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
+            (" · ", None),
+            ("Settings", Some(ButtonId::Settings)),
             (" ", None),
         ],
         Focus::Overlay => vec![("Esc Close ", None)],
         _ => vec![
             ("Ctrl+K Jump", Some(ButtonId::CommandPalette)),
+            (" · ", None),
+            ("Settings", Some(ButtonId::Settings)),
             (" · ", None),
             ("?", Some(ButtonId::Help)),
             (" ", None),
@@ -755,6 +772,21 @@ fn draw_status_bar(
             .fg(ui.theme.fg_secondary)
             .bg(ui.theme.bg_header)
     };
+
+    let presence_prefix_w = presence_prefix.width() as u16;
+    let presence_x = area.x.saturating_add(badge_w);
+    let avail_vis_w = avail.width().min(left_budget) as u16;
+    let presence_hit_w = presence_prefix_w
+        .saturating_add(avail_vis_w)
+        .min(area.right().saturating_sub(presence_x));
+    if presence_hit_w > 0 {
+        hitmap.add_line(
+            presence_x,
+            area.y,
+            presence_hit_w,
+            HitTarget::Button(ButtonId::Presence),
+        );
+    }
 
     let mut spans = vec![
         Span::styled(mode_badge, badge_style),

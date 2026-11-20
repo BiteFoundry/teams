@@ -247,6 +247,20 @@ pub enum UiMsg {
         att_id: String,
         error: String,
     },
+    ImageAutoRoutedToHtml {
+        cache_key: String,
+        owner_id: String,
+        att_id: String,
+        title: String,
+        html: String,
+    },
+    HtmlAttachmentLoaded {
+        title: String,
+        html: String,
+    },
+    HtmlServed {
+        url: String,
+    },
     UpdateChecked(UpdateCheckResult),
     DaemonAttached {
         pid: Option<u32>,
@@ -515,6 +529,8 @@ pub struct AppState {
     pub image_raw_cache: HashMap<String, Arc<[u8]>>,
     pub image_raw_order: VecDeque<String>,
     pub image_raw_bytes: usize,
+    /// Lazy localhost Axum server for viewing HTML documents in the default browser (`0 MB` idle).
+    pub html_server: bitefoundry_html::NativeHtmlServer,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
 }
 
@@ -579,6 +595,7 @@ impl AppState {
             image_raw_cache: HashMap::new(),
             image_raw_order: VecDeque::new(),
             image_raw_bytes: 0,
+            html_server: bitefoundry_html::NativeHtmlServer::new(),
             ui_tx,
         }
     }
@@ -2290,6 +2307,36 @@ impl AppState {
             };
             match raw_bytes {
                 Ok(bytes) => {
+                    let sniffed = bitefoundry_html::sniff_content_kind(
+                        Some(att.content_type.as_str()),
+                        att.name.as_deref(),
+                        Some(&bytes),
+                    );
+                    if sniffed == bitefoundry_html::ContentKind::Html {
+                        let html = String::from_utf8_lossy(&bytes).into_owned();
+                        let title = att
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("HTML ({att_id})"));
+                        if caps.is_some() {
+                            let _ = tx.send(UiMsg::ImageAutoRoutedToHtml {
+                                cache_key: key,
+                                owner_id: msg_id,
+                                att_id,
+                                title,
+                                html,
+                            });
+                        } else {
+                            let _ = tx.send(UiMsg::ImageDecodeFailed {
+                                cache_key: key,
+                                owner_id: msg_id,
+                                att_id,
+                                error: "HTML content detected (press H to view in HTML Preview)"
+                                    .to_string(),
+                            });
+                        }
+                        return;
+                    }
                     let decode_res = tokio::task::spawn_blocking(move || match caps {
                         Some(c) => img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg, c),
                         None => img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg),
@@ -2371,6 +2418,93 @@ impl AppState {
                 );
             }
         }
+    }
+
+    pub fn fetch_html_attachment(&self, ui: &mut UiState, att: AttachmentInfo) {
+        let title = att
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("HTML ({})", att.id));
+        if tokio::runtime::Handle::try_current().is_err() {
+            ui.error("Cannot fetch HTML attachment without async runtime");
+            return;
+        }
+        let graph = self.graph.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = format!("Open HTML: {title}");
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match graph.fetch_attachment_bytes(&att).await {
+                Ok((fetched_name, _, bytes)) => {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    let resolved_title = if fetched_name.trim().is_empty() {
+                        title
+                    } else {
+                        fetched_name
+                    };
+                    let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
+                        title: resolved_title,
+                        html,
+                    });
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: None,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("Failed to load HTML: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn serve_html_preview(&self, ui: &mut UiState, title: String, html: String) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            ui.error("Cannot start native HTML server without async runtime");
+            return;
+        }
+        let server = self.html_server.clone();
+        let tx = self.ui_tx.clone();
+        let task_label = format!("Serve HTML: {title}");
+        ui.tasks.begin(task_label.clone());
+
+        tokio::spawn(async move {
+            match server.serve_html(&title, &html).await {
+                Ok(url) => {
+                    #[cfg(not(test))]
+                    let open_res = open::that_detached(&url);
+                    #[cfg(test)]
+                    let open_res: Result<(), std::io::Error> = Ok(());
+
+                    let _ = tx.send(UiMsg::HtmlServed { url: url.clone() });
+                    let toast = match open_res {
+                        Ok(()) => (format!("Opened in browser: {url}"), ToastKind::Success),
+                        Err(err) => (
+                            format!("Serving at {url} (browser launch failed: {err})"),
+                            ToastKind::Info,
+                        ),
+                    };
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: None,
+                        toast: Some(toast),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::TaskDone {
+                        label: task_label,
+                        error: Some(err.to_string()),
+                        toast: Some((format!("Native HTML server failed: {err}"), ToastKind::Error)),
+                    });
+                }
+            }
+        });
     }
 
     pub fn check_for_updates(&mut self, ui: &mut UiState, check_only: bool, force: bool) {
@@ -2946,6 +3080,39 @@ impl AppState {
                     }
                 }
             }
+            UiMsg::ImageAutoRoutedToHtml {
+                cache_key,
+                owner_id,
+                att_id,
+                title,
+                html,
+            } => {
+                self.image_pending.remove(&cache_key);
+                self.clear_image_error(&cache_key);
+                let matches_active_preview = matches!(
+                    ui.overlays.last(),
+                    Some(Overlay::ImagePreview(preview))
+                        if preview
+                            .current()
+                            .is_some_and(|cur| cur.owner_id() == owner_id && cur.att_id() == att_id)
+                );
+                if matches_active_preview {
+                    ui.close_top_overlay();
+                    ui.close_overlays_of(OverlayKind::HtmlPreview);
+                    ui.push_overlay(Overlay::html_preview(Some(title), html));
+                    ui.info("HTML content detected — opened in interactive HTML Preview");
+                }
+            }
+            UiMsg::HtmlAttachmentLoaded { title, html } => {
+                ui.close_overlays_of(OverlayKind::HtmlPreview);
+                ui.push_overlay(Overlay::html_preview(Some(title), html));
+            }
+            UiMsg::HtmlServed { url } => {
+                if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last_mut() {
+                    preview.last_served_url = Some(url.clone());
+                    preview.session.last_status = Some(format!("Serving: {url}"));
+                }
+            }
             UiMsg::UpdateChecked(_res) => {}
             UiMsg::DaemonAttached { pid, sync_busy } => {
                 self.daemon_attached = true;
@@ -3232,6 +3399,7 @@ mod tests {
             lines: vec![],
             protocol: img_preview::TerminalImageProtocol::Halfblock,
             pixel_payload: None,
+            scroll_backing: None,
         }
     }
 

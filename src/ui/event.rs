@@ -289,6 +289,16 @@ mod tests {
                 &keymap,
                 false,
             ),
+            Some(Action::OpenHtmlPreview)
+        );
+        assert_eq!(
+            key_to_action_for_tab(
+                press(KeyCode::Char('s'), KeyModifiers::NONE),
+                Focus::Chat,
+                0,
+                &keymap,
+                false,
+            ),
             Some(Action::SyncHistory)
         );
     }

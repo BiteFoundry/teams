@@ -100,6 +100,11 @@ impl ContextMenu {
                     Action::CopyMessage { scope, msg_index },
                 ));
                 items.push(MenuItem::new(
+                    "Inspect HTML / Card",
+                    Some("H"),
+                    Action::OpenHtmlPreviewForMessage { scope, msg_index },
+                ));
+                items.push(MenuItem::new(
                     "Extract Links (URLs)",
                     Some("u"),
                     Action::OpenLinks,

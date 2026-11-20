@@ -19,6 +19,7 @@ anyhow = "1"
 arboard = { version = "3", features = ["image-data"] }
 axum = "0.8"
 base64 = "0.22"
+bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "13b5946eb5d7b6f4755188398cf8e6e085e3608e" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", features = ["event-stream"] }

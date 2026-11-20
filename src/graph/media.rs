@@ -606,7 +606,7 @@ async fn detect_downloaded_mime_and_image(
     file_name: &str,
     declared_content_type: &str,
 ) -> (String, bool) {
-    let mut header = [0u8; 16];
+    let mut header = [0u8; 512];
     let n = match tokio::fs::File::open(path).await {
         Ok(mut f) => {
             let mut read = 0usize;
@@ -634,6 +634,12 @@ async fn detect_downloaded_mime_and_image(
                 return (m.to_string(), true);
             }
         }
+        if crate::img_preview::looks_like_svg_bytes(&header[..n]) {
+            return ("image/svg+xml".to_string(), false);
+        }
+        if crate::img_preview::looks_like_html_bytes(&header[..n]) {
+            return ("text/html".to_string(), false);
+        }
     }
 
     let declared = declared_content_type.trim().to_ascii_lowercase();
@@ -645,8 +651,7 @@ async fn detect_downloaded_mime_and_image(
         mime_from_extension(file_name).to_string()
     };
 
-    let is_image = mime.starts_with("image/")
-        || crate::img_preview::is_image_mime_or_name(&mime, Some(file_name));
+    let is_image = crate::img_preview::is_image_mime_or_name(&mime, Some(file_name));
     (mime, is_image)
 }
 
@@ -970,5 +975,53 @@ mod tests {
             saw_auth.lock().unwrap().as_deref(),
             Some("Bearer hosted-secret-token")
         );
+    }
+
+    #[tokio::test]
+    async fn test_detect_downloaded_mime_rejects_svg_and_html_as_raster_images() {
+        let dir = tempdir().unwrap();
+
+        let svg_path = dir.path().join("diagram.svg");
+        std::fs::write(
+            &svg_path,
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>",
+        )
+        .unwrap();
+        let (mime, is_image) =
+            detect_downloaded_mime_and_image(&svg_path, "diagram.svg", "image/svg+xml").await;
+        assert_eq!(mime, "image/svg+xml");
+        assert!(!is_image, "SVG must not be classified as a raster image");
+
+        // Empty/unknown body with declared image/svg+xml must also be non-image
+        let empty_svg = dir.path().join("empty.svg");
+        std::fs::write(&empty_svg, b"").unwrap();
+        let (mime2, is_image2) =
+            detect_downloaded_mime_and_image(&empty_svg, "empty.svg", "image/svg+xml").await;
+        assert_eq!(mime2, "image/svg+xml");
+        assert!(!is_image2);
+
+        // HTML auth redirect disguised as a .png file must be classified as text/html, not raster image
+        let html_png = dir.path().join("login.png");
+        std::fs::write(
+            &html_png,
+            b"<!DOCTYPE html><html><body>Sign in</body></html>",
+        )
+        .unwrap();
+        let (mime3, is_image3) =
+            detect_downloaded_mime_and_image(&html_png, "login.png", "image/png").await;
+        assert_eq!(mime3, "text/html");
+        assert!(!is_image3);
+
+        // Real PNG header is classified as image/png + is_image = true
+        let real_png = dir.path().join("ok.bin");
+        std::fs::write(
+            &real_png,
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13],
+        )
+        .unwrap();
+        let (mime4, is_image4) =
+            detect_downloaded_mime_and_image(&real_png, "ok.bin", "application/octet-stream").await;
+        assert_eq!(mime4, "image/png");
+        assert!(is_image4);
     }
 }

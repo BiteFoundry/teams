@@ -19,7 +19,7 @@ use crate::{
     models::{ConversationKind, InlineImageUpload, MemberInfo, MentionInfo},
     ui::{
         app::{AppState, Focus, UiState},
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         overlays::mentions::MentionPopup,
     },
 };
@@ -826,7 +826,7 @@ pub fn draw(
     let is_channel_root = is_composing_channel_root(app, ui);
     let show_subject = is_channel_root && ui.show_subject;
 
-    // Row 0: top hairline (`─`) with embedded context label
+    // Row 0: top hairline (`─`) with embedded context label + clickable [Subject] / [+File] pills
     let hairline_style = if theme.no_color {
         if focused {
             Style::default().add_modifier(Modifier::BOLD)
@@ -838,10 +838,21 @@ pub fn draw(
     } else {
         Style::default().fg(theme.fg_subtle).bg(theme.bg_composer)
     };
-    let hairline = composer_hairline(ui, app, show_subject, is_channel_root, area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(hairline, hairline_style))),
+    let pill_style = if theme.no_color {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(theme.accent_soft).bg(theme.bg_composer)
+    };
+    draw_composer_hairline(
+        frame,
         Rect::new(area.x, area.y, area.width, 1),
+        ui,
+        app,
+        show_subject,
+        is_channel_root,
+        hairline_style,
+        pill_style,
+        hitmap,
     );
 
     let mut y = area.y.saturating_add(1);
@@ -1067,53 +1078,119 @@ fn is_composing_channel_root(app: &AppState, ui: &UiState) -> bool {
     !(ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some())
 }
 
-fn composer_hairline(
+#[allow(clippy::too_many_arguments)]
+fn draw_composer_hairline(
+    frame: &mut Frame,
+    rect: Rect,
     ui: &UiState,
     app: &AppState,
     show_subject: bool,
     is_channel_root: bool,
-    width: usize,
-) -> String {
-    if width == 0 {
-        return String::new();
+    hairline_style: Style,
+    pill_style: Style,
+    hitmap: &mut HitMap,
+) {
+    let width = rect.width as usize;
+    if width == 0 || rect.height == 0 {
+        return;
     }
+
     let conv_name = app
         .active_conversation()
         .map(|c| c.title.as_str())
         .unwrap_or("No conversation");
 
-    let prefix = if !show_subject {
+    let file_pill = "[+File]";
+    let file_pill_w = UnicodeWidthStr::width(file_pill);
+    let show_file_pill = width >= 20 && width >= file_pill_w + 10;
+    let right_reserved = if show_file_pill { file_pill_w + 3 } else { 0 };
+    let left_max = width.saturating_sub(right_reserved);
+
+    let subj_pill = if show_subject {
+        "[Subject ✓]"
+    } else {
+        "[Subject]"
+    };
+    let subj_pill_w = UnicodeWidthStr::width(subj_pill);
+    let in_thread = ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some();
+
+    let (base_prefix, include_subject_pill) = if !show_subject {
         if let Some(reply) = ui.composer.reply() {
-            let max_summary = width
+            let max_summary = left_max
                 .saturating_sub(UnicodeWidthStr::width(reply.author.as_str()) + 34)
                 .max(6);
-            format!(
-                "─ ↩ Replying to {}: \"{}\" · Esc cancel ",
-                reply.author,
-                reply.summary(max_summary)
+            (
+                format!(
+                    "─ ↩ Replying to {}: \"{}\" · Esc cancel ",
+                    reply.author,
+                    reply.summary(max_summary)
+                ),
+                false,
             )
-        } else if ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some()
-        {
-            "─ Reply in thread · Alt+T channel ".to_string()
+        } else if in_thread {
+            ("─ Reply in thread · Alt+T channel ".to_string(), false)
         } else if is_channel_root {
-            format!("─ New post in {conv_name} · Ctrl+S subject ")
+            (format!("─ New post in {conv_name} "), true)
         } else {
-            format!("─ {conv_name} ")
+            (format!("─ {conv_name} "), false)
         }
-    } else if ui.thread_drawer_open && ui.composer_target_thread && app.active_thread.is_some() {
-        "─ Reply in thread · Alt+T channel ".to_string()
+    } else if in_thread {
+        ("─ Reply in thread · Alt+T channel ".to_string(), false)
     } else if is_channel_root {
-        format!("─ New post in {conv_name} · Ctrl+S subject ")
+        (format!("─ New post in {conv_name} "), true)
     } else {
-        format!("─ {conv_name} ")
+        (format!("─ {conv_name} "), false)
     };
 
-    let mut out = truncate_display(&prefix, width);
-    let used = UnicodeWidthStr::width(out.as_str());
-    for _ in used..width {
-        out.push('─');
+    let show_subj_pill = include_subject_pill && left_max >= subj_pill_w + 8;
+    let prefix_budget = if show_subj_pill {
+        left_max.saturating_sub(subj_pill_w + 2)
+    } else {
+        left_max
+    };
+    let clipped_prefix = truncate_display(&base_prefix, prefix_budget);
+    let mut used = UnicodeWidthStr::width(clipped_prefix.as_str());
+
+    let mut spans = vec![Span::styled(clipped_prefix, hairline_style)];
+
+    if show_subj_pill {
+        let subj_x = rect.x.saturating_add(used as u16);
+        spans.push(Span::styled(subj_pill, pill_style));
+        spans.push(Span::styled(" ", hairline_style));
+        hitmap.add_line(
+            subj_x,
+            rect.y,
+            subj_pill_w as u16,
+            HitTarget::Button(ButtonId::SubjectToggle),
+        );
+        used += subj_pill_w + 1;
     }
-    out
+
+    if show_file_pill {
+        let fill_len = width.saturating_sub(used + file_pill_w + 2);
+        if fill_len > 0 {
+            spans.push(Span::styled("─".repeat(fill_len), hairline_style));
+            used += fill_len;
+        }
+        spans.push(Span::styled(" ", hairline_style));
+        used += 1;
+        let file_x = rect.x.saturating_add(used as u16);
+        spans.push(Span::styled(file_pill, pill_style));
+        hitmap.add_line(
+            file_x,
+            rect.y,
+            file_pill_w as u16,
+            HitTarget::Button(ButtonId::SendFile),
+        );
+        used += file_pill_w;
+        if used < width {
+            spans.push(Span::styled("─".repeat(width - used), hairline_style));
+        }
+    } else if used < width {
+        spans.push(Span::styled("─".repeat(width - used), hairline_style));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
 }
 
 fn push_line_spans(

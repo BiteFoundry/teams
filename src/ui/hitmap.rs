@@ -23,6 +23,9 @@ pub enum ButtonId {
     NarrowChat,
     NarrowThread,
     ImagePreview,
+    HtmlPreview,
+    HtmlToggleRaw,
+    HtmlOpenBrowser,
     CommandPalette,
     DensityToggle,
     Help,
@@ -37,6 +40,7 @@ pub enum InlineActionKind {
     Reply,
     Thread,
     React,
+    HtmlPreview,
     More,
 }
 

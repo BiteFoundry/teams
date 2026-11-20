@@ -414,11 +414,15 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitm
     };
     let header_style = Style::default().bg(header_bg);
 
-    let buttons: [(&str, ButtonId); 4] = [
+    let buttons: [(&str, ButtonId); 8] = [
         ("[Search]", ButtonId::Search),
+        ("[File]", ButtonId::SendFile),
         ("[Attach]", ButtonId::Attachments),
+        ("[Img]", ButtonId::ImagePreview),
+        ("[H: HTML]", ButtonId::HtmlPreview),
         ("[Info]", ButtonId::RoomInfo),
         ("[Refresh]", ButtonId::Refresh),
+        ("[Settings]", ButtonId::Settings),
     ];
 
     let min_title_w = 16u16;
@@ -1736,7 +1740,17 @@ fn render_message_body_and_attachments(
                 let is_img = attachments.get(attach_idx).is_some_and(|a| {
                     img_preview::is_image_mime_or_name(&a.content_type, a.name.as_deref())
                 });
-                let tag = if is_img { "IMG " } else { "FILE " };
+                let is_html = !is_img
+                    && attachments.get(attach_idx).is_some_and(
+                        crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_html_attachment,
+                    );
+                let tag = if is_img {
+                    "IMG "
+                } else if is_html {
+                    "HTML "
+                } else {
+                    "FILE "
+                };
                 let chip = format!("[{tag} {display_name}]");
                 let max_chip_w = bctx.width.saturating_sub(bctx.indent_col as usize);
                 let trunc_chip = truncate(&chip, max_chip_w);
@@ -1866,7 +1880,15 @@ fn render_message_body_and_attachments(
         ended_with_text = false;
         let name = att.name.as_deref().unwrap_or(&att.id);
         let is_img = img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref());
-        let tag = if is_img { "IMG " } else { "FILE " };
+        let is_html = !is_img
+            && crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_html_attachment(att);
+        let tag = if is_img {
+            "IMG "
+        } else if is_html {
+            "HTML "
+        } else {
+            "FILE "
+        };
         let chip = format!("[{tag} {name}]");
         let max_chip_w = bctx.width.saturating_sub(bctx.indent_col as usize);
         let trunc_chip = truncate(&chip, max_chip_w);
@@ -2031,11 +2053,13 @@ pub(crate) fn apply_selection_to_line(
                 ("r reply", InlineActionKind::Reply),
                 ("t thread", InlineActionKind::Thread),
                 ("+ react", InlineActionKind::React),
+                ("[H: HTML]", InlineActionKind::HtmlPreview),
             ]
         } else {
             &[
                 ("r reply", InlineActionKind::Reply),
                 ("+ react", InlineActionKind::React),
+                ("[H: HTML]", InlineActionKind::HtmlPreview),
             ]
         };
         let sep = " · ";
@@ -3271,6 +3295,7 @@ mod tests {
                 lines: vec![Line::from("▀▄▀▄"), Line::from("▄▀▄▀")],
                 protocol: img_preview::TerminalImageProtocol::Halfblock,
                 pixel_payload: None,
+                scroll_backing: None,
             },
         );
 
