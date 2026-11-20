@@ -342,7 +342,8 @@ impl GraphClient {
                 )
             });
 
-        let mut all_changed = Vec::new();
+        let mut all_changed: Vec<MessageItem> = Vec::new();
+        let mut msg_pos_by_id: HashMap<String, usize> = HashMap::new();
         let mut final_delta_link = None;
 
         loop {
@@ -353,17 +354,40 @@ impl GraphClient {
                     .as_deref()
                     .filter(|rid| !rid.is_empty() && *rid != raw.id)
                     .map(str::to_string);
-                let normalized =
+                let mut normalized =
                     normalize_chat_message(&conv_key, parent_id, my_id.as_deref(), raw);
                 if !is_pure_system_noise(&normalized) {
-                    all_changed.push(normalized);
+                    if let Some(&pos) = msg_pos_by_id.get(&normalized.msg_id) {
+                        let prev = &all_changed[pos];
+                        if normalized.deleted && normalized.created_at.is_empty() {
+                            normalized.created_at = prev.created_at.clone();
+                        }
+                        if normalized.deleted && normalized.author_name == "Unknown" {
+                            normalized.author_name = prev.author_name.clone();
+                            normalized.author_id = prev.author_id.clone();
+                            normalized.is_me = prev.is_me;
+                        }
+                        all_changed[pos] = normalized;
+                    } else {
+                        let idx = all_changed.len();
+                        msg_pos_by_id.insert(normalized.msg_id.clone(), idx);
+                        all_changed.push(normalized);
+                    }
                 }
             }
-            if let Some(dl) = page.delta_link {
+            if let Some(dl) = page
+                .delta_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 final_delta_link = Some(dl);
                 break;
             }
-            if let Some(nl) = page.next_link {
+            if let Some(nl) = page
+                .next_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
                 url = nl;
             } else {
                 break;

@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::models::{
     AttachmentInfo, ChannelSummary, ConversationKind, ConversationSummary, ConversationTarget,
@@ -238,6 +238,13 @@ pub fn increment_conversation_unread(conn: &Connection, conv_key: &str, delta: i
     Ok(())
 }
 
+pub fn set_conversation_pinned(conn: &Connection, conv_key: &str, pinned: bool) -> Result<()> {
+    let mut stmt =
+        conn.prepare_cached("UPDATE conversations SET pinned = ?1 WHERE conv_key = ?2")?;
+    stmt.execute(params![if pinned { 1i32 } else { 0i32 }, conv_key])?;
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UpsertMessagesOutcome {
     pub changed_ids: Vec<String>,
@@ -293,13 +300,25 @@ pub fn upsert_messages_detailed(
 fn upsert_messages_inner(
     conn: &mut Connection,
     messages: &[MessageItem],
-    mut outcome: Option<&mut UpsertMessagesOutcome>,
+    outcome: Option<&mut UpsertMessagesOutcome>,
 ) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
     }
     let tx = conn.transaction()?;
+    let changed_count = upsert_messages_in_transaction(&tx, messages, outcome)?;
+    tx.commit()?;
+    Ok(changed_count)
+}
 
+fn upsert_messages_in_transaction(
+    tx: &Transaction<'_>,
+    messages: &[MessageItem],
+    mut outcome: Option<&mut UpsertMessagesOutcome>,
+) -> Result<usize> {
+    if messages.is_empty() {
+        return Ok(0);
+    }
     let mut changed_count = 0usize;
     let mut touched_threads: HashSet<(String, String)> = HashSet::new();
     let mut newest_by_conv: HashMap<String, &MessageItem> = HashMap::new();
@@ -639,7 +658,6 @@ fn upsert_messages_inner(
         }
     }
 
-    tx.commit()?;
     Ok(changed_count)
 }
 
@@ -1007,6 +1025,33 @@ pub fn save_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> {
         cursor.synced_at,
     ])?;
     Ok(())
+}
+
+pub(crate) fn apply_channel_delta(
+    conn: &mut Connection,
+    expected: Option<&SyncCursor>,
+    cursor: &SyncCursor,
+    messages: &[MessageItem],
+    eligible_unread: &HashSet<&str>,
+) -> Result<Option<UpsertMessagesOutcome>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if get_sync_cursor(&tx, &cursor.scope_key)?.as_ref() != expected {
+        return Ok(None);
+    }
+
+    let mut outcome = UpsertMessagesOutcome::default();
+    upsert_messages_in_transaction(&tx, messages, Some(&mut outcome))?;
+    let unread = outcome
+        .inserted_ids
+        .iter()
+        .filter(|id| eligible_unread.contains(id.as_str()))
+        .count() as i32;
+    if unread > 0 {
+        increment_conversation_unread(&tx, &cursor.scope_key, unread)?;
+    }
+    save_sync_cursor(&tx, cursor)?;
+    tx.commit()?;
+    Ok(Some(outcome))
 }
 
 fn map_conversation_row(row: &Row<'_>) -> rusqlite::Result<ConversationSummary> {

@@ -258,6 +258,7 @@ impl Drop for AttachedClientGuard {
     fn drop(&mut self) {
         if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.sync_ctrl.set_focus(None, None);
+            self.sync_ctrl.reset_window_focus();
         }
     }
 }

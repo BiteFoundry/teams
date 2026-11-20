@@ -495,6 +495,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 app.config.pinned_convs = ui.pinned_convs.iter().cloned().collect();
                 app.config.pinned_convs.sort();
                 let _ = app.config.save();
+                let _ = app.storage.set_conversation_pinned(&key, pinned_now);
                 if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == key) {
                     conv.pinned = pinned_now;
                 }

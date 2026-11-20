@@ -4,7 +4,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -24,7 +24,7 @@ use crate::{
     graph::GraphClient,
     models::{
         ConversationKind, ConversationSummary, ConversationTarget, CoreEvent, MessageItem,
-        NotificationCandidate, PresenceStatus, SyncCursor, POLL_RETRY_SUMMARY,
+        NotificationCandidate, PresenceStatus, SyncCursor, TeamSummary, POLL_RETRY_SUMMARY,
     },
     storage::Storage,
 };
@@ -38,6 +38,25 @@ const MAX_TIER2_BATCH_SUBREQS: usize = 20;
 const ROLLING_CHAT_REVALIDATE_BATCH: usize = 5;
 const MIN_ROLLING_CHAT_SLOTS: usize = 2;
 const MAX_REFRESH_CHANNELS: usize = 20;
+const BACKGROUND_CHANNEL_BATCH_SIZE: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WindowFocusState {
+    Unknown = 0,
+    Focused = 1,
+    Unfocused = 2,
+}
+
+impl WindowFocusState {
+    fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::Focused,
+            2 => Self::Unfocused,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChatPollCacheEntry {
@@ -56,6 +75,7 @@ pub(crate) struct SyncSharedState {
     last_activity_ms: AtomicU64,
     activity_seq: AtomicU64,
     auth_pause_until_ms: AtomicU64,
+    window_focus: AtomicU8,
 }
 
 impl SyncSharedState {
@@ -69,6 +89,7 @@ impl SyncSharedState {
             last_activity_ms: AtomicU64::new(0),
             activity_seq: AtomicU64::new(0),
             auth_pause_until_ms: AtomicU64::new(0),
+            window_focus: AtomicU8::new(WindowFocusState::Unknown as u8),
         }
     }
 
@@ -83,6 +104,15 @@ impl SyncSharedState {
         let last_ms = self.last_activity_ms.load(Ordering::Acquire);
         let now_ms = now.saturating_duration_since(self.epoch).as_millis() as u64;
         (Duration::from_millis(now_ms.saturating_sub(last_ms)), seq)
+    }
+
+    pub(crate) fn window_focus(&self) -> WindowFocusState {
+        WindowFocusState::from_u8(self.window_focus.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_window_focus(&self, state: WindowFocusState) -> WindowFocusState {
+        let prev = self.window_focus.swap(state as u8, Ordering::AcqRel);
+        WindowFocusState::from_u8(prev)
     }
 
     pub(crate) fn pause_auth(&self, now: Instant, duration: Duration) {
@@ -233,6 +263,16 @@ pub(crate) fn idle_multiplier(idle_duration: Duration) -> u64 {
     }
 }
 
+pub(crate) fn effective_active_idle_multiplier(
+    window_focus: WindowFocusState,
+    idle_duration: Duration,
+) -> u64 {
+    match window_focus {
+        WindowFocusState::Focused | WindowFocusState::Unknown => 1,
+        WindowFocusState::Unfocused => idle_multiplier(idle_duration).max(4),
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct PeriodicBackoffTracker {
     tick_count: u64,
@@ -241,11 +281,14 @@ pub(crate) struct PeriodicBackoffTracker {
 
 impl PeriodicBackoffTracker {
     pub(crate) fn on_tick(&mut self, idle_duration: Duration, activity_seq: u64) -> bool {
+        self.on_tick_with_multiplier(idle_multiplier(idle_duration), activity_seq)
+    }
+
+    pub(crate) fn on_tick_with_multiplier(&mut self, mult: u64, activity_seq: u64) -> bool {
         if activity_seq != self.last_activity_seq {
             self.last_activity_seq = activity_seq;
             self.tick_count = 0;
         }
-        let mult = idle_multiplier(idle_duration);
         if mult <= 1 {
             self.tick_count = 0;
             return true;
@@ -255,7 +298,7 @@ impl PeriodicBackoffTracker {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FocusTarget {
     pub target: Option<ConversationTarget>,
     pub thread_root_id: Option<String>,
@@ -277,6 +320,9 @@ pub enum SyncCommand {
         channel_id: String,
     },
     NotifyUserActivity,
+    SetWindowFocus {
+        focused: bool,
+    },
     Shutdown,
 }
 
@@ -310,8 +356,15 @@ impl SyncController {
     }
 
     pub fn notify_activity(&self) {
-        self.shared.record_activity(Instant::now());
         self.request(SyncCommand::NotifyUserActivity);
+    }
+
+    pub fn set_window_focus(&self, focused: bool) {
+        self.request(SyncCommand::SetWindowFocus { focused });
+    }
+
+    pub fn reset_window_focus(&self) {
+        self.shared.set_window_focus(WindowFocusState::Unknown);
     }
 }
 
@@ -432,6 +485,52 @@ fn handle_lane1_error(
     }
 }
 
+enum ActiveSyncRunOutcome {
+    Completed(Result<()>),
+    FocusChanged,
+    Shutdown,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_active_sync_cancellable(
+    focus: &FocusTarget,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    last_active_sig: &mut HashMap<String, u64>,
+    is_periodic: bool,
+    focus_rx: &mut watch::Receiver<FocusTarget>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> ActiveSyncRunOutcome {
+    let check_focus_rx = focus_rx.clone();
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => {
+            if *shutdown_rx.borrow() {
+                ActiveSyncRunOutcome::Shutdown
+            } else {
+                ActiveSyncRunOutcome::Completed(Ok(()))
+            }
+        }
+        changed = focus_rx.changed() => {
+            if changed.is_err() {
+                ActiveSyncRunOutcome::Shutdown
+            } else {
+                ActiveSyncRunOutcome::FocusChanged
+            }
+        }
+        res = sync_active_focus_inner(
+            focus,
+            graph,
+            storage,
+            event_tx,
+            last_active_sig,
+            is_periodic,
+            Some(&check_focus_rx),
+        ) => ActiveSyncRunOutcome::Completed(res),
+    }
+}
+
 /// Spawns the two-lane background sync engine (Fast Interactive Lane + Background Poll Lane)
 /// and returns a `SyncController` handle.
 pub fn spawn_sync_engine(
@@ -448,6 +547,8 @@ pub fn spawn_sync_engine(
     let active_ms = config.active_poll_ms.max(250);
     let chat_ms = config.chat_poll_ms.max(500);
     let channel_ms = config.channel_poll_ms.max(1_000);
+    let resume_min_gap = Duration::from_millis((active_ms / 2).clamp(250, 1_500));
+    let config_pinned: HashSet<String> = config.pinned_convs.iter().cloned().collect();
     let shared = Arc::new(SyncSharedState::new());
 
     // Lane 1: Fast Interactive Lane (active conversation/thread polling + immediate commands)
@@ -463,6 +564,8 @@ pub fn spawn_sync_engine(
         let mut restricted_convs: HashSet<String> = HashSet::new();
         let mut last_active_sig: HashMap<String, u64> = HashMap::new();
         let mut active_err_backoff = ErrorBackoffState::new(active_ms);
+        let mut last_active_sync_at: Option<Instant> = None;
+        let mut pending_focus_sync = false;
 
         // Consume initial immediate tick so startup isn't flooded simultaneously before focus/commands arrive.
         active_tick.tick().await;
@@ -471,6 +574,61 @@ pub fn spawn_sync_engine(
             if *fast_shutdown_rx.borrow() {
                 break;
             }
+            if pending_focus_sync {
+                pending_focus_sync = false;
+                let now = Instant::now();
+                fast_shared.record_activity(now);
+                let focus = focus_rx.borrow_and_update().clone();
+                let is_restricted = focus
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| restricted_convs.contains(&t.conv_key()));
+                if !is_restricted
+                    && !fast_shared.is_auth_paused(now)
+                    && !active_err_backoff.is_backed_off(now)
+                {
+                    match run_active_sync_cancellable(
+                        &focus,
+                        &fast_graph,
+                        &fast_storage,
+                        &fast_event_tx,
+                        &mut last_active_sig,
+                        false,
+                        &mut focus_rx,
+                        &mut fast_shutdown_rx,
+                    )
+                    .await
+                    {
+                        ActiveSyncRunOutcome::Completed(Ok(())) => {
+                            last_active_sync_at = Some(Instant::now());
+                            if active_err_backoff.record_success() {
+                                let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
+                                    busy: false,
+                                    summary: "Synced".to_string(),
+                                });
+                            }
+                        }
+                        ActiveSyncRunOutcome::Completed(Err(err)) => {
+                            handle_lane1_error(
+                                &err,
+                                &focus,
+                                &fast_shared,
+                                &mut restricted_convs,
+                                &mut active_err_backoff,
+                                &fast_event_tx,
+                            );
+                        }
+                        ActiveSyncRunOutcome::FocusChanged => {
+                            pending_focus_sync = true;
+                            continue;
+                        }
+                        ActiveSyncRunOutcome::Shutdown => break,
+                    }
+                }
+                active_tick.reset();
+                continue;
+            }
+
             tokio::select! {
                 _ = fast_shutdown_rx.changed() => {
                     if *fast_shutdown_rx.borrow() {
@@ -495,15 +653,20 @@ pub fn spawn_sync_engine(
                             restricted_convs.clear();
                             active_err_backoff.reset_window();
                             let focus = focus_rx.borrow_and_update().clone();
-                            match sync_active_focus_with_state(
+                            match run_active_sync_cancellable(
                                 &focus,
                                 &fast_graph,
                                 &fast_storage,
                                 &fast_event_tx,
                                 &mut last_active_sig,
                                 false,
-                            ).await {
-                                Ok(()) => {
+                                &mut focus_rx,
+                                &mut fast_shutdown_rx,
+                            )
+                            .await
+                            {
+                                ActiveSyncRunOutcome::Completed(Ok(())) => {
+                                    last_active_sync_at = Some(Instant::now());
                                     if active_err_backoff.record_success() {
                                         let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
                                             busy: false,
@@ -511,7 +674,7 @@ pub fn spawn_sync_engine(
                                         });
                                     }
                                 }
-                                Err(err) => {
+                                ActiveSyncRunOutcome::Completed(Err(err)) => {
                                     handle_lane1_error(
                                         &err,
                                         &focus,
@@ -521,6 +684,11 @@ pub fn spawn_sync_engine(
                                         &fast_event_tx,
                                     );
                                 }
+                                ActiveSyncRunOutcome::FocusChanged => {
+                                    pending_focus_sync = true;
+                                    continue;
+                                }
+                                ActiveSyncRunOutcome::Shutdown => break,
                             }
                             active_tick.reset();
                         }
@@ -549,7 +717,137 @@ pub fn spawn_sync_engine(
                             }
                         }
                         Some(SyncCommand::NotifyUserActivity) => {
-                            fast_shared.record_activity(Instant::now());
+                            let now = Instant::now();
+                            let (prev_idle, _) = fast_shared.idle_snapshot(now);
+                            fast_shared.record_activity(now);
+                            let returning_from_idle =
+                                prev_idle >= Duration::from_secs(IDLE_THRESHOLD_SECS);
+                            let throttled = last_active_sync_at
+                                .is_some_and(|t| now.saturating_duration_since(t) < resume_min_gap);
+                            if returning_from_idle
+                                && !throttled
+                                && !fast_shared.is_auth_paused(now)
+                                && !active_err_backoff.is_backed_off(now)
+                            {
+                                let focus = focus_rx.borrow_and_update().clone();
+                                let allowed = focus
+                                    .target
+                                    .as_ref()
+                                    .is_some_and(|t| !restricted_convs.contains(&t.conv_key()));
+                                if allowed {
+                                    match run_active_sync_cancellable(
+                                        &focus,
+                                        &fast_graph,
+                                        &fast_storage,
+                                        &fast_event_tx,
+                                        &mut last_active_sig,
+                                        true,
+                                        &mut focus_rx,
+                                        &mut fast_shutdown_rx,
+                                    )
+                                    .await
+                                    {
+                                        ActiveSyncRunOutcome::Completed(Ok(())) => {
+                                            last_active_sync_at = Some(Instant::now());
+                                            if active_err_backoff.record_success() {
+                                                let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
+                                                    busy: false,
+                                                    summary: "Synced".to_string(),
+                                                });
+                                            }
+                                            active_tick.reset();
+                                        }
+                                        ActiveSyncRunOutcome::Completed(Err(err)) => {
+                                            handle_lane1_error(
+                                                &err,
+                                                &focus,
+                                                &fast_shared,
+                                                &mut restricted_convs,
+                                                &mut active_err_backoff,
+                                                &fast_event_tx,
+                                            );
+                                            active_tick.reset();
+                                        }
+                                        ActiveSyncRunOutcome::FocusChanged => {
+                                            pending_focus_sync = true;
+                                            continue;
+                                        }
+                                        ActiveSyncRunOutcome::Shutdown => break,
+                                    }
+                                }
+                            }
+                        }
+                        Some(SyncCommand::SetWindowFocus { focused }) => {
+                            let now = Instant::now();
+                            let (prev_idle, _) = fast_shared.idle_snapshot(now);
+                            let next_state = if focused {
+                                WindowFocusState::Focused
+                            } else {
+                                WindowFocusState::Unfocused
+                            };
+                            let prev_focus = fast_shared.set_window_focus(next_state);
+                            if focused {
+                                fast_shared.record_activity(now);
+                                let should_resume_check = prev_focus == WindowFocusState::Unfocused
+                                    || prev_idle >= Duration::from_secs(IDLE_THRESHOLD_SECS);
+                                let throttled = last_active_sync_at.is_some_and(|t| {
+                                    now.saturating_duration_since(t) < resume_min_gap
+                                });
+                                if should_resume_check
+                                    && !throttled
+                                    && !fast_shared.is_auth_paused(now)
+                                    && !active_err_backoff.is_backed_off(now)
+                                {
+                                    let focus = focus_rx.borrow_and_update().clone();
+                                    let allowed = focus
+                                        .target
+                                        .as_ref()
+                                        .is_some_and(|t| !restricted_convs.contains(&t.conv_key()));
+                                    if allowed {
+                                        match run_active_sync_cancellable(
+                                            &focus,
+                                            &fast_graph,
+                                            &fast_storage,
+                                            &fast_event_tx,
+                                            &mut last_active_sig,
+                                            true,
+                                            &mut focus_rx,
+                                            &mut fast_shutdown_rx,
+                                        )
+                                        .await
+                                        {
+                                            ActiveSyncRunOutcome::Completed(Ok(())) => {
+                                                last_active_sync_at = Some(Instant::now());
+                                                if active_err_backoff.record_success() {
+                                                    let _ = fast_event_tx.send(
+                                                        CoreEvent::SyncStateChanged {
+                                                            busy: false,
+                                                            summary: "Synced".to_string(),
+                                                        },
+                                                    );
+                                                }
+                                                active_tick.reset();
+                                            }
+                                            ActiveSyncRunOutcome::Completed(Err(err)) => {
+                                                handle_lane1_error(
+                                                    &err,
+                                                    &focus,
+                                                    &fast_shared,
+                                                    &mut restricted_convs,
+                                                    &mut active_err_backoff,
+                                                    &fast_event_tx,
+                                                );
+                                                active_tick.reset();
+                                            }
+                                            ActiveSyncRunOutcome::FocusChanged => {
+                                                pending_focus_sync = true;
+                                                continue;
+                                            }
+                                            ActiveSyncRunOutcome::Shutdown => break,
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -558,66 +856,36 @@ pub fn spawn_sync_engine(
                         let _ = shutdown_tx.send(true);
                         break;
                     }
-                    let now = Instant::now();
-                    fast_shared.record_activity(now);
-                    let focus = focus_rx.borrow_and_update().clone();
-                    let is_restricted = focus
-                        .target
-                        .as_ref()
-                        .is_some_and(|t| restricted_convs.contains(&t.conv_key()));
-                    if !is_restricted && !fast_shared.is_auth_paused(now) {
-                        match sync_active_focus_with_state(
-                            &focus,
-                            &fast_graph,
-                            &fast_storage,
-                            &fast_event_tx,
-                            &mut last_active_sig,
-                            false,
-                        ).await {
-                            Ok(()) => {
-                                if active_err_backoff.record_success() {
-                                    let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
-                                }
-                            }
-                            Err(err) => {
-                                handle_lane1_error(
-                                    &err,
-                                    &focus,
-                                    &fast_shared,
-                                    &mut restricted_convs,
-                                    &mut active_err_backoff,
-                                    &fast_event_tx,
-                                );
-                            }
-                        }
-                    }
-                    active_tick.reset();
+                    pending_focus_sync = true;
                 }
                 _ = active_tick.tick() => {
                     let now = Instant::now();
                     let (idle, seq) = fast_shared.idle_snapshot(now);
-                    if active_backoff.on_tick(idle, seq)
+                    let mult = effective_active_idle_multiplier(fast_shared.window_focus(), idle);
+                    if active_backoff.on_tick_with_multiplier(mult, seq)
                         && !fast_shared.is_auth_paused(now)
                         && !active_err_backoff.is_backed_off(now)
                     {
-                        let focus = focus_rx.borrow().clone();
+                        let focus = focus_rx.borrow_and_update().clone();
                         let allowed = focus
                             .target
                             .as_ref()
                             .is_some_and(|t| !restricted_convs.contains(&t.conv_key()));
                         if allowed {
-                            match sync_active_focus_with_state(
+                            match run_active_sync_cancellable(
                                 &focus,
                                 &fast_graph,
                                 &fast_storage,
                                 &fast_event_tx,
                                 &mut last_active_sig,
                                 true,
-                            ).await {
-                                Ok(()) => {
+                                &mut focus_rx,
+                                &mut fast_shutdown_rx,
+                            )
+                            .await
+                            {
+                                ActiveSyncRunOutcome::Completed(Ok(())) => {
+                                    last_active_sync_at = Some(Instant::now());
                                     if active_err_backoff.record_success() {
                                         let _ = fast_event_tx.send(CoreEvent::SyncStateChanged {
                                             busy: false,
@@ -625,7 +893,7 @@ pub fn spawn_sync_engine(
                                         });
                                     }
                                 }
-                                Err(err) => {
+                                ActiveSyncRunOutcome::Completed(Err(err)) => {
                                     handle_lane1_error(
                                         &err,
                                         &focus,
@@ -635,6 +903,11 @@ pub fn spawn_sync_engine(
                                         &fast_event_tx,
                                     );
                                 }
+                                ActiveSyncRunOutcome::FocusChanged => {
+                                    pending_focus_sync = true;
+                                    continue;
+                                }
+                                ActiveSyncRunOutcome::Shutdown => break,
                             }
                         }
                     }
@@ -643,7 +916,7 @@ pub fn spawn_sync_engine(
         }
     });
 
-    // Lane 2: Background Poll Lane (chat preview diff + $batch, presence polling, bulk refreshes)
+    // Lane 2: Background Poll Lane (chat preview diff + $batch, rotating channel delta, presence polling, bulk refreshes)
     let bg_shared = Arc::clone(&shared);
     let bg_focus_rx = focus_tx.subscribe();
     tokio::spawn(async move {
@@ -658,9 +931,12 @@ pub fn spawn_sync_engine(
         let mut chat_cache_seeded = false;
         let mut chats_cursor_initialized = false;
         let mut rolling_chat_cursor: usize = 0;
+        let mut channel_rotation = ChannelRotationState::default();
+        let mut restricted_channels: HashSet<String> = HashSet::new();
         let mut presence_cache: PresencePollCache = HashMap::new();
         let mut presence_disabled_for_token: Option<String> = None;
         let mut chat_err_backoff = ErrorBackoffState::new(chat_ms);
+        let mut channel_err_backoff = ErrorBackoffState::new(channel_ms);
         let mut presence_err_backoff = ErrorBackoffState::new(channel_ms);
 
         // Consume initial immediate ticks so startup isn't flooded simultaneously before focus/commands arrive.
@@ -684,7 +960,9 @@ pub fn spawn_sync_engine(
                         Some(SyncCommand::RefreshConversations) => {
                             bg_shared.clear_auth_pause();
                             presence_disabled_for_token = None;
+                            restricted_channels.clear();
                             chat_err_backoff.reset_window();
+                            channel_err_backoff.reset_window();
                             presence_err_backoff.reset_window();
                             let active_key = bg_focus_rx
                                 .borrow()
@@ -707,6 +985,7 @@ pub fn spawn_sync_engine(
                             ).await {
                                 Ok(()) => {
                                     chat_err_backoff.record_success();
+                                    channel_err_backoff.record_success();
                                     presence_err_backoff.record_success();
                                     let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                         busy: false,
@@ -743,9 +1022,13 @@ pub fn spawn_sync_engine(
                             &mut rolling_chat_cursor,
                         ).await {
                             Ok(()) => {
-                                let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
+                                let was_degraded = chat_err_backoff.is_degraded()
+                                    || channel_err_backoff.is_degraded()
+                                    || presence_err_backoff.is_degraded();
                                 chat_err_backoff.record_success();
-                                let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
+                                let now_degraded = chat_err_backoff.is_degraded()
+                                    || channel_err_backoff.is_degraded()
+                                    || presence_err_backoff.is_degraded();
                                 if was_degraded && !now_degraded {
                                     let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                         busy: false,
@@ -763,9 +1046,13 @@ pub fn spawn_sync_engine(
                                         chat_err_backoff.record_transient_failure(now);
                                     }
                                     SyncErrorKind::Transient => {
-                                        let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
+                                        let was_degraded = chat_err_backoff.is_degraded()
+                                            || channel_err_backoff.is_degraded()
+                                            || presence_err_backoff.is_degraded();
                                         chat_err_backoff.record_transient_failure(now);
-                                        let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
+                                        let now_degraded = chat_err_backoff.is_degraded()
+                                            || channel_err_backoff.is_degraded()
+                                            || presence_err_backoff.is_degraded();
                                         if !was_degraded && now_degraded {
                                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                                 busy: false,
@@ -782,45 +1069,64 @@ pub fn spawn_sync_engine(
                     let now = Instant::now();
                     let (idle, seq) = bg_shared.idle_snapshot(now);
                     maybe_shrink_on_idle_async(idle, &mut was_idle, &storage);
-                    if idle < Duration::from_secs(IDLE_THRESHOLD_SECS)
-                        && channel_backoff.on_tick(idle, seq)
-                        && !bg_shared.is_auth_paused(now)
-                        && !presence_err_backoff.is_backed_off(now)
-                    {
-                        let token_fp = current_token_fingerprint(&graph).await;
-                        if presence_disabled_for_token.as_ref() == Some(&token_fp) {
-                            continue;
-                        }
-                        presence_disabled_for_token = None;
-                        match poll_presences_tier3_with_cache(
-                            &graph,
-                            &storage,
-                            &event_tx,
-                            &mut presence_cache,
-                        ).await {
-                            Ok(()) => {
-                                let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                presence_err_backoff.record_success();
-                                let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                if was_degraded && !now_degraded {
-                                    let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                        busy: false,
-                                        summary: "Synced".to_string(),
-                                    });
+                    if channel_backoff.on_tick(idle, seq) && !bg_shared.is_auth_paused(now) {
+                        if !channel_err_backoff.is_backed_off(now) {
+                            let active_key = bg_focus_rx
+                                .borrow()
+                                .target
+                                .as_ref()
+                                .map(ConversationTarget::conv_key);
+                            let current_pins = tokio::task::spawn_blocking(|| {
+                                AppConfig::load_from(&crate::config::config_file_path())
+                                    .ok()
+                                    .map(|cfg| cfg.pinned_convs.into_iter().collect::<HashSet<_>>())
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            match poll_channels_tier3_rotating(
+                                &graph,
+                                &storage,
+                                &event_tx,
+                                Some(&bg_focus_rx),
+                                current_pins.as_ref().unwrap_or(&config_pinned),
+                                active_key.as_deref(),
+                                &mut channel_rotation,
+                                &mut restricted_channels,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    let was_degraded = chat_err_backoff.is_degraded()
+                                        || channel_err_backoff.is_degraded()
+                                        || presence_err_backoff.is_degraded();
+                                    channel_err_backoff.record_success();
+                                    let now_degraded = chat_err_backoff.is_degraded()
+                                        || channel_err_backoff.is_degraded()
+                                        || presence_err_backoff.is_degraded();
+                                    if was_degraded && !now_degraded {
+                                        let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                            busy: false,
+                                            summary: "Synced".to_string(),
+                                        });
+                                    }
                                 }
-                            }
-                            Err(err) => {
-                                match classify_sync_error(&err) {
-                                    SyncErrorKind::Forbidden403 => {
-                                        presence_disabled_for_token = Some(token_fp);
-                                    }
+                                Err(err) => match classify_sync_error(&err) {
                                     SyncErrorKind::Unauthorized401 => {
-                                        bg_shared.pause_auth(now, Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
+                                        bg_shared.pause_auth(
+                                            now,
+                                            Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS),
+                                        );
                                     }
+                                    SyncErrorKind::Forbidden403 => {}
                                     SyncErrorKind::Transient => {
-                                        let was_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
-                                        presence_err_backoff.record_transient_failure(now);
-                                        let now_degraded = chat_err_backoff.is_degraded() || presence_err_backoff.is_degraded();
+                                        let was_degraded = chat_err_backoff.is_degraded()
+                                            || channel_err_backoff.is_degraded()
+                                            || presence_err_backoff.is_degraded();
+                                        channel_err_backoff.record_transient_failure(now);
+                                        let now_degraded = chat_err_backoff.is_degraded()
+                                            || channel_err_backoff.is_degraded()
+                                            || presence_err_backoff.is_degraded();
                                         if !was_degraded && now_degraded {
                                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                                 busy: false,
@@ -828,6 +1134,66 @@ pub fn spawn_sync_engine(
                                             });
                                         }
                                     }
+                                },
+                            }
+                        }
+
+                        if idle < Duration::from_secs(IDLE_THRESHOLD_SECS)
+                            && !bg_shared.is_auth_paused(now)
+                            && !presence_err_backoff.is_backed_off(now)
+                        {
+                            let token_fp = current_token_fingerprint(&graph).await;
+                            if presence_disabled_for_token.as_ref() != Some(&token_fp) {
+                                presence_disabled_for_token = None;
+                                match poll_presences_tier3_with_cache(
+                                    &graph,
+                                    &storage,
+                                    &event_tx,
+                                    &mut presence_cache,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let was_degraded = chat_err_backoff.is_degraded()
+                                            || channel_err_backoff.is_degraded()
+                                            || presence_err_backoff.is_degraded();
+                                        presence_err_backoff.record_success();
+                                        let now_degraded = chat_err_backoff.is_degraded()
+                                            || channel_err_backoff.is_degraded()
+                                            || presence_err_backoff.is_degraded();
+                                        if was_degraded && !now_degraded {
+                                            let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                                busy: false,
+                                                summary: "Synced".to_string(),
+                                            });
+                                        }
+                                    }
+                                    Err(err) => match classify_sync_error(&err) {
+                                        SyncErrorKind::Forbidden403 => {
+                                            presence_disabled_for_token = Some(token_fp);
+                                        }
+                                        SyncErrorKind::Unauthorized401 => {
+                                            bg_shared.pause_auth(
+                                                now,
+                                                Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS),
+                                            );
+                                        }
+                                        SyncErrorKind::Transient => {
+                                            let was_degraded = chat_err_backoff.is_degraded()
+                                                || channel_err_backoff.is_degraded()
+                                                || presence_err_backoff.is_degraded();
+                                            presence_err_backoff.record_transient_failure(now);
+                                            let now_degraded = chat_err_backoff.is_degraded()
+                                                || channel_err_backoff.is_degraded()
+                                                || presence_err_backoff.is_degraded();
+                                            if !was_degraded && now_degraded {
+                                                let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                                    busy: false,
+                                                    summary: POLL_RETRY_SUMMARY.to_string(),
+                                                });
+                                            }
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -928,6 +1294,17 @@ async fn sync_active_focus(
     sync_active_focus_with_state(focus, graph, storage, event_tx, &mut sigs, false).await
 }
 
+fn is_focus_still_current(
+    live_focus_rx: Option<&watch::Receiver<FocusTarget>>,
+    expected: &FocusTarget,
+) -> bool {
+    match live_focus_rx {
+        Some(rx) => !rx.has_changed().unwrap_or(false) && *rx.borrow() == *expected,
+        None => true,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 async fn sync_active_focus_with_state(
     focus: &FocusTarget,
     graph: &GraphClient,
@@ -935,6 +1312,27 @@ async fn sync_active_focus_with_state(
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
     last_active_sig: &mut HashMap<String, u64>,
     is_periodic: bool,
+) -> Result<()> {
+    sync_active_focus_inner(
+        focus,
+        graph,
+        storage,
+        event_tx,
+        last_active_sig,
+        is_periodic,
+        None,
+    )
+    .await
+}
+
+async fn sync_active_focus_inner(
+    focus: &FocusTarget,
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    last_active_sig: &mut HashMap<String, u64>,
+    is_periodic: bool,
+    live_focus_rx: Option<&watch::Receiver<FocusTarget>>,
 ) -> Result<()> {
     let Some(target) = &focus.target else {
         return Ok(());
@@ -944,6 +1342,9 @@ async fn sync_active_focus_with_state(
     match target {
         ConversationTarget::Chat { .. } => {
             let (messages, next_link) = graph.list_messages_page(target, 50, None).await?;
+            if !is_focus_still_current(live_focus_rx, focus) {
+                return Ok(());
+            }
             let sig = compute_messages_signature(&messages);
             let prev_sig = last_active_sig.get(&conv_key).copied();
             if is_periodic && prev_sig == Some(sig) {
@@ -958,6 +1359,9 @@ async fn sync_active_focus_with_state(
                 Ok((outcome.changed_ids, filtered))
             })
             .await?;
+            if !is_focus_still_current(live_focus_rx, focus) {
+                return Ok(());
+            }
             last_active_sig.insert(conv_key.clone(), sig);
 
             if !is_periodic || prev_sig.is_none() || !changed_ids.is_empty() {
@@ -977,6 +1381,7 @@ async fn sync_active_focus_with_state(
             let key_for_cursor = conv_key.clone();
             let cursor =
                 run_storage(storage, move |st| st.get_sync_cursor(&key_for_cursor)).await?;
+            let requested_at = chrono::Utc::now();
             let delta_fut = graph.sync_channel_messages_delta(
                 team_id,
                 channel_id,
@@ -994,6 +1399,9 @@ async fn sync_active_focus_with_state(
                 }
             };
             let (delta_res, replies_opt) = tokio::join!(delta_fut, replies_fut);
+            if !is_focus_still_current(live_focus_rx, focus) {
+                return Ok(());
+            }
 
             match delta_res {
                 Ok((messages, new_delta_link)) => {
@@ -1009,7 +1417,7 @@ async fn sync_active_focus_with_state(
                         scope_key: conv_key.clone(),
                         delta_link: effective_delta_link,
                         oldest_msg_ts: oldest_ts,
-                        synced_at: chrono::Utc::now().to_rfc3339(),
+                        synced_at: requested_at.to_rfc3339(),
                     };
 
                     let sig = compute_messages_signature(&messages);
@@ -1017,19 +1425,19 @@ async fn sync_active_focus_with_state(
 
                     let msgs_for_db = messages.clone();
                     let outcome = run_storage(storage, move |st| {
-                        // Commit message upserts BEFORE advancing the delta cursor so delta updates
-                        // can never be skipped or permanently lost.
-                        let outcome = if !msgs_for_db.is_empty() {
-                            st.upsert_messages_detailed(&msgs_for_db)?
-                        } else {
-                            Default::default()
-                        };
-                        st.save_sync_cursor(&new_cursor)?;
-                        Ok(outcome)
+                        st.apply_channel_delta(
+                            cursor.as_ref(),
+                            &new_cursor,
+                            &msgs_for_db,
+                            &HashSet::new(),
+                        )
                     })
                     .await?;
+                    if !is_focus_still_current(live_focus_rx, focus) {
+                        return Ok(());
+                    }
 
-                    if !messages.is_empty() {
+                    if let Some(outcome) = outcome.filter(|_| !messages.is_empty()) {
                         last_active_sig.insert(conv_key.clone(), sig);
                         if !is_periodic || prev_sig.is_none() || !outcome.changed_ids.is_empty() {
                             let changed_ids = if outcome.changed_ids.is_empty() {
@@ -1051,39 +1459,48 @@ async fn sync_active_focus_with_state(
                     if !is_expired_delta_error(&err) {
                         return Err(err);
                     }
-                    // Clear stale delta token before falling back to page listing.
-                    let stale_key = conv_key.clone();
-                    let stale_oldest = cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone());
-                    run_storage(storage, move |st| {
-                        st.save_sync_cursor(&SyncCursor {
-                            scope_key: stale_key,
-                            delta_link: None,
-                            oldest_msg_ts: stale_oldest,
-                            synced_at: chrono::Utc::now().to_rfc3339(),
-                        })
-                    })
-                    .await?;
+                    let Some(cleared_cursor) =
+                        clear_channel_delta_cursor(storage, &conv_key, cursor).await?
+                    else {
+                        return Ok(());
+                    };
 
                     let (messages, next_link) = graph.list_messages_page(target, 50, None).await?;
+                    if !is_focus_still_current(live_focus_rx, focus) {
+                        return Ok(());
+                    }
                     let sig = compute_messages_signature(&messages);
                     let prev_sig = last_active_sig.get(&conv_key).copied();
                     if !(is_periodic && prev_sig == Some(sig)) {
                         let msgs_for_db = messages.clone();
                         let key_for_db = conv_key.clone();
-                        let changed_rows = run_storage(storage, move |st| {
-                            let changed = st.upsert_messages(&msgs_for_db)?;
-                            save_initial_history_cursor_if_absent(
-                                st,
-                                &key_for_db,
+                        let outcome = run_storage(storage, move |st| {
+                            let outcome = st.apply_channel_delta(
+                                Some(&cleared_cursor),
+                                &cleared_cursor,
                                 &msgs_for_db,
-                                next_link,
+                                &HashSet::new(),
                             )?;
-                            Ok(changed)
+                            if outcome.is_some() {
+                                save_initial_history_cursor_if_absent(
+                                    st,
+                                    &key_for_db,
+                                    &msgs_for_db,
+                                    next_link,
+                                )?;
+                            }
+                            Ok(outcome)
                         })
                         .await?;
+                        if !is_focus_still_current(live_focus_rx, focus) {
+                            return Ok(());
+                        }
+                        let Some(outcome) = outcome else {
+                            return Ok(());
+                        };
                         last_active_sig.insert(conv_key.clone(), sig);
 
-                        if !is_periodic || prev_sig.is_none() || changed_rows > 0 {
+                        if !is_periodic || prev_sig.is_none() || !outcome.changed_ids.is_empty() {
                             let _ = event_tx.send(CoreEvent::MessagesUpdated {
                                 conv_key: conv_key.clone(),
                                 parent_msg_id: None,
@@ -1097,6 +1514,9 @@ async fn sync_active_focus_with_state(
             }
 
             if let Some((root_id, replies_res)) = replies_opt {
+                if !is_focus_still_current(live_focus_rx, focus) {
+                    return Ok(());
+                }
                 let replies = replies_res?;
                 let thread_sig_key = format!("{conv_key}|thread:{root_id}");
                 let sig = compute_messages_signature(&replies);
@@ -1106,6 +1526,9 @@ async fn sync_active_focus_with_state(
                     let changed_rows =
                         run_storage(storage, move |st| st.upsert_messages(&replies_for_db))
                             .await?;
+                    if !is_focus_still_current(live_focus_rx, focus) {
+                        return Ok(());
+                    }
                     last_active_sig.insert(thread_sig_key, sig);
 
                     if !is_periodic || prev_sig.is_none() || changed_rows > 0 {
@@ -1403,6 +1826,224 @@ async fn poll_presences_tier3_with_cache(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChannelPollCandidate {
+    pub team_id: String,
+    pub channel_id: String,
+    pub conv_key: String,
+    pub conv_title: String,
+    pub pinned: bool,
+    pub last_updated_at: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ChannelRotationState {
+    polled_in_round: HashSet<String>,
+}
+
+impl ChannelRotationState {
+    pub(crate) fn take_next(
+        &mut self,
+        candidates: &[ChannelPollCandidate],
+        already_picked_this_tick: &HashSet<String>,
+    ) -> Option<ChannelPollCandidate> {
+        if candidates.is_empty() {
+            return None;
+        }
+        if let Some(cand) = candidates.iter().find(|c| {
+            !self.polled_in_round.contains(&c.conv_key)
+                && !already_picked_this_tick.contains(&c.conv_key)
+        }) {
+            return Some(cand.clone());
+        }
+        if candidates.iter().all(|c| {
+            self.polled_in_round.contains(&c.conv_key)
+                || already_picked_this_tick.contains(&c.conv_key)
+        }) {
+            self.polled_in_round.clear();
+            return candidates
+                .iter()
+                .find(|c| !already_picked_this_tick.contains(&c.conv_key))
+                .cloned();
+        }
+        None
+    }
+
+    pub(crate) fn mark_polled(&mut self, conv_key: &str) {
+        self.polled_in_round.insert(conv_key.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_next_batch(
+        &mut self,
+        candidates: &[ChannelPollCandidate],
+        max_batch: usize,
+    ) -> Vec<ChannelPollCandidate> {
+        let mut picked = Vec::with_capacity(max_batch.min(candidates.len()));
+        let mut picked_this_tick = HashSet::with_capacity(max_batch.min(candidates.len()));
+        for _ in 0..max_batch {
+            let Some(cand) = self.take_next(candidates, &picked_this_tick) else {
+                break;
+            };
+            self.mark_polled(&cand.conv_key);
+            picked_this_tick.insert(cand.conv_key.clone());
+            picked.push(cand);
+        }
+        picked
+    }
+}
+
+pub(crate) fn build_channel_poll_candidates(
+    teams: &[TeamSummary],
+    conversations: &[ConversationSummary],
+    config_pinned: &HashSet<String>,
+    active_conv_key: Option<&str>,
+    restricted_channels: &HashSet<String>,
+) -> Vec<ChannelPollCandidate> {
+    let mut conv_meta: HashMap<&str, (bool, Option<&str>)> =
+        HashMap::with_capacity(conversations.len());
+    for c in conversations {
+        if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
+            conv_meta.insert(
+                c.conv_key.as_str(),
+                (c.pinned, c.last_updated_at.as_deref()),
+            );
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for team in teams {
+        for ch in &team.channels {
+            let conv_key = ch.conv_key();
+            if active_conv_key == Some(conv_key.as_str())
+                || restricted_channels.contains(&conv_key)
+                || !seen.insert(conv_key.clone())
+            {
+                continue;
+            }
+            let (db_pinned, last_updated_at) = conv_meta
+                .get(conv_key.as_str())
+                .copied()
+                .unwrap_or((false, None));
+            let pinned = db_pinned || config_pinned.contains(&conv_key);
+            candidates.push(ChannelPollCandidate {
+                team_id: ch.team_id.clone(),
+                channel_id: ch.id.clone(),
+                conv_title: format!("{} › #{}", team.display_name, ch.display_name),
+                conv_key,
+                pinned,
+                last_updated_at: last_updated_at.map(str::to_string),
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| {
+                b.last_updated_at
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(a.last_updated_at.as_deref().unwrap_or(""))
+            })
+            .then_with(|| a.conv_title.cmp(&b.conv_title))
+            .then_with(|| a.conv_key.cmp(&b.conv_key))
+    });
+    candidates
+}
+
+#[derive(Debug, Default)]
+struct ChannelDeltaOutcome {
+    any_summary_changed: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_channels_tier3_rotating(
+    graph: &GraphClient,
+    storage: &Storage,
+    event_tx: &mpsc::UnboundedSender<CoreEvent>,
+    live_focus_rx: Option<&watch::Receiver<FocusTarget>>,
+    config_pinned: &HashSet<String>,
+    active_conv_key: Option<&str>,
+    rotation: &mut ChannelRotationState,
+    restricted_channels: &mut HashSet<String>,
+) -> Result<()> {
+    let (teams, convs) = run_storage(storage, |st| {
+        Ok((st.list_teams()?, st.list_conversations()?))
+    })
+    .await?;
+    let candidates = build_channel_poll_candidates(
+        &teams,
+        &convs,
+        config_pinned,
+        active_conv_key,
+        restricted_channels,
+    );
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let mut picked_this_tick: HashSet<String> = HashSet::with_capacity(BACKGROUND_CHANNEL_BATCH_SIZE);
+    let mut any_summary_changed = false;
+    let mut first_fatal_err: Option<anyhow::Error> = None;
+
+    for _ in 0..BACKGROUND_CHANNEL_BATCH_SIZE {
+        let Some(cand) = rotation.take_next(&candidates, &picked_this_tick) else {
+            break;
+        };
+        let now_active = live_focus_rx.is_some_and(|rx| {
+            rx.borrow()
+                .target
+                .as_ref()
+                .is_some_and(|t| t.conv_key() == cand.conv_key)
+        });
+        if now_active {
+            picked_this_tick.insert(cand.conv_key);
+            continue;
+        }
+
+        rotation.mark_polled(&cand.conv_key);
+        picked_this_tick.insert(cand.conv_key.clone());
+        match refresh_channel_delta_once(
+            graph,
+            storage,
+            event_tx,
+            &cand.team_id,
+            &cand.channel_id,
+            &cand.conv_key,
+            &cand.conv_title,
+            true,
+            live_focus_rx,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                any_summary_changed |= outcome.any_summary_changed;
+            }
+            Err(err) => match classify_sync_error(&err) {
+                SyncErrorKind::Forbidden403 => {
+                    restricted_channels.insert(cand.conv_key);
+                }
+                SyncErrorKind::Unauthorized401 | SyncErrorKind::Transient => {
+                    first_fatal_err = Some(err);
+                    break;
+                }
+            },
+        }
+    }
+
+    if any_summary_changed {
+        let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
+        let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
+    }
+
+    if let Some(err) = first_fatal_err {
+        return Err(err);
+    }
+    Ok(())
+}
+
 async fn refresh_all_conversations_with_cache(
     graph: &GraphClient,
     storage: &Storage,
@@ -1433,10 +2074,10 @@ async fn refresh_all_conversations_with_cache(
         // Explicit refresh also reconciles inactive joined channels via delta so new posts,
         // @me mentions, deletions, and unread counts surface without focusing each channel.
         let mut refreshed_channels = 0usize;
-        for team in &teams {
+        'teams_loop: for team in &teams {
             for ch in &team.channels {
                 if refreshed_channels >= MAX_REFRESH_CHANNELS {
-                    break;
+                    break 'teams_loop;
                 }
                 refreshed_channels += 1;
                 let conv_key = ch.conv_key();
@@ -1451,6 +2092,7 @@ async fn refresh_all_conversations_with_cache(
                     &conv_key,
                     &conv_title,
                     !is_active,
+                    None,
                 )
                 .await;
             }
@@ -1463,6 +2105,25 @@ async fn refresh_all_conversations_with_cache(
     Ok(())
 }
 
+async fn clear_channel_delta_cursor(
+    storage: &Storage,
+    conv_key: &str,
+    expected: Option<SyncCursor>,
+) -> Result<Option<SyncCursor>> {
+    let cleared = SyncCursor {
+        scope_key: conv_key.to_string(),
+        delta_link: None,
+        oldest_msg_ts: expected.as_ref().and_then(|cursor| cursor.oldest_msg_ts.clone()),
+        synced_at: chrono::Utc::now().to_rfc3339(),
+    };
+    run_storage(storage, move |st| {
+        let outcome = st.apply_channel_delta(expected.as_ref(), &cleared, &[], &HashSet::new())?;
+        Ok(outcome.map(|_| cleared))
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn refresh_channel_delta_once(
     graph: &GraphClient,
     storage: &Storage,
@@ -1472,90 +2133,115 @@ async fn refresh_channel_delta_once(
     conv_key: &str,
     conv_title: &str,
     mark_unread_on_new: bool,
-) -> Result<()> {
-    let ck = conv_key.to_string();
-    let (cursor, had_local_msgs) = run_storage(storage, move |st| {
-        let cur = st.get_sync_cursor(&ck)?;
-        let has_msgs = !st.list_root_messages(&ck, 1, None)?.is_empty();
-        Ok((cur, has_msgs))
-    })
-    .await?;
-    let had_prior_state = cursor.is_some() || had_local_msgs;
-
-    let delta_res = graph
-        .sync_channel_messages_delta(
-            team_id,
-            channel_id,
-            cursor.as_ref().and_then(|c| c.delta_link.as_deref()),
-        )
-        .await;
-
-    let (messages, new_delta_link) = match delta_res {
-        Ok(res) => res,
+    live_focus_rx: Option<&watch::Receiver<FocusTarget>>,
+) -> Result<ChannelDeltaOutcome> {
+    let key = conv_key.to_string();
+    let mut cursor = run_storage(storage, move |st| st.get_sync_cursor(&key)).await?;
+    let delta_link = cursor
+        .as_ref()
+        .and_then(|c| c.delta_link.as_deref())
+        .map(str::trim)
+        .filter(|link| !link.is_empty());
+    let requested_at = chrono::Utc::now();
+    let (messages, next_link, incremental) = match graph
+        .sync_channel_messages_delta(team_id, channel_id, delta_link)
+        .await
+    {
+        Ok((messages, next_link)) => {
+            let incremental = delta_link.is_some();
+            let next_link = next_link.or_else(|| delta_link.map(str::to_string));
+            (messages, next_link, incremental)
+        }
         Err(err) if is_expired_delta_error(&err) => {
+            let Some(cleared) = clear_channel_delta_cursor(storage, conv_key, cursor).await? else {
+                return Ok(ChannelDeltaOutcome::default());
+            };
+            cursor = Some(cleared);
             let target = ConversationTarget::Channel {
                 team_id: team_id.to_string(),
                 channel_id: channel_id.to_string(),
             };
-            let (msgs, _) = graph.list_messages_page(&target, 50, None).await?;
-            (msgs, None)
+            let (messages, _) = graph.list_messages_page(&target, 50, None).await?;
+            (messages, None, false)
         }
         Err(err) => return Err(err),
     };
-
     let oldest_ts = messages
         .iter()
         .map(|m| m.created_at.as_str())
+        .filter(|ts| !ts.is_empty())
         .min()
         .map(str::to_string)
         .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()));
-    let effective_delta_link =
-        new_delta_link.or_else(|| cursor.as_ref().and_then(|c| c.delta_link.clone()));
     let new_cursor = SyncCursor {
         scope_key: conv_key.to_string(),
-        delta_link: effective_delta_link,
+        delta_link: next_link,
         oldest_msg_ts: oldest_ts,
-        synced_at: chrono::Utc::now().to_rfc3339(),
+        synced_at: requested_at.to_rfc3339(),
     };
 
-    let ck_db = conv_key.to_string();
-    let msgs_for_db = messages.clone();
-    let (outcome, newly_inserted) = run_storage(storage, move |st| {
-        let outcome = if !msgs_for_db.is_empty() {
-            st.upsert_messages_detailed(&msgs_for_db)?
-        } else {
-            Default::default()
+    // An original post can arrive late. Use the last request time only to distinguish
+    // a fresh post that has already changed from an edit to uncached channel history.
+    let last_request_at = cursor
+        .as_ref()
+        .and_then(|c| chrono::DateTime::parse_from_rfc3339(&c.synced_at).ok());
+    let live_focus_rx = live_focus_rx.cloned();
+    let applied = run_storage(storage, move |st| {
+        let focused_now = live_focus_rx.as_ref().is_some_and(|rx| {
+            rx.borrow()
+                .target
+                .as_ref()
+                .is_some_and(|target| target.conv_key() == new_cursor.scope_key)
+        });
+        let eligible_unread: HashSet<&str> = messages
+            .iter()
+            .filter(|message| {
+                if !incremental || !mark_unread_on_new || focused_now || message.is_me || message.deleted {
+                    return false;
+                }
+                let Ok(created) = chrono::DateTime::parse_from_rfc3339(&message.created_at) else {
+                    return false;
+                };
+                let original = message.reactions.is_empty()
+                    && message.last_modified_at.as_deref().is_none_or(|modified| {
+                        chrono::DateTime::parse_from_rfc3339(modified)
+                            .is_ok_and(|modified| modified == created)
+                    });
+                original || last_request_at.is_some_and(|cutoff| created >= cutoff)
+            })
+            .map(|message| message.msg_id.as_str())
+            .collect();
+        let Some(outcome) =
+            st.apply_channel_delta(cursor.as_ref(), &new_cursor, &messages, &eligible_unread)?
+        else {
+            return Ok(None);
         };
-        st.save_sync_cursor(&new_cursor)?;
-        let inserted = filter_changed_messages_ref(&msgs_for_db, &outcome.inserted_ids);
-        if mark_unread_on_new && had_prior_state {
-            let unread_delta = inserted
-                .iter()
-                .filter(|m| !m.is_me && !m.deleted)
-                .count() as i32;
-            if unread_delta > 0 {
-                st.increment_conversation_unread(&ck_db, unread_delta)?;
-            }
-        }
-        Ok((outcome, inserted))
+        let newly_inserted = outcome
+            .inserted_ids
+            .iter()
+            .filter(|id| eligible_unread.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let new_messages = filter_changed_messages_ref(&messages, &newly_inserted);
+        let changed = filter_changed_messages(messages, &outcome.changed_ids);
+        Ok(Some((outcome, changed, new_messages)))
     })
     .await?;
+    let Some((outcome, changed_messages, newly_inserted)) = applied else {
+        return Ok(ChannelDeltaOutcome::default());
+    };
 
+    let any_summary_changed = !newly_inserted.is_empty() || !outcome.preview_updated_convs.is_empty();
     if !outcome.changed_ids.is_empty() {
-        let notify_candidate = if mark_unread_on_new && had_prior_state {
-            build_notification_candidate(conv_key, conv_title, &newly_inserted)
-        } else {
-            None
-        };
         let _ = event_tx.send(CoreEvent::MessagesUpdated {
             conv_key: conv_key.to_string(),
             parent_msg_id: None,
-            messages,
-            notify_candidate,
+            messages: changed_messages,
+            notify_candidate: build_notification_candidate(conv_key, conv_title, &newly_inserted),
             changed_msg_ids: Some(outcome.changed_ids),
         });
     }
-    Ok(())
+    Ok(ChannelDeltaOutcome { any_summary_changed })
 }
 
 async fn sync_channel_history(
@@ -3364,6 +4050,945 @@ mod tests {
         }
         assert!(saw_beyond_event, "expected MessagesUpdated for beyond-page-1 chat");
 
+        server.abort();
+    }
+
+    #[test]
+    fn test_channel_rotation_pinned_recent_priority_and_no_starvation_beyond_20() {
+        use crate::models::ChannelSummary;
+
+        let make_channels = |count: usize| -> Vec<TeamSummary> {
+            let channels = (0..count)
+                .map(|i| ChannelSummary {
+                    id: format!("ch-{i:02}"),
+                    team_id: "t1".to_string(),
+                    team_name: "Eng".to_string(),
+                    display_name: format!("Chan {i:02}"),
+                    description: None,
+                    membership_type: "standard".to_string(),
+                    web_url: None,
+                })
+                .collect();
+            vec![TeamSummary {
+                id: "t1".to_string(),
+                display_name: "Eng".to_string(),
+                description: None,
+                channels,
+            }]
+        };
+
+        let make_conv = |i: usize, pinned: bool, updated: Option<&str>| -> ConversationSummary {
+            let target = ConversationTarget::Channel {
+                team_id: "t1".to_string(),
+                channel_id: format!("ch-{i:02}"),
+            };
+            ConversationSummary {
+                conv_key: target.conv_key(),
+                target,
+                kind: ConversationKind::Channel,
+                team_id: Some("t1".to_string()),
+                team_name: Some("Eng".to_string()),
+                title: format!("Chan {i:02}"),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: updated.map(str::to_string),
+                pinned,
+                peer_user_id: None,
+                web_url: None,
+            }
+        };
+
+        // 1) 5 channels -> all 5 covered in 1 tick; pinned & recent start first.
+        let teams5 = make_channels(5);
+        let convs5 = vec![
+            make_conv(3, false, Some("2026-11-20T09:00:00Z")),
+            make_conv(4, true, None),
+        ];
+        let mut cfg_pinned = HashSet::new();
+        cfg_pinned.insert("chan:t1:ch-02".to_string());
+        let restricted = HashSet::new();
+        let cands5 = build_channel_poll_candidates(&teams5, &convs5, &cfg_pinned, None, &restricted);
+        let mut rot5 = ChannelRotationState::default();
+        let tick1 = rot5.select_next_batch(&cands5, BACKGROUND_CHANNEL_BATCH_SIZE);
+        assert_eq!(tick1.len(), 5);
+        // Pinned channels (ch-02 via config, ch-04 via DB) come first, then recent (ch-03).
+        assert_eq!(tick1[0].channel_id, "ch-02");
+        assert_eq!(tick1[1].channel_id, "ch-04");
+        assert_eq!(tick1[2].channel_id, "ch-03");
+
+        // 2) 10 channels -> all 10 covered in 2 ticks even if priorities change mid-round.
+        let teams10 = make_channels(10);
+        let mut rot10 = ChannelRotationState::default();
+        let cands10_a =
+            build_channel_poll_candidates(&teams10, &[], &HashSet::new(), None, &restricted);
+        let batch1 = rot10.select_next_batch(&cands10_a, BACKGROUND_CHANNEL_BATCH_SIZE);
+        assert_eq!(batch1.len(), 5);
+        // Reprioritize already-polled channels as pinned + recent before tick 2.
+        let convs10_reshuffled: Vec<ConversationSummary> = (0..5)
+            .map(|i| make_conv(i, true, Some("2026-11-20T12:00:00Z")))
+            .collect();
+        let cands10_b = build_channel_poll_candidates(
+            &teams10,
+            &convs10_reshuffled,
+            &HashSet::new(),
+            None,
+            &restricted,
+        );
+        let batch2 = rot10.select_next_batch(&cands10_b, BACKGROUND_CHANNEL_BATCH_SIZE);
+        assert_eq!(batch2.len(), 5);
+        let seen10: HashSet<String> = batch1
+            .into_iter()
+            .chain(batch2)
+            .map(|c| c.conv_key)
+            .collect();
+        assert_eq!(seen10.len(), 10, "all 10 channels must be checked in 2 ticks without starvation");
+
+        // 3) 22 channels (1 active excluded -> 21 inactive) -> 21st channel reached by tick 5, strict 5/tick cap.
+        let teams22 = make_channels(22);
+        let mut rot21 = ChannelRotationState::default();
+        let mut seen21: HashSet<String> = HashSet::new();
+        for tick in 0..5 {
+            // Even with dynamic recency churn on top channels, all 21 must rotate without starvation.
+            let churn: Vec<ConversationSummary> = (0..6)
+                .map(|i| make_conv(i, i < 2, Some(&format!("2026-11-20T10:{:02}:00Z", tick))))
+                .collect();
+            let cands = build_channel_poll_candidates(
+                &teams22,
+                &churn,
+                &HashSet::new(),
+                Some("chan:t1:ch-00"),
+                &restricted,
+            );
+            assert_eq!(cands.len(), 21);
+            assert!(!cands.iter().any(|c| c.conv_key == "chan:t1:ch-00"));
+            let batch = rot21.select_next_batch(&cands, BACKGROUND_CHANNEL_BATCH_SIZE);
+            assert_eq!(batch.len(), BACKGROUND_CHANNEL_BATCH_SIZE);
+            let uniq: HashSet<&str> = batch.iter().map(|c| c.conv_key.as_str()).collect();
+            assert_eq!(uniq.len(), BACKGROUND_CHANNEL_BATCH_SIZE);
+            for c in batch {
+                seen21.insert(c.conv_key);
+            }
+        }
+        assert_eq!(seen21.len(), 21, "all 21 inactive channels including #21 must be polled within 5 ticks");
+    }
+
+    #[test]
+    fn notifying_activity_preserves_idle_until_the_lane_handles_it() {
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (nudge_tx, mut nudge_rx) = mpsc::unbounded_channel();
+        let controller = SyncController::from_channels(focus_tx, nudge_tx, false);
+        let (_, before) = controller.shared.idle_snapshot(Instant::now());
+
+        controller.notify_activity();
+
+        assert!(matches!(nudge_rx.try_recv(), Ok(SyncCommand::NotifyUserActivity)));
+        let (_, after) = controller.shared.idle_snapshot(Instant::now());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn channel_delta_cannot_apply_an_older_snapshot() {
+        let storage = Storage::open_in_memory().unwrap();
+        let key = "chan:t1:ch1";
+        let old_cursor = SyncCursor {
+            scope_key: key.to_string(),
+            delta_link: Some("https://example.invalid/old".to_string()),
+            oldest_msg_ts: None,
+            synced_at: "2026-11-20T05:00:00Z".to_string(),
+        };
+        storage.save_sync_cursor(&old_cursor).unwrap();
+        let new_cursor = SyncCursor {
+            delta_link: Some("https://example.invalid/new".to_string()),
+            ..old_cursor.clone()
+        };
+        let mut fresh = sample_msg(key, "edited", "2026-11-20T05:00:30Z");
+        fresh.body_plain = "latest edit".to_string();
+        assert!(storage
+            .apply_channel_delta(Some(&old_cursor), &new_cursor, &[fresh], &HashSet::new())
+            .unwrap()
+            .is_some());
+
+        let stale = sample_msg(key, "edited", "2026-11-20T05:00:30Z");
+        assert!(storage
+            .apply_channel_delta(Some(&old_cursor), &old_cursor, &[stale], &HashSet::new())
+            .unwrap()
+            .is_none());
+        assert_eq!(storage.get_sync_cursor(key).unwrap(), Some(new_cursor));
+        assert_eq!(storage.list_root_messages(key, 1, None).unwrap()[0].body_plain, "latest edit");
+    }
+
+    #[tokio::test]
+    async fn test_background_channel_delta_410_recovery_drops_stale_cursor_and_gets_fresh_link() {
+        use axum::{extract::RawQuery, http::StatusCode, routing::get, Json, Router};
+        use std::sync::Mutex;
+
+        let seen_delta_queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sq = Arc::clone(&seen_delta_queries);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fresh_delta_link =
+            format!("http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta?state=fresh-2");
+        let fresh_for_route = fresh_delta_link.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages/delta",
+                get(move |RawQuery(q): RawQuery| {
+                    let sq = Arc::clone(&sq);
+                    let fresh_dl = fresh_for_route.clone();
+                    async move {
+                        let q_str = q.unwrap_or_default();
+                        sq.lock().unwrap().push(q_str.clone());
+                        if q_str.contains("state=stale") {
+                            (
+                                StatusCode::GONE,
+                                Json(serde_json::json!({
+                                    "error": { "code": "resyncRequired", "message": "Expired delta token" }
+                                })),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "value": [
+                                        {
+                                            "id": "cm-1",
+                                            "createdDateTime": "2026-11-20T05:00:00Z",
+                                            "messageType": "message",
+                                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                            "body": { "contentType": "html", "content": "<p>existing</p>" }
+                                        },
+                                        {
+                                            "id": "cm-2",
+                                            "createdDateTime": "2026-11-20T05:05:00Z",
+                                            "messageType": "message",
+                                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                            "body": { "contentType": "html", "content": "<p>after 410 fresh</p>" }
+                                        }
+                                    ],
+                                    "@odata.deltaLink": fresh_dl
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "cm-1",
+                            "createdDateTime": "2026-11-20T05:00:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>existing</p>" }
+                        }]
+                    }))
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Me".to_string()),
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_teams(&[TeamSummary {
+                id: "t1".to_string(),
+                display_name: "Eng".to_string(),
+                description: None,
+                channels: vec![crate::models::ChannelSummary {
+                    id: "ch1".to_string(),
+                    team_id: "t1".to_string(),
+                    team_name: "Eng".to_string(),
+                    display_name: "General".to_string(),
+                    description: None,
+                    membership_type: "standard".to_string(),
+                    web_url: None,
+                }],
+            }])
+            .unwrap();
+        storage
+            .upsert_messages(&[sample_msg("chan:t1:ch1", "cm-1", "2026-11-20T05:00:00Z")])
+            .unwrap();
+        storage
+            .save_sync_cursor(&SyncCursor {
+                scope_key: "chan:t1:ch1".to_string(),
+                delta_link: Some(format!(
+                    "http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta?state=stale"
+                )),
+                oldest_msg_ts: None,
+                synced_at: "2026-11-20T05:00:00Z".to_string(),
+            })
+            .unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // First call hits 410 -> MUST drop stale delta_link to None in SQLite!
+        refresh_channel_delta_once(
+            &graph,
+            &storage,
+            &event_tx,
+            "t1",
+            "ch1",
+            "chan:t1:ch1",
+            "Eng › #General",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            storage
+                .get_sync_cursor("chan:t1:ch1")
+                .unwrap()
+                .unwrap()
+                .delta_link
+                .is_none(),
+            "410 recovery must drop stale delta_link instead of re-saving it"
+        );
+
+        // Second call starts fresh delta without stale token and saves the new deltaLink.
+        let outcome2 = refresh_channel_delta_once(
+            &graph,
+            &storage,
+            &event_tx,
+            "t1",
+            "ch1",
+            "chan:t1:ch1",
+            "Eng › #General",
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome2.any_summary_changed);
+        assert_eq!(
+            storage
+                .get_sync_cursor("chan:t1:ch1")
+                .unwrap()
+                .unwrap()
+                .delta_link
+                .as_deref(),
+            Some(fresh_delta_link.as_str())
+        );
+        // Rebuilding the cursor can find uncached history without producing unread or a toast.
+        assert_eq!(
+            storage
+                .get_conversation("chan:t1:ch1")
+                .unwrap()
+                .unwrap()
+                .unread_count,
+            0
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated { notify_candidate, .. } = event {
+                assert!(notify_candidate.is_none());
+            }
+        }
+        let queries = seen_delta_queries.lock().unwrap().clone();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[0].contains("state=stale"));
+        assert!(!queries[1].contains("state=stale"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_background_channel_delta_unread_notifications_edits_reactions_deletes_and_search() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let stage = Arc::new(AtomicUsize::new(0));
+        let st_route = Arc::clone(&stage);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let delta_base = format!("http://{addr}/v1.0/teams/t1/channels/ch1/messages/delta");
+
+        let app = Router::new().route(
+            "/v1.0/teams/t1/channels/ch1/messages/delta",
+            get(move || {
+                let st = Arc::clone(&st_route);
+                let base = delta_base.clone();
+                async move {
+                    let s = st.load(Ordering::SeqCst);
+                    let value = match s {
+                        0 => vec![serde_json::json!({
+                            "id": "cm-0",
+                            "createdDateTime": "2026-11-20T04:00:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>HISTORICAL-SEED</p>" }
+                        })],
+                        1 | 2 => vec![serde_json::json!({
+                            "id": "cm-1",
+                            "createdDateTime": "2026-11-20T05:00:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>FRESH-ALPHA-KEYWORD</p>" }
+                        })],
+                        3 => vec![serde_json::json!({
+                            "id": "cm-1",
+                            "createdDateTime": "2026-11-20T05:00:00Z",
+                            "lastModifiedDateTime": "2026-11-20T05:01:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>EDITED-BETA-KEYWORD</p>" }
+                        })],
+                        4 => vec![serde_json::json!({
+                            "id": "cm-1",
+                            "createdDateTime": "2026-11-20T05:00:00Z",
+                            "lastModifiedDateTime": "2026-11-20T05:01:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>EDITED-BETA-KEYWORD</p>" },
+                            "reactions": [{
+                                "reactionType": "heart",
+                                "user": { "user": { "id": "u3", "displayName": "Bob" } }
+                            }]
+                        })],
+                        6 => vec![serde_json::json!({
+                            "id": "uncached-old-edit",
+                            "createdDateTime": "2026-01-01T00:00:00Z",
+                            "lastModifiedDateTime": "2026-11-20T05:01:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>UNCACHED-HISTORICAL-EDIT</p>" }
+                        })],
+                        7 => vec![serde_json::json!({
+                            "id": "delayed-original",
+                            "createdDateTime": "2026-01-02T00:00:00Z",
+                            "lastModifiedDateTime": "2026-01-02T00:00:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>DELAYED-ORIGINAL</p>" }
+                        })],
+                        _ => vec![serde_json::json!({
+                            "id": "cm-1",
+                            "@removed": { "reason": "deleted" }
+                        })],
+                    };
+                    Json(serde_json::json!({
+                        "value": value,
+                        "@odata.deltaLink": format!("{base}?s={s}")
+                    }))
+                }
+            }),
+        );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Me".to_string()),
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_teams(&[TeamSummary {
+                id: "t1".to_string(),
+                display_name: "Eng".to_string(),
+                description: None,
+                channels: vec![crate::models::ChannelSummary {
+                    id: "ch1".to_string(),
+                    team_id: "t1".to_string(),
+                    team_name: "Eng".to_string(),
+                    display_name: "General".to_string(),
+                    description: None,
+                    membership_type: "standard".to_string(),
+                    web_url: None,
+                }],
+            }])
+            .unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut rotation = ChannelRotationState::default();
+        let mut restricted = HashSet::new();
+        let pinned = HashSet::new();
+
+        // Stage 0: First sync -> historical message, 0 unread, 0 notification.
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_conversation("chan:t1:ch1").unwrap().unwrap().unread_count,
+            0
+        );
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated { notify_candidate, .. } = ev {
+                assert!(notify_candidate.is_none(), "initial sync must not notify");
+            }
+        }
+
+        // Stage 1: New message -> unread = 1, notify = Some, ConversationsUpdated emitted, searchable.
+        stage.store(1, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_conversation("chan:t1:ch1").unwrap().unwrap().unread_count,
+            1
+        );
+        let mut saw_notify = false;
+        let mut saw_sidebar_convs = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                CoreEvent::MessagesUpdated { notify_candidate, .. } => {
+                    saw_notify = notify_candidate.is_some();
+                }
+                CoreEvent::ConversationsUpdated(convs) => {
+                    saw_sidebar_convs = convs
+                        .iter()
+                        .any(|c| c.conv_key == "chan:t1:ch1" && c.unread_count == 1);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_notify);
+        assert!(saw_sidebar_convs);
+        assert_eq!(storage.search_messages("FRESH-ALPHA-KEYWORD", None, 10).unwrap().len(), 1);
+
+        // Stage 2: Re-delivery of same message -> unread stays 1, 0 notifications.
+        stage.store(2, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_conversation("chan:t1:ch1").unwrap().unwrap().unread_count,
+            1
+        );
+        assert!(event_rx.try_recv().is_err(), "re-delivery should emit zero events");
+
+        // Stage 3: Same-ID edit -> unread stays 1, notify = None, search updated.
+        stage.store(3, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_conversation("chan:t1:ch1").unwrap().unwrap().unread_count,
+            1
+        );
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated { notify_candidate, .. } = ev {
+                assert!(notify_candidate.is_none(), "edit must not notify");
+            }
+        }
+        assert_eq!(storage.search_messages("FRESH-ALPHA-KEYWORD", None, 10).unwrap().len(), 0);
+        assert_eq!(storage.search_messages("EDITED-BETA-KEYWORD", None, 10).unwrap().len(), 1);
+
+        // Stage 4: Reaction -> unread stays 1, notify = None, reaction stored.
+        stage.store(4, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_conversation("chan:t1:ch1").unwrap().unwrap().unread_count,
+            1
+        );
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated { notify_candidate, .. } = ev {
+                assert!(notify_candidate.is_none(), "reaction must not notify");
+            }
+        }
+        assert_eq!(
+            storage.get_message("chan:t1:ch1", "cm-1").unwrap().unwrap().reactions.len(),
+            1
+        );
+
+        // Stage 5: Deletion -> unread stays 1, notify = None, removed from search, preview updated.
+        stage.store(5, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage.get_conversation("chan:t1:ch1").unwrap().unwrap().unread_count,
+            1
+        );
+        assert_eq!(storage.search_messages("EDITED-BETA-KEYWORD", None, 10).unwrap().len(), 0);
+        assert!(storage.get_message("chan:t1:ch1", "cm-1").unwrap().unwrap().deleted);
+        assert_eq!(
+            storage
+                .get_conversation("chan:t1:ch1")
+                .unwrap()
+                .unwrap()
+                .last_msg_preview
+                .as_deref(),
+            Some("(deleted message)")
+        );
+
+        stage.store(6, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        let summary = storage.get_conversation("chan:t1:ch1").unwrap().unwrap();
+        assert_eq!(summary.unread_count, 1);
+        assert_eq!(
+            storage.search_messages("UNCACHED-HISTORICAL-EDIT", None, 10).unwrap().len(),
+            1
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated { notify_candidate, .. } = event {
+                assert!(notify_candidate.is_none());
+            }
+        }
+
+        stage.store(7, Ordering::SeqCst);
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            Some("chat:c-open"),
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        let summary = storage.get_conversation("chan:t1:ch1").unwrap().unwrap();
+        assert_eq!(summary.unread_count, 2);
+        assert!(matches!(event_rx.try_recv(), Ok(CoreEvent::MessagesUpdated {
+            notify_candidate: Some(candidate), ..
+        }) if candidate.preview == "DELAYED-ORIGINAL"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_window_focus_reading_vs_unfocused_throttle_and_non_destructive_resume() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        // 1) Pure state-machine checks: reading & no-focus-reporting stay at 1x even after 10 min;
+        //    explicitly unfocused window throttles to 4x immediately and 10x at 600s.
+        assert_eq!(
+            effective_active_idle_multiplier(WindowFocusState::Focused, Duration::from_secs(700)),
+            1
+        );
+        assert_eq!(
+            effective_active_idle_multiplier(WindowFocusState::Unknown, Duration::from_secs(700)),
+            1
+        );
+        assert_eq!(
+            effective_active_idle_multiplier(WindowFocusState::Unfocused, Duration::from_secs(5)),
+            4
+        );
+        assert_eq!(
+            effective_active_idle_multiplier(WindowFocusState::Unfocused, Duration::from_secs(600)),
+            10
+        );
+
+        // 2) Live engine check: focus-gained resume respects 403 circuit breaker and throttles rapid flap.
+        let c403_hits = Arc::new(AtomicUsize::new(0));
+        let cok_hits = Arc::new(AtomicUsize::new(0));
+        let h403 = Arc::clone(&c403_hits);
+        let hok = Arc::clone(&cok_hits);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/chats/c403/messages",
+                get(move || {
+                    let h = Arc::clone(&h403);
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({ "error": { "code": "Forbidden", "message": "Denied" } })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/chats/c-ok/messages",
+                get(move || {
+                    let h = Arc::clone(&hok);
+                    async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [{
+                                    "id": "m1",
+                                    "createdDateTime": "2026-11-20T05:00:00Z",
+                                    "messageType": "message",
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "html", "content": "<p>ok</p>" }
+                                }]
+                            })),
+                        )
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            active_poll_ms: 2_500,
+            chat_poll_ms: 60_000,
+            channel_poll_ms: 60_000,
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_sync_engine(cfg, graph, storage, event_tx);
+
+        // 403 room: FocusLost -> FocusGained must NOT clear restricted_convs.
+        ctrl.set_focus(
+            Some(ConversationTarget::Chat {
+                chat_id: "c403".to_string(),
+            }),
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(c403_hits.load(Ordering::SeqCst), 1);
+        ctrl.set_window_focus(false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        ctrl.set_window_focus(true);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            c403_hits.load(Ordering::SeqCst),
+            1,
+            "automatic focus resume must not clear 403 restriction"
+        );
+
+        // Normal room: immediate focus sync -> rapid FocusLost/FocusGained flap within resume_min_gap is throttled.
+        ctrl.set_focus(
+            Some(ConversationTarget::Chat {
+                chat_id: "c-ok".to_string(),
+            }),
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let baseline_hits = cok_hits.load(Ordering::SeqCst);
+        assert_eq!(baseline_hits, 1);
+        ctrl.set_window_focus(false);
+        ctrl.set_window_focus(true);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            cok_hits.load(Ordering::SeqCst),
+            baseline_hits,
+            "rapid focus return right after sync must be throttled"
+        );
+
+        ctrl.request(SyncCommand::Shutdown);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_no_late_stale_focus_results_on_rapid_focus_switch() {
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/v1.0/chats/c-slow/messages",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "slow-1",
+                            "createdDateTime": "2026-11-20T05:00:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>STALE-SLOW</p>" }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/chats/c-fast/messages",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "fast-1",
+                            "createdDateTime": "2026-11-20T05:01:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u3", "displayName": "Bob" } },
+                            "body": { "contentType": "html", "content": "<p>CURRENT-FAST</p>" }
+                        }]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            active_poll_ms: 10_000,
+            chat_poll_ms: 60_000,
+            channel_poll_ms: 60_000,
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let ctrl = spawn_sync_engine(cfg, graph, storage, event_tx);
+
+        ctrl.set_focus(
+            Some(ConversationTarget::Chat {
+                chat_id: "c-slow".to_string(),
+            }),
+            None,
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        ctrl.set_focus(
+            Some(ConversationTarget::Chat {
+                chat_id: "c-fast".to_string(),
+            }),
+            None,
+        );
+
+        let mut saw_fast = false;
+        let mut saw_slow = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(650);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(100), event_rx.recv()).await {
+                Ok(Some(CoreEvent::MessagesUpdated { conv_key, .. })) => {
+                    if conv_key == "chat:c-fast" {
+                        saw_fast = true;
+                    } else if conv_key == "chat:c-slow" {
+                        saw_slow = true;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => {}
+            }
+        }
+        assert!(saw_fast, "expected fast current focus event");
+        assert!(!saw_slow, "stale slow focus response must never emit MessagesUpdated");
+
+        ctrl.request(SyncCommand::Shutdown);
         server.abort();
     }
 }

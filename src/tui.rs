@@ -9,9 +9,10 @@ use anyhow::Result;
 #[cfg(not(windows))]
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -303,11 +304,12 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableFocusChange
         )?;
         #[cfg(windows)]
         {
-            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
             write_vt_mouse_enable(&mut stdout)?;
         }
 
@@ -362,6 +364,7 @@ impl TerminalGuard {
         #[cfg(not(windows))]
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -369,7 +372,7 @@ impl TerminalGuard {
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableFocusChange, DisableMouseCapture, LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -401,6 +404,7 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         #[cfg(not(windows))]
         let _ = execute!(
             stdout,
+            DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
@@ -408,7 +412,7 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
         #[cfg(windows)]
         {
             let _ = write_vt_mouse_disable(&mut stdout);
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableFocusChange, DisableMouseCapture, LeaveAlternateScreen);
         }
         let _ = disable_raw_mode();
         #[cfg(windows)]
@@ -489,9 +493,17 @@ async fn process_terminal_event_with_burst(
     ui: &mut UiState,
     dirty: &mut bool,
     last_activity_sent: &mut Option<Instant>,
+    window_focused: &mut Option<bool>,
 ) -> LoopStep {
     let CrosstermEvent::Key(first_key) = first_ev else {
-        return handle_terminal_event(first_ev, app, ui, dirty, last_activity_sent);
+        return handle_terminal_event(
+            first_ev,
+            app,
+            ui,
+            dirty,
+            last_activity_sent,
+            window_focused,
+        );
     };
     if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
         return handle_terminal_event(
@@ -500,6 +512,7 @@ async fn process_terminal_event_with_burst(
             ui,
             dirty,
             last_activity_sent,
+            window_focused,
         );
     }
 
@@ -560,7 +573,8 @@ async fn process_terminal_event_with_burst(
                         app,
                         ui,
                         dirty,
-                        last_activity_sent
+                        last_activity_sent,
+                        window_focused
                     ),
                     LoopStep::Quit
                 ) {
@@ -572,7 +586,7 @@ async fn process_terminal_event_with_burst(
 
     if let Some(extra) = trailing_event {
         if matches!(
-            handle_terminal_event(extra, app, ui, dirty, last_activity_sent),
+            handle_terminal_event(extra, app, ui, dirty, last_activity_sent, window_focused),
             LoopStep::Quit
         ) {
             return LoopStep::Quit;
@@ -754,6 +768,7 @@ fn handle_terminal_event(
     ui: &mut UiState,
     dirty: &mut bool,
     last_activity_sent: &mut Option<Instant>,
+    window_focused: &mut Option<bool>,
 ) -> LoopStep {
     match ev {
         CrosstermEvent::Key(key) => {
@@ -836,7 +851,19 @@ fn handle_terminal_event(
                 let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
             }
         }
-        _ => {}
+        CrosstermEvent::FocusGained => {
+            if *window_focused != Some(true) {
+                *window_focused = Some(true);
+                app.sync_ctrl.set_window_focus(true);
+                *last_activity_sent = Some(Instant::now());
+            }
+        }
+        CrosstermEvent::FocusLost => {
+            if *window_focused != Some(false) {
+                *window_focused = Some(false);
+                app.sync_ctrl.set_window_focus(false);
+            }
+        }
     }
     LoopStep::Continue
 }
@@ -1022,6 +1049,7 @@ pub async fn run_with_persona(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     let mut last_activity_sent: Option<Instant> = None;
+    let mut window_focused: Option<bool> = None;
 
     loop {
         if ui.editor_requested {
@@ -1060,11 +1088,12 @@ pub async fn run_with_persona(
                 stdout,
                 EnterAlternateScreen,
                 EnableMouseCapture,
-                EnableBracketedPaste
+                EnableBracketedPaste,
+                EnableFocusChange
             )?;
             #[cfg(windows)]
             {
-                execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+                execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableFocusChange)?;
                 write_vt_mouse_enable(&mut stdout)?;
             }
             if guard.keyboard_enhanced {
@@ -1138,7 +1167,8 @@ pub async fn run_with_persona(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
-                                &mut last_activity_sent
+                                &mut last_activity_sent,
+                                &mut window_focused
                             )
                             .await,
                             LoopStep::Quit
@@ -1199,7 +1229,8 @@ pub async fn run_with_persona(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
-                                &mut last_activity_sent
+                                &mut last_activity_sent,
+                                &mut window_focused
                             )
                             .await,
                             LoopStep::Quit

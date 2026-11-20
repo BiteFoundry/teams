@@ -5,7 +5,7 @@ pub mod repo;
 pub mod search;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -210,6 +210,11 @@ impl Storage {
         repo::increment_conversation_unread(&conn, conv_key, delta)
     }
 
+    pub fn set_conversation_pinned(&self, conv_key: &str, pinned: bool) -> Result<()> {
+        let conn = self.lock_conn()?;
+        repo::set_conversation_pinned(&conn, conv_key, pinned)
+    }
+
     // --- Messages & Threads ---
     pub fn upsert_messages(&self, messages: &[MessageItem]) -> Result<usize> {
         let mut conn = self.lock_conn()?;
@@ -401,6 +406,17 @@ impl Storage {
     pub fn save_sync_cursor(&self, cursor: &SyncCursor) -> Result<()> {
         let conn = self.lock_conn()?;
         repo::save_sync_cursor(&conn, cursor)
+    }
+
+    pub(crate) fn apply_channel_delta(
+        &self,
+        expected: Option<&SyncCursor>,
+        cursor: &SyncCursor,
+        messages: &[MessageItem],
+        eligible_unread: &HashSet<&str>,
+    ) -> Result<Option<UpsertMessagesOutcome>> {
+        let mut conn = self.lock_conn()?;
+        repo::apply_channel_delta(&mut conn, expected, cursor, messages, eligible_unread)
     }
 }
 

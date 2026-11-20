@@ -2779,6 +2779,20 @@ impl AppState {
                     }
                 }
                 self.conversations = convs;
+                if self.daemon_attached
+                    && self.active_conv_key.is_none()
+                    && self.active_target.is_none()
+                {
+                    if let Some(first) = self
+                        .conversations
+                        .iter()
+                        .find(|c| c.kind != ConversationKind::Channel)
+                        .or_else(|| self.conversations.first())
+                        .cloned()
+                    {
+                        self.select_conversation(ui, first.target);
+                    }
+                }
             }
             CoreEvent::TeamsUpdated(teams) => {
                 self.teams = teams;
@@ -3418,10 +3432,28 @@ impl AppState {
                 self.daemon_pid = pid;
                 self.syncing = sync_busy;
                 self.sync_summary = "Daemon connected".to_string();
-                self.sync_ctrl.set_focus(
-                    self.active_target.clone(),
-                    self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
-                );
+                self.load_cached_teams();
+                if self.active_conv_key.is_none() && self.active_target.is_none() {
+                    if let Some(first) = self
+                        .conversations
+                        .iter()
+                        .find(|c| c.kind != ConversationKind::Channel)
+                        .or_else(|| self.conversations.first())
+                        .cloned()
+                    {
+                        self.select_conversation(ui, first.target);
+                    } else {
+                        self.sync_ctrl.set_focus(
+                            self.active_target.clone(),
+                            self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
+                        );
+                    }
+                } else {
+                    self.sync_ctrl.set_focus(
+                        self.active_target.clone(),
+                        self.active_thread.as_ref().map(|t| t.root.msg_id.clone()),
+                    );
+                }
                 if self.my_profile.is_none() {
                     self.spawn_me_profile_if_needed();
                 }
@@ -4756,6 +4788,110 @@ mod tests {
             app.conversations[0].last_msg_preview.as_deref(),
             Some("(deleted message)")
         );
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn background_channel_events_update_sidebar_without_disturbing_open_conv_thread_or_draft() {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let (core_tx, _core_rx) = mpsc::unbounded_channel();
+        let (ui_tx, _ui_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = sync::spawn_sync_engine(cfg.clone(), graph.clone(), storage.clone(), core_tx);
+
+        let team = TeamSummary {
+            id: "t1".to_string(),
+            display_name: "Eng".to_string(),
+            description: None,
+            channels: vec![ChannelSummary {
+                id: "ch1".to_string(),
+                team_id: "t1".to_string(),
+                team_name: "Eng".to_string(),
+                display_name: "General".to_string(),
+                description: None,
+                membership_type: "standard".to_string(),
+                web_url: None,
+            }],
+        };
+        storage.upsert_teams(&[team.clone()]).unwrap();
+        let active_chat_target = ConversationTarget::Chat {
+            chat_id: "c-open".to_string(),
+        };
+        let active_key = active_chat_target.conv_key();
+        storage
+            .upsert_conversations(&[ConversationSummary {
+                conv_key: active_key.clone(),
+                target: active_chat_target.clone(),
+                kind: ConversationKind::OneOnOne,
+                team_id: None,
+                team_name: None,
+                title: "Alice".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: Some("a1".to_string()),
+                last_msg_author: Some("Alice".to_string()),
+                last_msg_preview: Some("hello".to_string()),
+                last_updated_at: Some("2026-11-20T05:00:00Z".to_string()),
+                pinned: false,
+                peer_user_id: Some("u2".to_string()),
+                web_url: None,
+            }])
+            .unwrap();
+        let active_msg = make_test_msg(&active_key, "a1", "2026-11-20T05:00:00Z", "hello");
+        storage.upsert_messages(&[active_msg.clone()]).unwrap();
+
+        let mut app = AppState::new(cfg.clone(), auth, graph, storage.clone(), sync_ctrl, ui_tx);
+        let mut ui = UiState::from_config(&cfg);
+        app.teams = vec![team];
+        app.conversations = storage.list_conversations().unwrap();
+        app.active_conv_key = Some(active_key.clone());
+        app.active_target = Some(active_chat_target);
+        app.messages = vec![active_msg.clone()];
+        app.active_thread = Some(ThreadView {
+            conv_key: active_key.clone(),
+            root: active_msg,
+            replies: Vec::new(),
+        });
+        ui.chat_scroll.selected_idx = Some(0);
+        ui.composer.load_text("draft in progress");
+
+        let bg_chan_key = "chan:t1:ch1".to_string();
+        let bg_msg = make_test_msg(&bg_chan_key, "cm-1", "2026-11-20T05:10:00Z", "Channel news");
+        storage.upsert_messages(&[bg_msg.clone()]).unwrap();
+        storage.increment_conversation_unread(&bg_chan_key, 1).unwrap();
+        let updated_convs = storage.list_conversations().unwrap();
+
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: bg_chan_key.clone(),
+                parent_msg_id: None,
+                messages: vec![bg_msg],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["cm-1".to_string()]),
+            },
+        );
+        app.handle_core_event(&mut ui, CoreEvent::ConversationsUpdated(updated_convs));
+
+        assert_eq!(app.active_conv_key.as_deref(), Some(active_key.as_str()));
+        assert_eq!(ui.chat_scroll.selected_idx, Some(0));
+        assert_eq!(ui.composer.text(), "draft in progress");
+        assert_eq!(
+            app.active_thread.as_ref().map(|t| t.root.msg_id.as_str()),
+            Some("a1")
+        );
+        assert_eq!(app.unread_channel_count(), 1);
+        ui.active_nav_tab = crate::ui::nav_pane::TAB_TEAMS;
+        let rows = crate::ui::nav_pane::nav_rows_cached(&app, &ui);
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            crate::ui::nav_pane::NavRow::TeamChannel { conv_key, unread: 1, .. }
+            if conv_key == &bg_chan_key
+        )));
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
