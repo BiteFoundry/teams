@@ -227,6 +227,21 @@ pub fn mark_conversation_read(conn: &Connection, conv_key: &str, read_at: &str) 
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_MAPPED_MESSAGE_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_mapped_message_rows() {
+    TEST_MAPPED_MESSAGE_ROWS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn mapped_message_rows() -> usize {
+    TEST_MAPPED_MESSAGE_ROWS.with(|c| c.get())
+}
+
 fn serialize_json_slice<T: serde::Serialize>(items: &[T]) -> Result<Cow<'static, str>> {
     if items.is_empty() {
         Ok(Cow::Borrowed("[]"))
@@ -236,6 +251,23 @@ fn serialize_json_slice<T: serde::Serialize>(items: &[T]) -> Result<Cow<'static,
 }
 
 pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Result<usize> {
+    upsert_messages_inner(conn, messages, None)
+}
+
+pub fn upsert_messages_returning_changed_ids(
+    conn: &mut Connection,
+    messages: &[MessageItem],
+) -> Result<Vec<String>> {
+    let mut changed_ids = Vec::new();
+    upsert_messages_inner(conn, messages, Some(&mut changed_ids))?;
+    Ok(changed_ids)
+}
+
+fn upsert_messages_inner(
+    conn: &mut Connection,
+    messages: &[MessageItem],
+    mut changed_ids: Option<&mut Vec<String>>,
+) -> Result<usize> {
     if messages.is_empty() {
         return Ok(0);
     }
@@ -426,6 +458,11 @@ pub fn upsert_messages(conn: &mut Connection, messages: &[MessageItem]) -> Resul
                 has_mentions_int,
             ])?;
             changed_count += 1;
+            if let Some(ids) = changed_ids.as_deref_mut() {
+                if !ids.iter().any(|id| id == &msg.msg_id) {
+                    ids.push(msg.msg_id.clone());
+                }
+            }
 
             if !fts_unchanged {
                 if existing.is_some() {
@@ -649,6 +686,23 @@ pub fn get_message(
     stmt.query_row(params![conv_key, msg_id], map_message_row)
         .optional()
         .map_err(Into::into)
+}
+
+pub fn get_messages_by_ids(
+    conn: &Connection,
+    conv_key: &str,
+    msg_ids: &[String],
+) -> Result<Vec<MessageItem>> {
+    let mut out = Vec::with_capacity(msg_ids.len());
+    for (idx, msg_id) in msg_ids.iter().enumerate() {
+        if msg_ids[..idx].iter().any(|prev| prev == msg_id) {
+            continue;
+        }
+        if let Some(msg) = get_message(conn, conv_key, msg_id)? {
+            out.push(msg);
+        }
+    }
+    Ok(out)
 }
 
 pub fn get_thread(
@@ -889,6 +943,9 @@ fn map_conversation_row(row: &Row<'_>) -> rusqlite::Result<ConversationSummary> 
 }
 
 fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageItem> {
+    #[cfg(test)]
+    TEST_MAPPED_MESSAGE_ROWS.with(|c| c.set(c.get() + 1));
+
     let is_me_int: i32 = row.get(10)?;
     let deleted_int: i32 = row.get(13)?;
     let attachments_json: String = row.get(18)?;

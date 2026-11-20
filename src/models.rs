@@ -378,6 +378,8 @@ pub enum CoreEvent {
         parent_msg_id: Option<String>,
         messages: Vec<MessageItem>,
         notify_candidate: Option<NotificationCandidate>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        changed_msg_ids: Option<Vec<String>>,
     },
     PresenceUpdated(Vec<PresenceStatus>),
     SyncStateChanged {

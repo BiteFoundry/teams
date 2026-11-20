@@ -1769,4 +1769,58 @@ mod tests {
         );
         assert_eq!(read_limited_line(&mut valid_reader).await.unwrap(), None);
     }
+
+    #[test]
+    fn core_event_messages_updated_ipc_serde_compat() {
+        // 1) Legacy IPC frame without `changed_msg_ids` deserializes cleanly to `None` (snapshot fallback).
+        let legacy_json = r#"{"type":"event","data":{"MessagesUpdated":{"conv_key":"chat:c1","parent_msg_id":null,"messages":[],"notify_candidate":null}}}"#;
+        let legacy_frame: ServerFrame = serde_json::from_str(legacy_json).unwrap();
+        match legacy_frame {
+            ServerFrame::Event(CoreEvent::MessagesUpdated {
+                conv_key,
+                parent_msg_id,
+                messages,
+                notify_candidate,
+                changed_msg_ids,
+            }) => {
+                assert_eq!(conv_key, "chat:c1");
+                assert!(parent_msg_id.is_none());
+                assert!(messages.is_empty());
+                assert!(notify_candidate.is_none());
+                assert_eq!(changed_msg_ids, None);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        // 2) `changed_msg_ids: None` omits the field on serialization.
+        let snapshot_frame = ServerFrame::Event(CoreEvent::MessagesUpdated {
+            conv_key: "chat:c1".to_string(),
+            parent_msg_id: None,
+            messages: Vec::new(),
+            notify_candidate: None,
+            changed_msg_ids: None,
+        });
+        let snapshot_json = serde_json::to_string(&snapshot_frame).unwrap();
+        assert!(!snapshot_json.contains("changed_msg_ids"));
+
+        // 3) `changed_msg_ids: Some(...)` round-trips identically.
+        let inc_frame = ServerFrame::Event(CoreEvent::MessagesUpdated {
+            conv_key: "chat:c1".to_string(),
+            parent_msg_id: None,
+            messages: Vec::new(),
+            notify_candidate: None,
+            changed_msg_ids: Some(vec!["m42".to_string()]),
+        });
+        let inc_json = serde_json::to_string(&inc_frame).unwrap();
+        assert!(inc_json.contains("\"changed_msg_ids\":[\"m42\"]"));
+        let decoded: ServerFrame = serde_json::from_str(&inc_json).unwrap();
+        match decoded {
+            ServerFrame::Event(CoreEvent::MessagesUpdated {
+                changed_msg_ids, ..
+            }) => {
+                assert_eq!(changed_msg_ids, Some(vec!["m42".to_string()]));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
 }

@@ -326,6 +326,16 @@ fn compute_messages_signature(messages: &[MessageItem]) -> u64 {
     hasher.finish()
 }
 
+fn filter_changed_messages(messages: Vec<MessageItem>, changed_ids: &[String]) -> Vec<MessageItem> {
+    if changed_ids.is_empty() {
+        return Vec::new();
+    }
+    messages
+        .into_iter()
+        .filter(|m| changed_ids.iter().any(|id| id == &m.msg_id))
+        .collect()
+}
+
 async fn current_token_fingerprint(graph: &GraphClient) -> String {
     match graph.auth().current_tokens().await {
         Some(tokens) => {
@@ -891,22 +901,23 @@ async fn sync_active_focus_with_state(
                 return Ok(());
             }
 
-            let msgs_for_db = messages.clone();
             let key_for_db = conv_key.clone();
-            let changed_rows = run_storage(storage, move |st| {
-                let changed = st.upsert_messages(&msgs_for_db)?;
-                save_initial_history_cursor_if_absent(st, &key_for_db, &msgs_for_db, next_link)?;
-                Ok(changed)
+            let (changed_ids, changed_messages) = run_storage(storage, move |st| {
+                let changed = st.upsert_messages_returning_changed_ids(&messages)?;
+                save_initial_history_cursor_if_absent(st, &key_for_db, &messages, next_link)?;
+                let filtered = filter_changed_messages(messages, &changed);
+                Ok((changed, filtered))
             })
             .await?;
             last_active_sig.insert(conv_key.clone(), sig);
 
-            if !is_periodic || prev_sig.is_none() || changed_rows > 0 {
+            if !is_periodic || prev_sig.is_none() || !changed_ids.is_empty() {
                 let _ = event_tx.send(CoreEvent::MessagesUpdated {
                     conv_key,
                     parent_msg_id: None,
-                    messages,
+                    messages: changed_messages,
                     notify_candidate: None,
+                    changed_msg_ids: Some(changed_ids),
                 });
             }
         }
@@ -978,6 +989,7 @@ async fn sync_active_focus_with_state(
                                 parent_msg_id: None,
                                 messages,
                                 notify_candidate: None,
+                                changed_msg_ids: None,
                             });
                         }
                     }
@@ -1024,6 +1036,7 @@ async fn sync_active_focus_with_state(
                                 parent_msg_id: None,
                                 messages,
                                 notify_candidate: None,
+                                changed_msg_ids: None,
                             });
                         }
                     }
@@ -1048,6 +1061,7 @@ async fn sync_active_focus_with_state(
                             parent_msg_id: Some(root_id),
                             messages: replies,
                             notify_candidate: None,
+                            changed_msg_ids: None,
                         });
                     }
                 }
@@ -1141,26 +1155,30 @@ async fn poll_chats_tier2_with_cache(
     if !dirty_ids.is_empty() {
         let fetched = graph.batch_fetch_chat_messages(&dirty_ids, 20).await?;
         for (chat_id, messages) in fetched {
-            let msgs_for_db = messages.clone();
-            let changed_msgs =
-                run_storage(storage, move |st| st.upsert_messages(&msgs_for_db)).await?;
-            if changed_msgs > 0 {
-                let conv_key = ConversationTarget::Chat {
-                    chat_id: chat_id.clone(),
-                }
-                .conv_key();
-                let conv_title = chat_by_id
-                    .get(&chat_id)
-                    .map(|c| c.title.clone())
-                    .unwrap_or_else(|| conv_key.clone());
-                let notify_candidate =
-                    build_notification_candidate(&conv_key, &conv_title, &messages);
+            let conv_key = ConversationTarget::Chat {
+                chat_id: chat_id.clone(),
+            }
+            .conv_key();
+            let conv_title = chat_by_id
+                .get(&chat_id)
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| conv_key.clone());
+            let notify_candidate =
+                build_notification_candidate(&conv_key, &conv_title, &messages);
 
+            let (changed_ids, changed_messages) = run_storage(storage, move |st| {
+                let changed = st.upsert_messages_returning_changed_ids(&messages)?;
+                let filtered = filter_changed_messages(messages, &changed);
+                Ok((changed, filtered))
+            })
+            .await?;
+            if !changed_ids.is_empty() {
                 let _ = event_tx.send(CoreEvent::MessagesUpdated {
                     conv_key,
                     parent_msg_id: None,
-                    messages,
+                    messages: changed_messages,
                     notify_candidate,
+                    changed_msg_ids: Some(changed_ids),
                 });
             }
         }
@@ -1294,6 +1312,7 @@ async fn sync_channel_history(
         parent_msg_id: None,
         messages,
         notify_candidate: None,
+        changed_msg_ids: None,
     });
     Ok(())
 }
@@ -2140,6 +2159,293 @@ mod tests {
         assert!(saw_recovered_synced, "expected Synced after transient recovery");
 
         ctrl.request(SyncCommand::Shutdown);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chat_sync_producers_emit_exact_changed_msg_ids_and_notifications() {
+        use axum::{routing::{get, post}, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let chat_stage = Arc::new(AtomicUsize::new(0));
+        let stage_messages = Arc::clone(&chat_stage);
+        let stage_chats = Arc::clone(&chat_stage);
+        let stage_batch = Arc::clone(&chat_stage);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/chats/c1/messages",
+                get(move || {
+                    let stage = Arc::clone(&stage_messages);
+                    async move {
+                        let s = stage.load(Ordering::SeqCst);
+                        let value = match s {
+                            0 => vec![serde_json::json!({
+                                "id": "m1",
+                                "createdDateTime": "2026-11-20T01:00:00Z",
+                                "messageType": "message",
+                                "importance": "normal",
+                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": "<p>one</p>" }
+                            })],
+                            1 => vec![
+                                serde_json::json!({
+                                    "id": "m2",
+                                    "createdDateTime": "2026-11-20T02:00:00Z",
+                                    "messageType": "message",
+                                    "importance": "normal",
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "html", "content": "<p>two</p>" }
+                                }),
+                                serde_json::json!({
+                                    "id": "m1",
+                                    "createdDateTime": "2026-11-20T01:00:00Z",
+                                    "messageType": "message",
+                                    "importance": "normal",
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "html", "content": "<p>one</p>" }
+                                }),
+                            ],
+                            _ => vec![
+                                serde_json::json!({
+                                    "id": "m2",
+                                    "createdDateTime": "2026-11-20T02:00:00Z",
+                                    "lastModifiedDateTime": "2026-11-20T02:05:00Z",
+                                    "deletedDateTime": "2026-11-20T02:05:00Z",
+                                    "messageType": "message",
+                                    "importance": "normal",
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "html", "content": "" }
+                                }),
+                                serde_json::json!({
+                                    "id": "m1",
+                                    "createdDateTime": "2026-11-20T01:00:00Z",
+                                    "messageType": "message",
+                                    "importance": "normal",
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "html", "content": "<p>one</p>" }
+                                }),
+                            ],
+                        };
+                        Json(serde_json::json!({ "value": value }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/chats",
+                get(move || {
+                    let stage = Arc::clone(&stage_chats);
+                    async move {
+                        let s = stage.load(Ordering::SeqCst);
+                        let last_id = if s >= 3 { "m3" } else { "m2" };
+                        let updated = if s >= 3 {
+                            "2026-11-20T03:00:00Z"
+                        } else {
+                            "2026-11-20T02:00:00Z"
+                        };
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "c1",
+                                "chatType": "oneOnOne",
+                                "topic": null,
+                                "lastUpdatedDateTime": updated,
+                                "members": [
+                                    { "userId": "u1", "displayName": "Me" },
+                                    { "userId": "u2", "displayName": "Alice" }
+                                ],
+                                "lastMessagePreview": {
+                                    "id": last_id,
+                                    "createdDateTime": updated,
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "text", "content": "three" }
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(req): Json<serde_json::Value>| {
+                    let _stage = Arc::clone(&stage_batch);
+                    async move {
+                        let req_id = req["requests"][0]["id"].as_str().unwrap_or("0");
+                        Json(serde_json::json!({
+                            "responses": [{
+                                "id": req_id,
+                                "status": 200,
+                                "body": {
+                                    "value": [
+                                        {
+                                            "id": "m3",
+                                            "createdDateTime": "2026-11-20T03:00:00Z",
+                                            "messageType": "message",
+                                            "importance": "normal",
+                                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                            "body": { "contentType": "html", "content": "<p>three from batch</p>" }
+                                        },
+                                        {
+                                            "id": "m1",
+                                            "createdDateTime": "2026-11-20T01:00:00Z",
+                                            "messageType": "message",
+                                            "importance": "normal",
+                                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                            "body": { "contentType": "html", "content": "<p>one</p>" }
+                                        }
+                                    ]
+                                }
+                            }]
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg.clone(), auth)
+            .unwrap()
+            .with_my_user_id("u1");
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_conversations(&[chat_summary("c1", Some("m1"), Some("2026-11-20T01:00:00Z"))])
+            .unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let focus = FocusTarget {
+            target: Some(ConversationTarget::Chat {
+                chat_id: "c1".to_string(),
+            }),
+            thread_root_id: None,
+        };
+        let mut sigs = HashMap::new();
+
+        // 1) Initial immediate focus poll inserts m1 -> changed_msg_ids == Some(["m1"]).
+        sync_active_focus_with_state(&focus, &graph, &storage, &event_tx, &mut sigs, false)
+            .await
+            .unwrap();
+        match event_rx.try_recv().unwrap() {
+            CoreEvent::MessagesUpdated {
+                conv_key,
+                messages,
+                changed_msg_ids,
+                ..
+            } => {
+                assert_eq!(conv_key, "chat:c1");
+                assert_eq!(changed_msg_ids, Some(vec!["m1".to_string()]));
+                assert_eq!(messages.len(), 1);
+            }
+            other => panic!("expected MessagesUpdated, got {other:?}"),
+        }
+
+        // 2) Immediate focus re-poll with 0 DB changes -> changed_msg_ids == Some([]), messages == [].
+        sync_active_focus_with_state(&focus, &graph, &storage, &event_tx, &mut sigs, false)
+            .await
+            .unwrap();
+        match event_rx.try_recv().unwrap() {
+            CoreEvent::MessagesUpdated {
+                messages,
+                changed_msg_ids,
+                ..
+            } => {
+                assert_eq!(changed_msg_ids, Some(Vec::new()));
+                assert!(messages.is_empty());
+            }
+            other => panic!("expected MessagesUpdated, got {other:?}"),
+        }
+
+        // 3) Periodic poll with 1 new message (m2) -> changed_msg_ids == Some(["m2"]) only.
+        chat_stage.store(1, Ordering::SeqCst);
+        sync_active_focus_with_state(&focus, &graph, &storage, &event_tx, &mut sigs, true)
+            .await
+            .unwrap();
+        match event_rx.try_recv().unwrap() {
+            CoreEvent::MessagesUpdated {
+                messages,
+                changed_msg_ids,
+                ..
+            } => {
+                assert_eq!(changed_msg_ids, Some(vec!["m2".to_string()]));
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].msg_id, "m2");
+            }
+            other => panic!("expected MessagesUpdated, got {other:?}"),
+        }
+
+        // 4) Periodic poll with soft-delete on m2 -> changed_msg_ids == Some(["m2"]).
+        chat_stage.store(2, Ordering::SeqCst);
+        sync_active_focus_with_state(&focus, &graph, &storage, &event_tx, &mut sigs, true)
+            .await
+            .unwrap();
+        match event_rx.try_recv().unwrap() {
+            CoreEvent::MessagesUpdated {
+                messages,
+                changed_msg_ids,
+                ..
+            } => {
+                assert_eq!(changed_msg_ids, Some(vec!["m2".to_string()]));
+                assert_eq!(messages.len(), 1);
+                assert!(messages[0].deleted);
+            }
+            other => panic!("expected MessagesUpdated, got {other:?}"),
+        }
+
+        // 5) Background tier-2 batch poll for dirty chat emits changed_msg_ids == Some(["m3"])
+        //    and preserves notify_candidate.
+        chat_stage.store(3, Ordering::SeqCst);
+        let mut chat_cache = HashMap::new();
+        let mut seeded = false;
+        let mut cursor_init = false;
+        poll_chats_tier2_with_cache(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut chat_cache,
+            &mut seeded,
+            &mut cursor_init,
+        )
+        .await
+        .unwrap();
+        let mut saw_batch_update = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if let CoreEvent::MessagesUpdated {
+                conv_key,
+                messages,
+                notify_candidate,
+                changed_msg_ids,
+                ..
+            } = ev
+            {
+                assert_eq!(conv_key, "chat:c1");
+                assert_eq!(changed_msg_ids, Some(vec!["m3".to_string()]));
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].msg_id, "m3");
+                let cand = notify_candidate.expect("expected notification candidate");
+                assert_eq!(cand.sender, "Alice");
+                assert_eq!(cand.preview, "three from batch");
+                saw_batch_update = true;
+            }
+        }
+        assert!(saw_batch_update, "expected tier-2 MessagesUpdated event");
+
         server.abort();
     }
 }

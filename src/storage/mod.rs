@@ -209,6 +209,14 @@ impl Storage {
         repo::upsert_messages(&mut conn, messages)
     }
 
+    pub fn upsert_messages_returning_changed_ids(
+        &self,
+        messages: &[MessageItem],
+    ) -> Result<Vec<String>> {
+        let mut conn = self.lock_conn()?;
+        repo::upsert_messages_returning_changed_ids(&mut conn, messages)
+    }
+
     /// Lists root messages in chronological order (oldest first, newest last), limited to newest `limit`.
     pub fn list_root_messages(
         &self,
@@ -233,6 +241,18 @@ impl Storage {
     pub fn get_message(&self, conv_key: &str, msg_id: &str) -> Result<Option<MessageItem>> {
         let conn = self.read_conn()?;
         repo::get_message(&conn, conv_key, msg_id)
+    }
+
+    pub fn get_messages_by_ids(
+        &self,
+        conv_key: &str,
+        msg_ids: &[String],
+    ) -> Result<Vec<MessageItem>> {
+        if msg_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.read_conn()?;
+        repo::get_messages_by_ids(&conn, conv_key, msg_ids)
     }
 
     pub fn get_thread(
@@ -995,5 +1015,65 @@ mod tests {
         let mentioned = storage.list_mentions_for_user("u-target", 10).unwrap();
         assert_eq!(mentioned.len(), 1);
         assert_eq!(mentioned[0].msg_id, "root1");
+    }
+
+    #[test]
+    fn test_upsert_messages_returning_changed_ids_and_get_messages_by_ids() {
+        let storage = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c-inc", "Incremental Chat", false, None);
+        let conv_key = chat.conv_key.clone();
+        storage.upsert_conversations(&[chat]).unwrap();
+
+        let m1 = sample_msg(&conv_key, "m1", None, "Alice", "one", None, "2026-11-20T01:00:00Z");
+        let m2 = sample_msg(&conv_key, "m2", None, "Bob", "two", None, "2026-11-20T02:00:00Z");
+
+        // Initial insert returns both IDs; duplicates in the same batch are deduplicated.
+        let changed = storage
+            .upsert_messages_returning_changed_ids(&[m1.clone(), m2.clone(), m1.clone()])
+            .unwrap();
+        assert_eq!(changed, vec!["m1".to_string(), "m2".to_string()]);
+
+        // Re-upserting identical rows returns empty Vec.
+        let unchanged = storage
+            .upsert_messages_returning_changed_ids(&[m1.clone(), m2.clone()])
+            .unwrap();
+        assert!(unchanged.is_empty());
+
+        // Editing one row and soft-deleting another returns only changed IDs.
+        let mut m1_edit = m1.clone();
+        m1_edit.body_plain = "one edited".to_string();
+        m1_edit.body_html = "<p>one edited</p>".to_string();
+        m1_edit.last_modified_at = Some("2026-11-20T02:05:00Z".to_string());
+        let mut m2_del = m2.clone();
+        m2_del.deleted = true;
+        let m3 = sample_msg(&conv_key, "m3", None, "Alice", "three", None, "2026-11-20T03:00:00Z");
+
+        let changed2 = storage
+            .upsert_messages_returning_changed_ids(&[m1_edit, m2_del, m3])
+            .unwrap();
+        assert_eq!(
+            changed2,
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+        );
+
+        // get_messages_by_ids reads only requested unique IDs via get_message.
+        repo::reset_mapped_message_rows();
+        let empty = storage.get_messages_by_ids(&conv_key, &[]).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(repo::mapped_message_rows(), 0);
+
+        repo::reset_mapped_message_rows();
+        let fetched = storage
+            .get_messages_by_ids(
+                &conv_key,
+                &["m1".to_string(), "m2".to_string(), "m1".to_string()],
+            )
+            .unwrap();
+        assert_eq!(repo::mapped_message_rows(), 2);
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].msg_id, "m1");
+        assert_eq!(fetched[0].body_plain, "one edited");
+        assert_eq!(fetched[1].msg_id, "m2");
+        assert!(fetched[1].deleted);
     }
 }

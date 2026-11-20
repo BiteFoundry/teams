@@ -2675,18 +2675,61 @@ impl AppState {
             }
             CoreEvent::MessagesUpdated {
                 conv_key,
-                parent_msg_id: _,
+                parent_msg_id,
                 messages,
                 notify_candidate,
+                changed_msg_ids,
             } => {
                 ui.poll_retrying = false;
+                let mut fetched_mentions_or_deleted = false;
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     let prev_len = self.messages.len();
                     let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
-                    let window = self.messages.len().max(80);
-                    if let Ok(msgs) = self.storage.list_root_messages(&conv_key, window, None) {
-                        merge_optimistic_messages(&mut self.messages, msgs);
+                    let is_chat = self
+                        .active_target
+                        .as_ref()
+                        .map(|t| !t.is_channel())
+                        .unwrap_or_else(|| {
+                            self.target_for_conv_key(&conv_key)
+                                .is_some_and(|t| !t.is_channel())
+                        });
+                    let use_incremental = parent_msg_id.is_none()
+                        && self.active_thread.is_none()
+                        && is_chat
+                        && self
+                            .messages
+                            .iter()
+                            .any(|m| !m.msg_id.starts_with("optimistic-"));
+
+                    let mut handled_incrementally = false;
+                    if use_incremental {
+                        if let Some(ref changed_ids) = changed_msg_ids {
+                            if changed_ids.is_empty() {
+                                handled_incrementally = true;
+                            } else if let Ok(changed_rows) =
+                                self.storage.get_messages_by_ids(&conv_key, changed_ids)
+                            {
+                                fetched_mentions_or_deleted = changed_rows
+                                    .iter()
+                                    .any(|m| !m.mentions.is_empty() || m.deleted);
+                                apply_changed_messages_incremental(
+                                    &mut self.messages,
+                                    changed_rows,
+                                    self.oldest_reached,
+                                    &mut ui.chat_scroll.selected_idx,
+                                );
+                                handled_incrementally = true;
+                            }
+                        }
                     }
+
+                    if !handled_incrementally {
+                        let window = self.messages.len().max(80);
+                        if let Ok(msgs) = self.storage.list_root_messages(&conv_key, window, None) {
+                            merge_optimistic_messages(&mut self.messages, msgs);
+                        }
+                    }
+
                     let appended_at_bottom = self.messages.len() > prev_len
                         || self.messages.last().map(|m| m.msg_id.as_str())
                             != prev_last_id.as_deref();
@@ -2716,9 +2759,13 @@ impl AppState {
                         }
                     }
                 }
-                if !self.my_user_id.is_empty()
-                    && messages.iter().any(|m| !m.mentions.is_empty() || m.deleted)
-                {
+                let mentions_may_have_changed = if changed_msg_ids.as_deref() == Some(&[]) {
+                    false
+                } else {
+                    fetched_mentions_or_deleted
+                        || messages.iter().any(|m| !m.mentions.is_empty() || m.deleted)
+                };
+                if !self.my_user_id.is_empty() && mentions_may_have_changed {
                     if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
                     {
                         self.activity_mentions = mentions;
@@ -3227,6 +3274,118 @@ impl AppState {
             ConversationKind::Group => "Group",
             ConversationKind::Meeting => "Meeting",
             ConversationKind::Channel => "Channel",
+        }
+    }
+}
+
+fn cmp_message_order(a: &MessageItem, b: &MessageItem) -> std::cmp::Ordering {
+    a.created_at
+        .cmp(&b.created_at)
+        .then_with(|| a.msg_id.cmp(&b.msg_id))
+}
+
+fn find_incremental_insert_pos(target: &[MessageItem], msg: &MessageItem) -> usize {
+    let mut insert_pos = target.len();
+    while insert_pos > 0 {
+        let prev = &target[insert_pos - 1];
+        if prev.msg_id.starts_with("optimistic-")
+            || cmp_message_order(msg, prev) == std::cmp::Ordering::Less
+        {
+            insert_pos -= 1;
+        } else {
+            break;
+        }
+    }
+    insert_pos
+}
+
+fn apply_changed_messages_incremental(
+    target: &mut Vec<MessageItem>,
+    incoming: Vec<MessageItem>,
+    oldest_reached: bool,
+    selected_idx: &mut Option<usize>,
+) {
+    if incoming.is_empty() {
+        return;
+    }
+
+    let mut has_full_window = target.len() >= 80
+        && target
+            .iter()
+            .filter(|m| !m.msg_id.starts_with("optimistic-"))
+            .take(80)
+            .count()
+            >= 80;
+    let mut earliest_loaded: Option<(String, String)> = target
+        .iter()
+        .find(|m| !m.msg_id.starts_with("optimistic-"))
+        .map(|m| (m.created_at.clone(), m.msg_id.clone()));
+
+    for msg in incoming {
+        if msg.parent_msg_id.is_some() {
+            continue;
+        }
+        if let Some(pos) = target.iter().rposition(|m| m.msg_id == msg.msg_id) {
+            if target[pos].created_at == msg.created_at {
+                target[pos] = msg;
+                continue;
+            }
+            let was_selected = *selected_idx == Some(pos);
+            target.remove(pos);
+            if let Some(sel) = *selected_idx {
+                if was_selected {
+                    *selected_idx = None;
+                } else if sel > pos {
+                    *selected_idx = Some(sel - 1);
+                }
+            }
+            let insert_pos = find_incremental_insert_pos(target, &msg);
+            target.insert(insert_pos, msg);
+            if was_selected {
+                *selected_idx = Some(insert_pos);
+            } else if let Some(sel) = *selected_idx {
+                if insert_pos <= sel {
+                    *selected_idx = Some(sel + 1);
+                }
+            }
+            earliest_loaded = target
+                .iter()
+                .find(|m| !m.msg_id.starts_with("optimistic-"))
+                .map(|m| (m.created_at.clone(), m.msg_id.clone()));
+            continue;
+        }
+
+        if !oldest_reached && has_full_window {
+            if let Some((ref min_ts, ref min_id)) = earliest_loaded {
+                if (msg.created_at.as_str(), msg.msg_id.as_str())
+                    < (min_ts.as_str(), min_id.as_str())
+                {
+                    continue;
+                }
+            }
+        }
+
+        let insert_pos = find_incremental_insert_pos(target, &msg);
+        let key = (msg.created_at.clone(), msg.msg_id.clone());
+        target.insert(insert_pos, msg);
+        if !has_full_window && target.len() >= 80 {
+            has_full_window = target
+                .iter()
+                .filter(|m| !m.msg_id.starts_with("optimistic-"))
+                .take(80)
+                .count()
+                >= 80;
+        }
+        if let Some(sel) = *selected_idx {
+            if insert_pos <= sel {
+                *selected_idx = Some(sel + 1);
+            }
+        }
+        let is_earlier = earliest_loaded
+            .as_ref()
+            .is_none_or(|(min_ts, min_id)| key.0 < *min_ts || (key.0 == *min_ts && key.1 < *min_id));
+        if is_earlier {
+            earliest_loaded = Some(key);
         }
     }
 }
@@ -3765,6 +3924,7 @@ mod tests {
                 parent_msg_id: None,
                 messages: vec![],
                 notify_candidate: None,
+                changed_msg_ids: None,
             },
         );
         assert_eq!(ui.pending_append_anchor, Some(20));
@@ -3885,6 +4045,383 @@ mod tests {
             }
             _ => panic!("expected Sixel ImageDecoded on raw cache hit"),
         }
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn incremental_chat_updates_read_only_changed_rows_for_80_and_830_windows() {
+        use crate::storage::repo::{mapped_message_rows, reset_mapped_message_rows};
+
+        for initial_count in [80usize, 830usize] {
+            let (mut app, mut ui) = make_test_app();
+            let conv = "chat:perf-room";
+            app.active_conv_key = Some(conv.to_string());
+            app.active_target = Some(ConversationTarget::Chat {
+                chat_id: "perf-room".to_string(),
+            });
+
+            let mut seed = Vec::with_capacity(initial_count);
+            for i in 0..initial_count {
+                let ts = format!(
+                    "2026-11-20T{:02}:{:02}:{:02}Z",
+                    i / 3600,
+                    (i / 60) % 60,
+                    i % 60
+                );
+                seed.push(make_test_msg(
+                    conv,
+                    &format!("m{:04}", i + 1),
+                    &ts,
+                    &format!("msg {}", i + 1),
+                ));
+            }
+            app.storage.upsert_messages(&seed).unwrap();
+            app.messages = seed;
+
+            // 1) 0 changed rows -> 0 SQLite row reads.
+            reset_mapped_message_rows();
+            app.handle_core_event(
+                &mut ui,
+                CoreEvent::MessagesUpdated {
+                    conv_key: conv.to_string(),
+                    parent_msg_id: None,
+                    messages: Vec::new(),
+                    notify_candidate: None,
+                    changed_msg_ids: Some(Vec::new()),
+                },
+            );
+            assert_eq!(mapped_message_rows(), 0, "0 changes must read 0 rows");
+            assert_eq!(app.messages.len(), initial_count);
+
+            // 2) 1 new root message while scrolled up -> reads exactly 1 row & sets append anchor.
+            let new_msg = make_test_msg(
+                conv,
+                &format!("m{:04}", initial_count + 1),
+                "2026-11-20T23:00:00Z",
+                "newest arrival",
+            );
+            app.storage
+                .upsert_messages(std::slice::from_ref(&new_msg))
+                .unwrap();
+            ui.chat_scroll.follow_tail = false;
+            ui.chat_scroll.scroll_up = 12;
+            ui.chat_scroll.total_lines = 400;
+            ui.chat_scroll.offset = 100;
+            ui.pending_append_anchor = None;
+
+            reset_mapped_message_rows();
+            app.handle_core_event(
+                &mut ui,
+                CoreEvent::MessagesUpdated {
+                    conv_key: conv.to_string(),
+                    parent_msg_id: None,
+                    messages: vec![new_msg.clone()],
+                    notify_candidate: None,
+                    changed_msg_ids: Some(vec![new_msg.msg_id.clone()]),
+                },
+            );
+            assert_eq!(
+                mapped_message_rows(),
+                1,
+                "1 new message in {initial_count}-row chat must read exactly 1 row"
+            );
+            assert_eq!(app.messages.len(), initial_count + 1);
+            assert_eq!(app.messages.last().unwrap().msg_id, new_msg.msg_id);
+            assert_eq!(ui.pending_append_anchor, Some(100));
+
+            app.sync_ctrl.request(SyncCommand::Shutdown);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_chat_updates_preserve_order_edits_deletes_optimistic_and_snapshots() {
+        use crate::storage::repo::{mapped_message_rows, reset_mapped_message_rows};
+
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chat:group-1";
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(ConversationTarget::Chat {
+            chat_id: "group-1".to_string(),
+        });
+        app.conversations.push(ConversationSummary {
+            conv_key: conv.to_string(),
+            target: ConversationTarget::Chat {
+                chat_id: "group-1".to_string(),
+            },
+            kind: ConversationKind::Group,
+            team_id: None,
+            team_name: None,
+            title: "Group Chat".to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        });
+
+        // 1) Empty window uses snapshot fallback even if changed_msg_ids is Some([]).
+        let m1 = make_test_msg(conv, "m1", "2026-11-20T01:00:00Z", "one");
+        let m3 = make_test_msg(conv, "m3", "2026-11-20T02:00:00Z", "three");
+        app.storage
+            .upsert_messages(&[m1.clone(), m3.clone()])
+            .unwrap();
+        assert!(app.messages.is_empty());
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: Vec::new(),
+                notify_candidate: None,
+                changed_msg_ids: Some(Vec::new()),
+            },
+        );
+        assert_eq!(
+            app.messages.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m3"]
+        );
+
+        // 2) Same-timestamp tie-break (m2 < m3 at identical timestamp) + selection shift.
+        let m2 = make_test_msg(conv, "m2", "2026-11-20T02:00:00Z", "two");
+        app.storage.upsert_messages(std::slice::from_ref(&m2)).unwrap();
+        ui.chat_scroll.selected_idx = Some(1); // pointing at m3
+        reset_mapped_message_rows();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![m2.clone()],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["m2".to_string()]),
+            },
+        );
+        assert_eq!(mapped_message_rows(), 1);
+        assert_eq!(
+            app.messages.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3"]
+        );
+        assert_eq!(ui.chat_scroll.selected_idx, Some(2)); // still pointing at m3
+
+        // 3) Edit, soft-delete, and duplicate delivery update in-place without duplicating.
+        let mut m2_edited = m2.clone();
+        m2_edited.body_plain = "two edited".to_string();
+        m2_edited.body_html = "<p>two edited</p>".to_string();
+        m2_edited.last_modified_at = Some("2026-11-20T02:05:00Z".to_string());
+        let mut m3_deleted = m3.clone();
+        m3_deleted.deleted = true;
+        app.storage
+            .upsert_messages(&[m2_edited.clone(), m3_deleted.clone()])
+            .unwrap();
+        reset_mapped_message_rows();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![m2_edited, m3_deleted],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["m2".to_string(), "m3".to_string(), "m2".to_string()]),
+            },
+        );
+        assert_eq!(mapped_message_rows(), 2);
+        assert_eq!(app.messages.len(), 3);
+        assert_eq!(app.messages[1].body_plain, "two edited");
+        assert!(app.messages[2].deleted);
+
+        // 4) Optimistic reconciliation:
+        //    (a) Poll arrives before MessageSent -> server row inserted before optimistic, then MessageSent removes optimistic.
+        let opt = make_test_msg(conv, "optimistic-1", "2026-11-20T03:00:00Z", "sending");
+        app.messages.push(opt);
+        let m4 = make_test_msg(conv, "m4", "2026-11-20T02:59:59Z", "sending");
+        app.storage.upsert_messages(std::slice::from_ref(&m4)).unwrap();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![m4.clone()],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["m4".to_string()]),
+            },
+        );
+        assert_eq!(
+            app.messages.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3", "m4", "optimistic-1"]
+        );
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageSent {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                optimistic_id: Some("optimistic-1".to_string()),
+                sent: m4.clone(),
+            },
+        );
+        assert_eq!(
+            app.messages.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3", "m4"]
+        );
+
+        //    (b) MessageSent arrives before duplicate poll -> poll replaces in-place without duplicating.
+        let opt2 = make_test_msg(conv, "optimistic-2", "2026-11-20T04:00:00Z", "second");
+        app.messages.push(opt2);
+        let m5 = make_test_msg(conv, "m5", "2026-11-20T04:00:01Z", "second");
+        app.storage.upsert_messages(std::slice::from_ref(&m5)).unwrap();
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageSent {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                optimistic_id: Some("optimistic-2".to_string()),
+                sent: m5.clone(),
+            },
+        );
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![m5.clone()],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["m5".to_string()]),
+            },
+        );
+        assert_eq!(
+            app.messages.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3", "m4", "m5"]
+        );
+
+        // 5) Out-of-window old message is NOT injected into a full (>=80) window when !oldest_reached.
+        let mut full_window = Vec::with_capacity(80);
+        for i in 100..180 {
+            full_window.push(make_test_msg(
+                conv,
+                &format!("w{i:03}"),
+                &format!("2026-11-20T10:{:02}:{:02}Z", (i - 100) / 60, (i - 100) % 60),
+                "win",
+            ));
+        }
+        let very_old = make_test_msg(conv, "w001", "2026-11-19T00:00:00Z", "ancient");
+        app.storage.upsert_messages(&full_window).unwrap();
+        app.storage
+            .upsert_messages(std::slice::from_ref(&very_old))
+            .unwrap();
+        app.messages = full_window;
+        app.oldest_reached = false;
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![very_old],
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["w001".to_string()]),
+            },
+        );
+        assert_eq!(app.messages.len(), 80);
+        assert_eq!(app.messages[0].msg_id, "w100");
+
+        // 6) Legacy IPC event (changed_msg_ids: None) falls back to snapshot list_root_messages.
+        let m_snap = make_test_msg(conv, "w999", "2026-11-20T23:59:59Z", "snapshot fallback");
+        app.storage
+            .upsert_messages(std::slice::from_ref(&m_snap))
+            .unwrap();
+        reset_mapped_message_rows();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: Vec::new(),
+                notify_candidate: None,
+                changed_msg_ids: None,
+            },
+        );
+        assert!(mapped_message_rows() >= 80);
+        assert_eq!(app.messages.last().unwrap().msg_id, "w999");
+
+        // 7) Mentions refresh on changed mention row, skipped on 0-change event.
+        app.my_user_id = "me-mention".to_string();
+        reset_mapped_message_rows();
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: Vec::new(),
+                notify_candidate: None,
+                changed_msg_ids: Some(Vec::new()),
+            },
+        );
+        assert_eq!(mapped_message_rows(), 0);
+        assert!(app.activity_mentions.is_empty());
+
+        let mut mention_msg = make_test_msg(conv, "w1000", "2026-11-20T23:59:59.5Z", "@Me check");
+        mention_msg.mentions.push(crate::models::MentionInfo {
+            id: 0,
+            user_id: "me-mention".to_string(),
+            display_name: "Me".to_string(),
+        });
+        app.storage
+            .upsert_messages(std::slice::from_ref(&mention_msg))
+            .unwrap();
+        ui.notify = false;
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: conv.to_string(),
+                parent_msg_id: None,
+                messages: vec![mention_msg.clone()],
+                notify_candidate: Some(NotificationCandidate {
+                    conv_key: conv.to_string(),
+                    conv_title: "Group Chat".to_string(),
+                    sender: "Alice".to_string(),
+                    preview: "@Me check".to_string(),
+                }),
+                changed_msg_ids: Some(vec!["w1000".to_string()]),
+            },
+        );
+        assert_eq!(app.activity_mentions.len(), 1);
+        assert_eq!(app.activity_mentions[0].msg_id, "w1000");
+
+        // 8) Channel conversation still uses snapshot path + refreshes open thread.
+        let chan_key = "chan:t1:ch1";
+        let root = make_test_msg(chan_key, "r1", "2026-11-20T01:00:00Z", "root");
+        let mut reply = make_test_msg(chan_key, "r1-rep1", "2026-11-20T01:05:00Z", "reply");
+        reply.parent_msg_id = Some("r1".to_string());
+        app.storage
+            .upsert_messages(&[root.clone(), reply])
+            .unwrap();
+        app.active_conv_key = Some(chan_key.to_string());
+        app.active_target = Some(ConversationTarget::Channel {
+            team_id: "t1".to_string(),
+            channel_id: "ch1".to_string(),
+        });
+        app.messages = vec![root.clone()];
+        app.active_thread = Some(ThreadView {
+            conv_key: chan_key.to_string(),
+            root,
+            replies: Vec::new(),
+        });
+        app.handle_core_event(
+            &mut ui,
+            CoreEvent::MessagesUpdated {
+                conv_key: chan_key.to_string(),
+                parent_msg_id: Some("r1".to_string()),
+                messages: Vec::new(),
+                notify_candidate: None,
+                changed_msg_ids: Some(vec!["r1-rep1".to_string()]),
+            },
+        );
+        assert_eq!(app.active_thread.as_ref().unwrap().replies.len(), 1);
+        assert_eq!(app.active_thread.as_ref().unwrap().replies[0].msg_id, "r1-rep1");
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
