@@ -1096,7 +1096,7 @@ pub fn decode_and_render_halfblocks(
     let guessed = image::guess_format(bytes).ok();
     let format_label = format_label_for(guessed);
     let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
-    let rgba = dyn_img.to_rgba8();
+    let rgba = dyn_img.into_rgba8();
     let (width_px, height_px) = rgba.dimensions();
     if width_px == 0 || height_px == 0 {
         bail!("Image dimensions are 0x0");

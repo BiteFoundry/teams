@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/teams-linux-x64",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "description": "Prebuilt teams binary for Linux x64 (glibc)",
   "repository": {
     "type": "git",

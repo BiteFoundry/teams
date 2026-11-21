@@ -329,7 +329,7 @@ fn upsert_messages_in_transaction(
             "
             SELECT
                 last_modified_at, deleted, reply_count, reactions_json, body_plain, author_name, subject,
-                attachments_json, mentions_json
+                attachments_json, mentions_json, parent_msg_id
             FROM messages
             WHERE msg_key = ?1
             ",
@@ -409,6 +409,7 @@ fn upsert_messages_in_transaction(
                 Option<String>,
                 String,
                 String,
+                Option<String>,
             )> = check_stmt
                 .query_row(params![msg_key.as_ref()], |row| {
                     Ok((
@@ -421,6 +422,7 @@ fn upsert_messages_in_transaction(
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 })
                 .optional()?;
@@ -439,6 +441,7 @@ fn upsert_messages_in_transaction(
                 ref ex_subject,
                 ref ex_attachments_json,
                 ref ex_mentions_json,
+                _,
             )) = existing
             {
                 let effective_author_same = (msg.deleted && msg.author_name == "Unknown")
@@ -557,7 +560,12 @@ fn upsert_messages_in_transaction(
                     .or_insert(msg);
             }
 
-            if let Some(root_id) = &msg.parent_msg_id {
+            // A sparse delta tombstone can omit the already-stored parent ID.
+            if let Some(root_id) = msg
+                .parent_msg_id
+                .as_ref()
+                .or_else(|| existing.as_ref().and_then(|(.., parent)| parent.as_ref()))
+            {
                 touched_threads.insert((msg.conv_key.clone(), root_id.clone()));
             }
         }

@@ -36,6 +36,7 @@ use crate::{
 
 /// One rendered visual line plus optional full-line and inline click targets.
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct RenderedLine {
     pub line: Line<'static>,
     pub target: Option<HitTarget>,
@@ -124,6 +125,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
 
     if message_area.height == 0 {
         return;
+    }
+
+    if app.active_conv_key.is_none() || app.messages.is_empty() {
+        CHAT_LINES_CACHE.take();
     }
 
     if app.active_conv_key.is_none() {
@@ -602,7 +607,7 @@ impl DualHasher {
         s.as_bytes().hash(&mut self.h2);
     }
 
-    pub(crate) fn finish(self) -> (u64, u64) {
+    pub(crate) fn finish(&self) -> (u64, u64) {
         (self.h1.finish(), self.h2.finish())
     }
 }
@@ -659,7 +664,9 @@ pub(crate) fn hash_theme_sig(h: &mut DualHasher, theme: &Theme) {
     h.write_hash(&theme.unread_divider);
     h.write_hash(&theme.warning);
     h.write_hash(&theme.error);
+    h.write_hash(&theme.success);
     h.write_hash(&theme.code_fg);
+    h.write_hash(&theme.author_palette);
 }
 
 pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
@@ -695,6 +702,7 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
         }
         None => h.write_hash(&0u8),
     }
+    h.write_hash(&msg.reply_to_author);
     match &msg.reply_to_preview {
         Some(p) => {
             h.write_hash(&1u8);
@@ -712,6 +720,7 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
     }
     h.write_hash(&msg.mentions.len());
     for m in &msg.mentions {
+        h.write_hash(&m.id);
         h.write_str(&m.user_id);
         h.write_str(&m.display_name);
     }
@@ -727,6 +736,8 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
             None => h.write_hash(&0u8),
         }
         h.write_str(&att.content_type);
+        h.write_hash(&att.content_url);
+        h.write_hash(&att.content_json);
     }
     h.write_str(&msg.body_html);
     h.write_str(&msg.body_plain);
@@ -738,6 +749,12 @@ pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
         None => h.write_hash(&0u8),
     }
     h.write_str(&msg.importance);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatLinesSignature {
+    prefix: (u64, u64),
+    full: (u64, u64),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -759,7 +776,7 @@ fn compute_chat_lines_sig(
     oldest_reached: bool,
     history_error: Option<&str>,
     theme: &Theme,
-) -> (u64, u64) {
+) -> ChatLinesSignature {
     let mut h = DualHasher::new(0x4348_4154_5f4c_494e);
     match conv_key {
         Some(k) => {
@@ -807,8 +824,19 @@ fn compute_chat_lines_sig(
     }
     hash_theme_sig(&mut h, theme);
     h.write_hash(&view.messages.len());
-    for msg in view.messages {
-        hash_message_sig(&mut h, msg);
+    let Some((tail, prefix)) = view.messages.split_last() else {
+        let empty = h.finish();
+        return ChatLinesSignature {
+            prefix: empty,
+            full: empty,
+        };
+    };
+    // These tail fields fix its position and contribution to the unread divider.
+    h.write_str(&tail.msg_id);
+    h.write_str(&tail.created_at);
+    h.write_hash(&tail.is_me);
+    let hash_row = |h: &mut DualHasher, msg: &MessageItem| {
+        hash_message_sig(h, msg);
         if let (Some(map), Some(aid)) = (presences, msg.author_id.as_deref()) {
             if let Some(p) = map.get(aid) {
                 h.write_hash(&1u8);
@@ -817,12 +845,29 @@ fn compute_chat_lines_sig(
                 h.write_hash(&0u8);
             }
         }
+    };
+    for msg in prefix {
+        hash_row(&mut h, msg);
     }
-    h.finish()
+    let prefix = h.finish();
+    hash_row(&mut h, tail);
+    ChatLinesSignature {
+        prefix,
+        full: h.finish(),
+    }
+}
+
+#[derive(Clone)]
+struct ChatStream {
+    signature: ChatLinesSignature,
+    lines: Arc<Vec<RenderedLine>>,
+    ranges: Arc<[(usize, usize)]>,
 }
 
 thread_local! {
-    static CHAT_LINES_CACHE: RefCell<LineSliceCache> = RefCell::new(LineSliceCache::new(4));
+    static CHAT_LINES_CACHE: RefCell<Option<ChatStream>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static RENDERED_MESSAGE_BODIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn build_lines(app: &AppState, ui: &UiState, width: usize) -> Vec<RenderedLine> {
@@ -839,22 +884,15 @@ pub fn build_lines_with_images(
     ui: &UiState,
     width: usize,
 ) -> Vec<RenderedLine> {
-    build_lines_with_images_cached(app, ui, width).to_vec()
+    build_stream_cached(app, ui, width).lines.to_vec()
 }
 
-pub(crate) fn build_lines_with_images_cached(
+fn build_stream_cached(
     app: &mut AppState,
     ui: &UiState,
     width: usize,
-) -> Arc<[RenderedLine]> {
-    build_stream_cached(app, ui, width).lines
-}
-
-pub(crate) fn build_stream_cached(
-    app: &mut AppState,
-    ui: &UiState,
-    width: usize,
-) -> CachedStream {
+) -> ChatStream {
+    let tail_message_updated = std::mem::take(&mut app.tail_message_updated);
     let hyperlinks = hyperlinks_enabled();
     let width = width.max(12);
     let mut view = ChatRender::from_app(app, ui);
@@ -864,41 +902,49 @@ pub(crate) fn build_stream_cached(
         _ => None,
     };
 
-    let sig = {
-        let my_display_name = app.my_profile.as_ref().map(|p| p.display_name.as_str());
-        compute_chat_lines_sig(
-            app.active_conv_key.as_deref(),
-            &view,
-            ui.density,
-            active_unread_ts,
-            &app.my_user_id,
-            my_display_name,
-            Some(&app.presences),
-            app.my_presence.as_ref(),
-            width,
-            hyperlinks,
-            ui.show_hrefs,
-            ui.inline_images,
-            app.image_cache_gen,
-            app.loading_older,
-            app.oldest_reached,
-            app.history_error.as_deref(),
-            &ui.theme,
-        )
-    };
-
-    if let Some(cached) = CHAT_LINES_CACHE.with(|cache| cache.borrow_mut().get(sig)) {
-        return cached;
+    let my_display_name = app.my_profile.as_ref().map(|p| p.display_name.as_str());
+    let signature = compute_chat_lines_sig(
+        app.active_conv_key.as_deref(),
+        &view,
+        ui.density,
+        active_unread_ts,
+        &app.my_user_id,
+        my_display_name,
+        Some(&app.presences),
+        app.my_presence.as_ref(),
+        width,
+        hyperlinks,
+        ui.show_hrefs,
+        ui.inline_images,
+        app.image_cache_gen,
+        app.loading_older,
+        app.oldest_reached,
+        app.history_error.as_deref(),
+        &ui.theme,
+    );
+    let previous = CHAT_LINES_CACHE.take();
+    if let Some(cached) = previous.as_ref().filter(|cached| cached.signature == signature) {
+        let result = cached.clone();
+        CHAT_LINES_CACHE.set(previous);
+        return result;
     }
 
     let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
     let thumb_rows = 10u16;
 
-    let mut view = ChatRender::from_app(app, ui);
-    view.selected_index = None;
-    let my_display_name = app.my_profile.as_ref().map(|p| p.display_name.as_str());
     let mut out = Vec::new();
-    if app.active_conv_key.is_some() {
+    let mut ranges = Vec::with_capacity(view.messages.len());
+    if let Some(cached) = previous.filter(|cached| {
+        tail_message_updated && cached.signature.prefix == signature.prefix && cached.ranges.len() > 1
+    }) {
+        if let Ok(lines) = Arc::try_unwrap(cached.lines) {
+            ranges.extend_from_slice(&cached.ranges[..cached.ranges.len() - 1]);
+            out = lines;
+            // The date divider and spacing belong to the following message.
+            out.truncate(ranges[ranges.len() - 1].1);
+        }
+    }
+    if ranges.is_empty() && app.active_conv_key.is_some() {
         if let Some(banner) = build_history_banner_line(
             app.loading_older,
             app.oldest_reached,
@@ -931,13 +977,15 @@ pub(crate) fn build_stream_cached(
         thumbs,
         (thumb_cols, thumb_rows),
         ui.show_hrefs,
+        ranges,
     );
 
-    let cached = CachedStream {
-        lines: Arc::from(out),
+    let cached = ChatStream {
+        signature,
+        lines: Arc::new(out),
         ranges: Arc::from(ranges),
     };
-    CHAT_LINES_CACHE.with(|cache| cache.borrow_mut().insert(sig, cached.clone()));
+    CHAT_LINES_CACHE.set(Some(cached.clone()));
     cached
 }
 
@@ -963,6 +1011,7 @@ pub fn build_lines_with_hyperlinks(
         None,
         (0, 0),
         false,
+        Vec::new(),
     );
     out
 }
@@ -982,12 +1031,16 @@ fn build_chat_body_lines(
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
     show_hrefs: bool,
+    mut ranges: Vec<(usize, usize)>,
 ) -> Vec<(usize, usize)> {
+    let start_index = ranges.len();
     let first_unread = find_first_unread(view.messages, unread_anchor_ts);
-    let mut last_date_key: Option<String> = None;
-    let mut ranges = Vec::with_capacity(view.messages.len());
+    let mut last_date_key = start_index
+        .checked_sub(1)
+        .map(|idx| format_date_key(&view.messages[idx].created_at));
+    ranges.reserve(view.messages.len() - start_index);
 
-    for (msg_index, msg) in view.messages.iter().enumerate() {
+    for (msg_index, msg) in view.messages.iter().enumerate().skip(start_index) {
         let mut just_emitted_divider = false;
         let date_key = format_date_key(&msg.created_at);
         if last_date_key.as_deref() != Some(date_key.as_str()) {
@@ -1711,6 +1764,9 @@ fn render_message_body_and_attachments(
     msg: &MessageItem,
     bctx: &BodyBlockCtx<'_>,
 ) -> bool {
+    #[cfg(test)]
+    RENDERED_MESSAGE_BODIES.set(RENDERED_MESSAGE_BODIES.get() + 1);
+
     let eff_attachments = msg.effective_attachments();
     let attachments = eff_attachments.as_ref();
     let parsed_blocks =
@@ -2893,6 +2949,7 @@ mod tests {
             None,
             (0, 0),
             false,
+            Vec::new(),
         );
         assert_eq!(ranges.len(), 3);
         // m1 and m2 have 0 blank lines between them (m1 ends where m2 starts)
@@ -2940,6 +2997,7 @@ mod tests {
             None,
             (0, 0),
             false,
+            Vec::new(),
         );
         let joined = plain_text(&out);
         assert!(joined.contains("─── 1 unread message ───"));
@@ -2984,6 +3042,7 @@ mod tests {
             None,
             (0, 0),
             false,
+            Vec::new(),
         );
         let joined = plain_text(&out);
         assert!(!joined.contains('\x1b'));
@@ -3002,6 +3061,91 @@ mod tests {
         let mention_span = body_line.line.spans.iter().find(|s| s.content.contains("@Bob")).unwrap();
         assert_eq!(mention_span.style.fg, Some(theme.fg_mention_me));
         assert_eq!(mention_span.style.bg, Some(theme.bg_mention_me));
+    }
+
+    #[tokio::test]
+    async fn tail_edit_and_reaction_render_one_body_and_preserve_the_view() {
+        use crate::{models::CoreEvent, ui::app::tests::make_test_app};
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chat:long-history";
+        app.active_conv_key = Some(conv.into());
+        app.messages = (1..=1580)
+            .map(|i| {
+                let mut msg = sample_msg(&format!("msg-{i:04}"), None, 0);
+                msg.conv_key = conv.into();
+                msg.msg_key = MessageItem::make_msg_key(conv, &msg.msg_id);
+                msg.body_html = format!("<p>History row {i}</p>");
+                msg.body_plain = format!("History row {i}");
+                msg
+            })
+            .collect();
+        app.messages.last_mut().unwrap().created_at = "2026-11-16T06:00:00Z".into();
+        ui.unread_anchor = Some((conv.into(), app.messages[0].created_at.clone()));
+        ui.inline_images = false;
+        ui.chat_scroll.selected_idx = Some(1579);
+        app.storage.upsert_messages(&app.messages).unwrap();
+
+        let snapshot = |app: &mut AppState, ui: &mut UiState| {
+            let area = Rect::new(0, 0, 80, 24);
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            let mut hitmap = HitMap::new();
+            terminal.draw(|frame| draw(frame, area, app, ui, &mut hitmap)).unwrap();
+            let hits: Vec<_> = hitmap.regions().copied().collect();
+            (
+                terminal.backend().buffer().clone(),
+                hits,
+                ui.chat_scroll.offset,
+                ui.chat_scroll.selected_idx,
+            )
+        };
+
+        for density in [DensityMode::Cozy, DensityMode::Compact] {
+            ui.density = density;
+            snapshot(&mut app, &mut ui);
+            for reaction in [false, true] {
+                let mut tail = app.messages.last().unwrap().clone();
+                if reaction {
+                    tail.reactions[0].count += 1;
+                } else {
+                    tail.body_html.push_str("<p>Added <a href=\"https://example.com\">a link</a></p>");
+                    tail.body_plain.push_str(" Added a link");
+                }
+                app.storage.upsert_messages(&[tail.clone()]).unwrap();
+                app.handle_core_event(&mut ui, CoreEvent::MessagesUpdated {
+                    conv_key: conv.into(),
+                    parent_msg_id: None,
+                    changed_msg_ids: Some(vec![tail.msg_id.clone()]),
+                    messages: vec![tail],
+                    notify_candidate: None,
+                });
+                assert!(app.tail_message_updated);
+                RENDERED_MESSAGE_BODIES.set(0);
+                let fast = snapshot(&mut app, &mut ui);
+                assert_eq!(RENDERED_MESSAGE_BODIES.get(), 1);
+                assert!(fast.1.iter().any(|(_, hit)| matches!(hit,
+                    HitTarget::Reaction { msg_index: 1579, .. })));
+                let fast_stream = CHAT_LINES_CACHE.take().unwrap();
+                RENDERED_MESSAGE_BODIES.set(0);
+                assert_eq!(fast, snapshot(&mut app, &mut ui));
+                assert_eq!(RENDERED_MESSAGE_BODIES.get(), 1580);
+                CHAT_LINES_CACHE.with_borrow(|cache| {
+                    let full = cache.as_ref().unwrap();
+                    assert_eq!(fast_stream.ranges, full.ranges);
+                    assert_eq!(fast_stream.lines, full.lines);
+                });
+            }
+        }
+
+        let old_lines = CHAT_LINES_CACHE.with_borrow(|cache| {
+            Arc::downgrade(&cache.as_ref().unwrap().lines)
+        });
+        app.active_conv_key = Some("chat:other".into());
+        app.messages.truncate(1);
+        snapshot(&mut app, &mut ui);
+        assert!(old_lines.upgrade().is_none());
+        app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }
 
     #[test]
@@ -3050,8 +3194,8 @@ mod tests {
             lines: Arc::clone(&lines),
             ranges: Arc::from(vec![(0, lines.len())]),
         };
-        cache.insert(sig_base, cached_val.clone());
-        let hit = cache.get(sig_base).expect("expected cache hit");
+        cache.insert(sig_base.full, cached_val.clone());
+        let hit = cache.get(sig_base.full).expect("expected cache hit");
         assert_eq!(hit.lines.len(), lines.len());
 
         let sig_sel = compute_chat_lines_sig(
@@ -3156,10 +3300,10 @@ mod tests {
         );
         assert_ne!(sig_base, sig_react);
 
-        cache.insert(sig_compact, cached_val.clone());
-        cache.insert(sig_width, cached_val);
-        assert!(cache.get(sig_base).is_none());
-        assert!(cache.get(sig_width).is_some());
+        cache.insert(sig_compact.full, cached_val.clone());
+        cache.insert(sig_width.full, cached_val);
+        assert!(cache.get(sig_base.full).is_none());
+        assert!(cache.get(sig_width.full).is_some());
 
         // Changing body_plain or attachment names invalidates the message hash.
         let orig_msg = msgs[0].clone();
@@ -3321,6 +3465,7 @@ mod tests {
             Some(&cache),
             thumb_dims,
             false,
+            Vec::new(),
         );
 
         let thumb_lines: Vec<_> = out
@@ -3373,6 +3518,7 @@ mod tests {
             None,
             (0, 0),
             false,
+            Vec::new(),
         );
         let hidden_text = plain_text(&hidden_out);
         assert!(hidden_text.contains("the guide"));
@@ -3393,6 +3539,7 @@ mod tests {
             None,
             (0, 0),
             true,
+            Vec::new(),
         );
         let shown_text = plain_text(&shown_out);
         assert!(shown_text.contains("the guide (https://example.com/guide)"));

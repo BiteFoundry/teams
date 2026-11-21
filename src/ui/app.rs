@@ -516,6 +516,8 @@ pub struct AppState {
     pub active_conv_key: Option<String>,
     pub active_target: Option<ConversationTarget>,
     pub messages: Vec<MessageItem>,
+    /// A single changed row replaced the last message at the same position.
+    pub(crate) tail_message_updated: bool,
     pub active_thread: Option<ThreadView>,
     pub activity_mentions: Vec<MessageItem>,
     pub members: Vec<MemberInfo>,
@@ -586,6 +588,7 @@ impl AppState {
             active_conv_key: None,
             active_target: None,
             messages: Vec::new(),
+            tail_message_updated: false,
             active_thread: None,
             activity_mentions: Vec::new(),
             members: Vec::new(),
@@ -1033,6 +1036,7 @@ impl AppState {
 
         self.active_conv_key = Some(new_key.clone());
         self.active_target = Some(target.clone());
+        self.tail_message_updated = false;
         self.active_thread = None;
         self.loading_older = false;
         self.history_error = None;
@@ -2807,47 +2811,74 @@ impl AppState {
                 ui.poll_retrying = false;
                 let mut fetched_mentions_or_deleted = false;
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
+                    self.tail_message_updated = false;
                     let prev_len = self.messages.len();
                     let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
-                    let is_chat = self
+                    let is_channel = self
                         .active_target
                         .as_ref()
-                        .map(|t| !t.is_channel())
-                        .unwrap_or_else(|| {
-                            self.target_for_conv_key(&conv_key)
-                                .is_some_and(|t| !t.is_channel())
+                        .map(ConversationTarget::is_channel)
+                        .or_else(|| {
+                            self.target_for_conv_key(&conv_key).map(|t| t.is_channel())
                         });
-                    let use_incremental = parent_msg_id.is_none()
-                        && self.active_thread.is_none()
-                        && is_chat
-                        && self
-                            .messages
-                            .iter()
-                            .any(|m| !m.msg_id.starts_with("optimistic-"));
-
-                    let mut handled_incrementally = false;
-                    if use_incremental {
-                        if let Some(ref changed_ids) = changed_msg_ids {
-                            if changed_ids.is_empty() {
-                                handled_incrementally = true;
-                            } else if let Ok(changed_rows) =
-                                self.storage.get_messages_by_ids(&conv_key, changed_ids)
-                            {
-                                fetched_mentions_or_deleted = changed_rows
+                    let changed_rows = changed_msg_ids
+                        .as_deref()
+                        .filter(|_| parent_msg_id.is_none() && self.active_thread.is_none())
+                        .and_then(|ids| {
+                            if is_channel == Some(false)
+                                && self
+                                    .messages
                                     .iter()
-                                    .any(|m| !m.mentions.is_empty() || m.deleted);
-                                apply_changed_messages_incremental(
-                                    &mut self.messages,
-                                    changed_rows,
-                                    self.oldest_reached,
-                                    &mut ui.chat_scroll.selected_idx,
-                                );
-                                handled_incrementally = true;
+                                    .any(|m| !m.msg_id.starts_with("optimistic-"))
+                            {
+                                return if ids.is_empty() {
+                                    Some(Vec::new())
+                                } else {
+                                    self.storage.get_messages_by_ids(&conv_key, ids).ok()
+                                };
                             }
-                        }
-                    }
 
-                    if !handled_incrementally {
+                            let [id] = ids else { return None };
+                            if is_channel != Some(true) || id.starts_with("optimistic-") {
+                                return None;
+                            }
+                            // Replies and tombstones can change a different row's reply count.
+                            if !messages.iter().any(|m| {
+                                &m.msg_id == id && m.parent_msg_id.is_none() && !m.deleted
+                            }) {
+                                return None;
+                            }
+                            let root = self.messages.iter().find(|m| {
+                                &m.msg_id == id && m.parent_msg_id.is_none() && !m.deleted
+                            })?;
+                            let rows = self.storage.get_messages_by_ids(&conv_key, ids).ok()?;
+                            if matches!(rows.as_slice(), [row]
+                                if row.parent_msg_id.is_none() && !row.deleted
+                                    && row.created_at == root.created_at)
+                            {
+                                Some(rows)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(changed_rows) = changed_rows {
+                        fetched_mentions_or_deleted = changed_rows
+                            .iter()
+                            .any(|m| !m.mentions.is_empty() || m.deleted);
+                        self.tail_message_updated = matches!(changed_msg_ids.as_deref(), Some([_]))
+                            && matches!(changed_rows.as_slice(), [row]
+                                if row.parent_msg_id.is_none() && !row.deleted
+                                    && self.messages.last().is_some_and(|last|
+                                        last.msg_id == row.msg_id
+                                            && last.created_at == row.created_at
+                                            && !last.deleted));
+                        apply_changed_messages_incremental(
+                            &mut self.messages,
+                            changed_rows,
+                            self.oldest_reached,
+                            &mut ui.chat_scroll.selected_idx,
+                        );
+                    } else {
                         let window = self.messages.len().max(80);
                         if let Ok(msgs) = self.storage.list_root_messages(&conv_key, window, None) {
                             merge_optimistic_messages(&mut self.messages, msgs);
@@ -3676,7 +3707,7 @@ fn merge_optimistic_messages(target: &mut Vec<MessageItem>, incoming: Vec<Messag
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::sync::SyncCommand;
 
@@ -3716,7 +3747,7 @@ mod tests {
         }
     }
 
-    fn make_test_app() -> (AppState, UiState) {
+    pub(in crate::ui) fn make_test_app() -> (AppState, UiState) {
         let cfg = AppConfig::default();
         let auth = AuthManager::new(cfg.clone()).unwrap();
         let graph = GraphClient::new(cfg.clone(), auth.clone()).unwrap();
@@ -4682,6 +4713,71 @@ mod tests {
         assert_eq!(app.active_thread.as_ref().unwrap().replies.len(), 1);
         assert_eq!(app.active_thread.as_ref().unwrap().replies[0].msg_id, "r1-rep1");
 
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn channel_root_reaction_maps_one_row_and_reply_deletion_refreshes_parent() {
+        use crate::storage::repo::{mapped_message_rows, reset_mapped_message_rows};
+
+        let (mut app, mut ui) = make_test_app();
+        let conv_key = "chan:t1:ch1";
+        app.active_conv_key = Some(conv_key.into());
+        app.active_target = ConversationTarget::from_conv_key(conv_key);
+        let roots: Vec<_> = (1..=1580)
+            .map(|i| {
+                make_test_msg(
+                    conv_key,
+                    &format!("root-{i:04}"),
+                    "2026-11-20T01:00:00Z",
+                    "root",
+                )
+            })
+            .collect();
+        let root_index = roots.len() - 1;
+        let mut changed_root = roots[root_index].clone();
+        let mut reply = make_test_msg(conv_key, "reply", "2026-11-20T01:05:00Z", "reply");
+        reply.parent_msg_id = Some(changed_root.msg_id.clone());
+        app.storage.upsert_messages(&roots).unwrap();
+        app.storage.upsert_messages(&[reply.clone()]).unwrap();
+        app.messages = app.storage.list_root_messages(conv_key, 1580, None).unwrap();
+        ui.chat_scroll.selected_idx = Some(root_index);
+        assert_eq!(app.messages[root_index].reply_count, 1);
+
+        let event = |message: MessageItem| CoreEvent::MessagesUpdated {
+            conv_key: conv_key.into(),
+            parent_msg_id: None,
+            changed_msg_ids: Some(vec![message.msg_id.clone()]),
+            messages: vec![message],
+            notify_candidate: None,
+        };
+        changed_root.reactions.push(crate::models::ReactionSummary {
+            reaction_type: "like".into(),
+            count: 1,
+            me_reacted: false,
+            users: vec!["someone".into()],
+        });
+        app.storage.upsert_messages(&[changed_root.clone()]).unwrap();
+        reset_mapped_message_rows();
+        app.handle_core_event(&mut ui, event(changed_root));
+        assert_eq!(mapped_message_rows(), 1);
+        assert_eq!(app.messages[root_index].reactions[0].count, 1);
+        assert_eq!(app.messages[root_index].reply_count, 1);
+        assert_eq!(ui.chat_scroll.selected_idx, Some(root_index));
+        assert!(app.tail_message_updated);
+
+        reply.deleted = true;
+        reply.parent_msg_id = None;
+        reply.created_at.clear();
+        reply.body_html.clear();
+        reply.body_plain.clear();
+        app.storage.upsert_messages(&[reply.clone()]).unwrap();
+        reset_mapped_message_rows();
+        app.handle_core_event(&mut ui, event(reply));
+        assert_eq!(mapped_message_rows(), 1580);
+        assert_eq!(app.messages[root_index].reply_count, 0);
+        assert_eq!(app.messages[root_index].reactions[0].count, 1);
+        assert!(!app.tail_message_updated);
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }
 
