@@ -34,12 +34,14 @@
 # 1. Install globally via npm (links prebuilt native binary, zero Node runtime overhead)
 npm i -g @bitefoundry/teams
 
-# 2. Authenticate with Microsoft Entra ID (PKCE browser login, or --device-code for SSH/headless)
-teams login
+# 2. Sign in with the desktop application registered by your organization
+teams login --client-id YOUR_CLIENT_ID --tenant-id YOUR_TENANT_ID
 
 # 3. Launch the interactive TUI
 teams
 ```
+
+IT administrators can register the app, select delegated permissions and verify a sign-in in Entra. For the public Microsoft Graph Command Line Tools client, run `teams login`. [Company app registration guide](docs/ENTERPRISE.md)
 
 > **Alternative installs:** Run one-off with `npx @bitefoundry/teams`, download prebuilt binaries from [GitHub Releases](https://github.com/BiteFoundry/teams/releases), or build from source with `cargo build --release` (Rust 1.80+, zero external OpenSSL/SQLite deps). Self-update anytime with `teams update`.
 >
@@ -143,10 +145,10 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 | --- | --- | --- | --- |
 | **`@bitefoundry/teams`** *(this repo)* | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/outlook`](https://github.com/BiteFoundry/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion`, `nt` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
 
 ---
 

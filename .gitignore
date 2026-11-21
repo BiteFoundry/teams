@@ -11,3 +11,4 @@ npm/*/bin/teams.exe
 
 # local release staging
 /dist-release/
+npm/*/LICENSE

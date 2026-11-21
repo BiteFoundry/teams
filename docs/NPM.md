@@ -153,6 +153,8 @@ the current host.
 
 When using an external Microsoft Graph token broker (`tc-auth`, `az account get-access-token`, Vault CLI, etc.), configure `token_file` / `token_refresh_cmd` instead of shell wrappers (avoids `cmd.exe` 1023-char `set /p` truncation and `.ps1`/`.cmd` shim issues). Setting `TEAMS_TOKEN_FILE` (`token_file`) or `TEAMS_ACCESS_TOKEN` automatically skips OS keyring reads.
 
+For tenant-owned registrations, follow the [company app registration guide](ENTERPRISE.md).
+
 ### Required Microsoft Graph delegated scopes
 
 Pure Teams requires only Microsoft Teams & Graph core scopes:

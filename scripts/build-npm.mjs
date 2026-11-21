@@ -201,6 +201,7 @@ function build(triple, options = {}) {
     return { triple: normalized, ok: false, reason: `missing package manifest: ${packageJson}` };
   }
 
+  fs.copyFileSync(path.join(ROOT, 'LICENSE'), path.join(packageDir, 'LICENSE'));
   const destination = copyBinary(source, packageDir, mapping.binary);
   return {
     triple: normalized,

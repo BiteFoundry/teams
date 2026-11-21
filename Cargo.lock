@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "teams-cli"
-version = "0.7.8"
+version = "0.7.9"
 dependencies = [
  "anyhow",
  "arboard",

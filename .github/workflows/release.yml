@@ -103,12 +103,13 @@ jobs:
           name="teams-${version}-${{ matrix.target }}"
           mkdir -p release-staging
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/teams.exe"
+            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/teams.exe" LICENSE
             if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+              cp LICENSE release-staging/LICENSE
               cp "target/${{ matrix.target }}/release/teams.exe" "release-staging/teams.exe"
             fi
           else
-            tar -czf "release-staging/${name}.tar.gz" -C "target/${{ matrix.target }}/release" teams
+            tar -czf "release-staging/${name}.tar.gz" LICENSE -C "target/${{ matrix.target }}/release" teams
           fi
 
       - name: Stage npm artifact directory
