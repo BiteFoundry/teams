@@ -239,7 +239,10 @@ fn parse_message_blocks_uncached(
     }
 
     for att in attachments {
-        if !ctx.seen_attachments.contains(&att.id) && !ctx.is_seen_inline_attachment(att) {
+        if !ctx.seen_attachments.contains(&att.id)
+            && !ctx.is_seen_inline_attachment(att)
+            && !att.is_message_reference()
+        {
             ctx.push_attachment_block(att);
         }
     }
@@ -591,7 +594,9 @@ impl<'a> ParserContext<'a> {
                 if let Some(id) = el.attr("id").map(str::trim).filter(|s| !s.is_empty()) {
                     self.seen_attachments.insert(id.to_string());
                     if let Some(att) = self.attachments.iter().find(|a| a.id == id) {
-                        self.push_attachment_block(att);
+                        if !att.is_message_reference() {
+                            self.push_attachment_block(att);
+                        }
                     } else {
                         self.blocks.push(RichBlock::AttachmentChip {
                             id: id.to_string(),
@@ -673,7 +678,6 @@ impl<'a> ParserContext<'a> {
     }
 
     fn walk_quote_children(&mut self, parent: ElementRef<'_>, style: &TextStyleFlags) {
-        let mut first_block = true;
         for child in parent.children() {
             match child.value() {
                 Node::Text(text) => {
@@ -688,10 +692,9 @@ impl<'a> ParserContext<'a> {
                     };
                     match el.name() {
                         "p" | "div" => {
-                            if !first_block && !self.current_spans.is_empty() {
+                            if !self.current_spans.is_empty() {
                                 self.push_raw_span("\n", &TextStyleFlags::default());
                             }
-                            first_block = false;
                             self.walk_quote_children(child_el, style);
                         }
                         "br" => {
@@ -1142,5 +1145,51 @@ mod tests {
             .iter()
             .all(|b| !matches!(b, RichBlock::InlineImageChip { .. })));
         assert_eq!(blocks_to_plain(&blocks), "Done ✅");
+    }
+
+    #[test]
+    fn legacy_reply_blockquote_separates_author_and_preview() {
+        let legacy_html = r#"<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="c-msg-1"><strong itemprop="mri" itemid="u-alice">Alice Kim</strong><span itemprop="time" itemid="c-msg-1">11/20/2026 8:00 AM</span><p itemprop="preview">Check the rollout plan</p></blockquote><p>Legacy quote reply</p>"#;
+        assert_eq!(
+            crate::parser::html_and_cards_to_plain(legacy_html, &[]),
+            "> Alice Kim\n> Check the rollout plan\nLegacy quote reply"
+        );
+
+        let p_only_html = "<blockquote><p>Only</p></blockquote><p>Body</p>";
+        assert_eq!(
+            crate::parser::html_and_cards_to_plain(p_only_html, &[]),
+            "> Only\nBody"
+        );
+    }
+
+    #[test]
+    fn message_reference_attachment_renders_no_chip() {
+        let msg_ref = AttachmentInfo {
+            id: "c-msg-1".to_string(),
+            content_type: "messageReference".to_string(),
+            content_url: None,
+            name: None,
+            content_json: Some(
+                r#"{"messageId":"c-msg-1","messagePreview":"Check the rollout plan","messageSender":{"user":{"id":"u-alice","displayName":"Alice Kim"}}}"#
+                    .to_string(),
+            ),
+            thumbnail_url: None,
+        };
+        let html = r#"<attachment id="c-msg-1"></attachment><p>Looks good</p>"#;
+
+        assert_eq!(
+            crate::parser::html_and_cards_to_plain(html, std::slice::from_ref(&msg_ref)),
+            "Looks good"
+        );
+
+        let with_file = vec![msg_ref, sample_attachment("f1", "spec.pdf")];
+        let plain_with_file = crate::parser::html_and_cards_to_plain(html, &with_file);
+        assert!(plain_with_file.contains("[Attachment: spec.pdf]"), "{plain_with_file}");
+        assert!(!plain_with_file.contains("c-msg-1"), "{plain_with_file}");
+
+        assert_eq!(
+            crate::parser::html_and_cards_to_plain(r#"<attachment id="x9"></attachment>"#, &[]),
+            "[Attachment: x9]"
+        );
     }
 }

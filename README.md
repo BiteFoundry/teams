@@ -82,10 +82,15 @@ teams reply "Acme Engineering/platform-release" 1700000000000 "Confirmed zero 5x
 teams send-file "Elena Park" ./latency-p99.png --inline --caption "P99 latency benchmark"
 
 # Read a cached thread and edit a post you sent
-teams thread "Acme Engineering/platform-release" 1700000000000 --offline --limit 2 --json --compact
+teams thread "Acme Engineering/platform-release" 1700000000000 --offline --limit 2 --json
 teams edit "Acme Engineering/platform-release" 1700000000000 --find "STATE: STAGED" --replace "STATE: READY"
 teams edit "Acme Engineering/platform-release" 1700000000000 --subject "Canary rollout"
 teams update-chat "Release handoff" --topic "Canary war room"
+
+# Paginate members, channels, and teams (JSON defaults to 50 per page)
+teams members "Acme Engineering/platform-release" --limit 50 --json
+teams channels "Acme Engineering" --limit 50 --cursor 50-1795260879123 --json
+teams teams --limit 50 --cursor 50-1795260879123 --json
 
 # Offline FTS5 search, deep history sync, presence, and background daemon
 teams search "connection pooling" --json
@@ -98,7 +103,9 @@ teams daemon start
 
 `teams edit --subject` changes the plain-text title of a channel root post you sent. Use the subject option by itself for a PATCH containing only `subject`. `teams update-chat --topic` changes an existing group chat's title using delegated `Chat.ReadWrite`. Topics allow up to 250 characters and exclude colons. [Microsoft Graph chat update](https://learn.microsoft.com/en-us/graph/api/chat-patch?view=graph-rest-1.0)
 
-`read` and `thread` accept `--json --compact` to return IDs, authors, timestamps, plain text, reply links, and attachment IDs and names. In a thread, `--limit` caps the replies and the response includes the root separately. Use `--offline` after an online thread read that covered the requested replies.
+`read --json`, `read --thread --json`, and `thread --json` return compact objects by default with top-level `omitted` (omitted mention/reaction counts and field names) and a `hint` command; pass `--json --full` for complete conversation and message objects (`--compact` remains a compatibility alias). In a thread, `--limit` caps the replies while including the root separately, and responses report `thread.returned`, `thread.has_more`, and `thread.root.reply_count` (the total reply count when known, or `null` when truncated). Use `--offline` after an online thread read that covered the requested replies.
+
+For `members`, `channels`, and `teams`, passing `--cursor` reads the next page directly from the local SQLite cache without calling Microsoft Graph. A verified empty member list (`0` members from a completed fetch) returns `members: []` even with `--offline`, whereas an unfetched conversation fails with an error until fetched online.
 
 ### Local HTTP REST API (`teams serve`)
 

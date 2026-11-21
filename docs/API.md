@@ -192,7 +192,7 @@ curl -X POST http://127.0.0.1:8788/conversations/Engineering%2FGeneral/messages 
 
 ### `GET /conversations/{key}/threads/{root_id}?limit=50&offline=false`
 
-Fetches a team channel root post and all thread replies (`400` if `{key}` is a chat).
+Fetches a team channel root post and up to the newest `limit` thread replies (`400` if `{key}` is a chat). The response includes `thread.returned`, `thread.has_more`, and `thread.root.reply_count` (the total reply count when the full thread was fetched, or `null` when truncated by `limit`). When `offline=true`, the cached thread fetch must cover the requested `limit` (or have fetched all replies); otherwise the endpoint returns `404`.
 
 ```bash
 curl "http://127.0.0.1:8788/conversations/chan%3Ateam1%3Achan1/threads/1700000000000?limit=50"
@@ -202,8 +202,10 @@ curl "http://127.0.0.1:8788/conversations/chan%3Ateam1%3Achan1/threads/170000000
 {
   "thread": {
     "conv_key": "chan:team1:chan1",
-    "root": { "msg_id": "1700000000000" },
-    "replies": [ { "msg_id": "1700000000100", "parent_msg_id": "1700000000000" } ]
+    "root": { "msg_id": "1700000000000", "reply_count": 1 },
+    "replies": [ { "msg_id": "1700000000100", "parent_msg_id": "1700000000000" } ],
+    "returned": 1,
+    "has_more": false
   }
 }
 ```

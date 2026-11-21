@@ -268,6 +268,36 @@ pub struct UserProfile {
     pub user_principal_name: Option<String>,
 }
 
+impl AttachmentInfo {
+    pub fn is_message_reference(&self) -> bool {
+        self.content_type == "messageReference"
+    }
+}
+
+/// What a thread read knows about replies beyond the returned window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadCoverage {
+    /// Replies exist that this read did not return.
+    pub has_more: bool,
+    /// Total replies in the thread; None when the source did not establish it.
+    pub reply_total: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TeamChannelError {
+    pub team_id: String,
+    pub display_name: String,
+    /// Status of the failed $batch sub-response; None when the response was missing.
+    pub status: Option<u16>,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedTeams {
+    pub teams: Vec<TeamSummary>,
+    pub channel_errors: Vec<TeamChannelError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub user_id: String,

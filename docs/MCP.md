@@ -94,9 +94,9 @@ args = ["mcp"]
 | `list_chats` | `refresh?` (bool), `limit?` (1..1000) | `{ "chats": [...] }` |
 | `create_chat` | `members` (`string[]`, min 1), `topic?` | `{ "ok": true, "conversation": {...} }` |
 | `update_chat` | Group chat `target`, `topic` (1–250 characters) | `{ "ok": true, "conversation": {...} }` |
-| `list_teams_channels` | `refresh?` (bool) | `{ "teams": [...] }` |
-| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?`, `compact?` | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null }` |
-| `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000 replies), `offline?`, `compact?` | `{ "conversation": {...}, "thread": { "root": {...}, "replies": [...] } }` |
+| `list_teams_channels` | `refresh?` (bool), `limit?` (1..1000, default `50`), `cursor?` (conflicts with `refresh: true`) | `{ "teams": [...], "returned": int, "has_more": bool, "next_cursor": string \| null, "total": int, "channel_errors"?: [...] }` |
+| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?`, `compact?` (default `true`) | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null, "omitted"?: {...}, "hint"?: string }` |
+| `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000 replies), `offline?`, `compact?` (default `true`) | `{ "conversation": {...}, "thread": { "root": {...}, "replies": [...], "returned": int, "has_more": bool }, "omitted"?: {...}, "hint"?: string }` |
 | `send_message` | `target`, `markdown`, `subject?`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "message": {...} }` |
 | `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` |
 | `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?` | `{ "ok": true, "conversation": {...}, "path": "...", "message": {...} }` |
@@ -105,7 +105,7 @@ args = ["mcp"]
 | `edit_message` | `target`, `msg_id`, and one mode. Body modes use `markdown` or both `find` and `replace`, with optional `thread_root_id`. The title mode uses `subject`. | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `delete_message` | `target`, `msg_id`, `confirm` (must be literal `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `search_messages` | `query`, `target?`, `limit?` (1..1000) | `{ "query": "...", "hits": [...] }` |
-| `list_members` | `target` | `{ "conv_key": "...", "title": "...", "members": [...] }` |
+| `list_members` | `target`, `limit?` (1..1000, default `50`), `cursor?`, `offline?` (default `false`) | `{ "conv_key": "...", "title": "...", "members": [...], "returned": int, "has_more": bool \| null, "next_cursor": string \| null, "total": int \| null, "fetched_at": string \| null }` |
 | `mark_read` | `target` | `{ "ok": true, "conv_key": "...", "scope": "server_and_local_cache" }` for chats, `"scope": "local_cache"` for channels |
 | `get_presence` | `user_ids?` (`string[]`) | `{ "presence": {...} }` or `{ "presences": [...] }` |
 | `set_presence` | `availability` (`Available\|Busy\|DoNotDisturb\|BeRightBack\|Away\|Reset`), `activity?`, `expiration_mins?` (1..1440) | `{ "ok": true, "availability": "...", "activity": "...", "expiration_mins": ... }` |
@@ -116,9 +116,21 @@ args = ["mcp"]
 
 ### Compact and offline reads
 
-Set `compact: true` on `get_messages` or `get_thread` to receive the conversation's `conv_key` and title, message IDs, authors, creation and available modification timestamps, full `body_plain`, and reply IDs when present. Attachments appear as `{id, name}` entries. The default response includes the full conversation and message objects.
+`get_messages` and `get_thread` default to `compact: true`. Set `compact: false` for full conversation and message objects. Compact output returns `conversation: { conv_key, title }`, fixed message fields (`msg_id`, `author_id`, `author_name`, `created_at`, `body_plain`), reply/edit links when present (`last_modified_at`, `parent_msg_id`, `reply_to_id`), non-`messageReference` attachments as `{ id, name }`, and the following conditional keys when non-default:
 
-The root is included separately from the `get_thread` reply limit in both modes. Replies are returned oldest first. With `offline: true`, the last successful online thread fetch must cover the requested reply limit or have reached the end of the replies. An empty `replies` list indicates the cached thread fetch found zero replies. A root cached through the message list has unknown reply coverage until a thread fetch runs.
+| Key | Included when | Meaning when absent |
+| --- | --- | --- |
+| `subject` | Non-blank string | No subject |
+| `deleted` | `true` | Not deleted |
+| `message_type` | Not `"message"` | `"message"` |
+| `importance` | Not `"normal"` (case-insensitive) | `"normal"` |
+| `reply_count` | `> 0` (always present on `get_thread` root as number or `null`) | `0` |
+
+Compact responses include top-level `omitted` (`{ "mentions": N, "reactions": N, "fields": [...] }`) and `hint` (telling how to request `"compact": false`). Individual messages include `"omitted": { "mentions": N, "reactions": N }` only when `mentions + reactions > 0`. Full responses omit `omitted` and `hint`.
+
+The root is included separately from the `get_thread` reply limit in both modes. Replies are returned oldest first. `thread.returned` reports the number of replies in the window, `thread.has_more` indicates whether older replies exist beyond the window, and `thread.root.reply_count` is the total reply count when known or `null` when truncated/unknown. With `offline: true`, the last successful online thread fetch must cover the requested reply limit or have reached the end of the replies. An empty `replies` list indicates the cached thread fetch found zero replies. A root cached through the message list has unknown reply coverage until a thread fetch runs.
+
+For `list_members` and `list_teams_channels`, passing `cursor` reads the next page from the local SQLite cache without calling Microsoft Graph. In `list_members`, a completed online fetch that returned zero members stays valid offline (`members: []`, `total: 0`, `fetched_at` populated), while a conversation whose members were never fetched returns an error when queried with `offline: true`.
 
 ### Edit a message you sent
 
@@ -146,7 +158,7 @@ Channel edits require delegated `ChannelMessage.ReadWrite` or legacy `Group.Read
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_messages","arguments":{"target":"Engineering/General","before":"2026-11-01","limit":50}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Engineering/General","markdown":"Build **passed**!","subject":"CI","mentions":["u1:Alice"]}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"target":"Engineering/General","msg_id":"1700000000000","confirm":true}}}
-{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_thread","arguments":{"target":"Engineering/General","root_msg_id":"1700000000001","limit":2,"offline":true,"compact":true}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_thread","arguments":{"target":"Engineering/General","root_msg_id":"1700000000001","limit":2,"offline":true}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","find":"STATE: STAGED","replace":"STATE: READY"}}}
 {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"set_presence","arguments":{"availability":"DoNotDisturb","expiration_mins":60}}}
 {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"update_chat","arguments":{"target":"Release handoff","topic":"Canary war room"}}}

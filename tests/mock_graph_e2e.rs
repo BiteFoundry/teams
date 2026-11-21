@@ -947,14 +947,16 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     // 3. Team -> Channel -> Thread: resolve "Engineering/Deployments", post with subject,
     //    reply in thread, fetch get_thread, verify reply_count in Storage
     // -----------------------------------------------------------------------
-    let teams: Vec<TeamSummary> = graph
+    let fetched = graph
         .list_joined_teams_with_channels()
         .await
         .expect("list_joined_teams_with_channels");
+    let teams: Vec<TeamSummary> = storage
+        .upsert_joined_teams(&fetched)
+        .expect("upsert joined teams");
     assert_eq!(teams.len(), 1);
     assert_eq!(teams[0].display_name, "Engineering");
     assert_eq!(teams[0].channels.len(), 2);
-    storage.upsert_teams(&teams).expect("upsert teams");
 
     let all_convs = storage.list_conversations().expect("list_conversations");
     let deploy_chan =
@@ -3469,8 +3471,8 @@ async fn regression_teams_bug_06_soft_delete_cache_and_export() {
     let del_out = run_cli(&["delete", "CoreEng/General", "m-del", "--yes", "--json"]).await;
     assert!(del_out.status.success(), "stderr={}", String::from_utf8_lossy(&del_out.stderr));
 
-    // Offline read (JSON): deleted=true, IDs & created_at preserved, metadata cleared
-    let read_json_out = run_cli(&["read", "CoreEng/General", "--offline", "--json"]).await;
+    // Offline read (JSON --full): deleted=true, IDs & created_at preserved, metadata cleared
+    let read_json_out = run_cli(&["read", "CoreEng/General", "--offline", "--json", "--full"]).await;
     assert!(read_json_out.status.success());
     let rj: Value = serde_json::from_slice(&read_json_out.stdout).unwrap();
     let del_msg = rj["messages"]
@@ -6332,6 +6334,1202 @@ async fn regression_teams_bug_16_read_thread_before_conflict() {
     );
     let tj: Value = serde_json::from_slice(&thread_only.stdout).unwrap();
     assert_eq!(tj["thread"]["replies"][0]["msg_id"], "rep-1");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_17_batch_channel_failure_keeps_cache() {
+    #[derive(Default)]
+    struct Bug17State {
+        batch_fail_status: RwLock<Option<u16>>,
+        direct_fail_status: RwLock<Option<u16>>,
+        direct_get_count: RwLock<usize>,
+    }
+
+    let state = Arc::new(Bug17State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route("/v1.0/me/chats", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        { "id": "team-a", "displayName": "Engineering", "description": "eng" },
+                        { "id": "team-b", "displayName": "Restricted", "description": "403 team" },
+                        { "id": "team-c", "displayName": "EmptyTeam", "description": "really empty" }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|State(st): State<Arc<Bug17State>>, Json(payload): Json<Value>| async move {
+                let fail_code = *st.batch_fail_status.read().unwrap();
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        let req_id = req["id"].as_str().unwrap_or("0");
+                        let url = req["url"].as_str().unwrap_or("");
+                        if url.contains("/teams/team-a/channels") {
+                            json!({
+                                "id": req_id,
+                                "status": 200,
+                                "body": { "value": [{ "id": "chan-general", "displayName": "General", "membershipType": "standard" }] }
+                            })
+                        } else if url.contains("/teams/team-b/channels") {
+                            if let Some(code) = fail_code {
+                                json!({
+                                    "id": req_id,
+                                    "status": code,
+                                    "body": { "error": { "code": if code == 429 { "TooManyRequests" } else { "Forbidden" }, "message": "denied" } }
+                                })
+                            } else {
+                                json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": { "value": [{ "id": "chan-secret", "displayName": "Secret", "membershipType": "private" }] }
+                                })
+                            }
+                        } else {
+                            json!({
+                                "id": req_id,
+                                "status": 200,
+                                "body": { "value": [] }
+                            })
+                        }
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels",
+            get(|State(st): State<Arc<Bug17State>>, Path(team_id): Path<String>| async move {
+                if team_id == "team-b" {
+                    *st.direct_get_count.write().unwrap() += 1;
+                    if let Some(code) = *st.direct_fail_status.read().unwrap() {
+                        let status =
+                            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let err_code = if code == 429 { "TooManyRequests" } else { "Forbidden" };
+                        let mut resp = (
+                            status,
+                            Json(json!({ "error": { "code": err_code, "message": "denied" } })),
+                        )
+                            .into_response();
+                        if code == 429 {
+                            resp.headers_mut().insert("retry-after", "1".parse().unwrap());
+                        }
+                        return resp;
+                    }
+                    return Json(json!({
+                        "value": [{ "id": "chan-secret", "displayName": "Secret", "membershipType": "private" }]
+                    }))
+                    .into_response();
+                }
+                Json(json!({ "value": [] })).into_response()
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. Healthy teams --refresh --json
+    let out1 = run_cli(&tmp, &["teams", "--refresh", "--json"]).await;
+    assert!(out1.status.success(), "stderr={}", String::from_utf8_lossy(&out1.stderr));
+    let j1: Value = serde_json::from_slice(&out1.stdout).unwrap();
+    assert_eq!(j1["channel_errors"], json!([]));
+    let tb1 = j1["teams"].as_array().unwrap().iter().find(|t| t["id"] == "team-b").unwrap();
+    assert_eq!(tb1["channels"][0]["id"], "chan-secret");
+
+    // 2. Inject 429 on both $batch and direct GET
+    *state.batch_fail_status.write().unwrap() = Some(429);
+    *state.direct_fail_status.write().unwrap() = Some(429);
+    let out2 = run_cli(&tmp, &["teams", "--refresh", "--json"]).await;
+    assert!(out2.status.success(), "stderr={}", String::from_utf8_lossy(&out2.stderr));
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(stderr2.contains("Warning"), "expected warning on stderr: {stderr2}");
+    let j2: Value = serde_json::from_slice(&out2.stdout).unwrap();
+    let tb2 = j2["teams"].as_array().unwrap().iter().find(|t| t["id"] == "team-b").unwrap();
+    assert_eq!(tb2["channels"][0]["id"], "chan-secret");
+    assert_eq!(j2["channel_errors"][0]["team_id"], "team-b");
+    assert_eq!(j2["channel_errors"][0]["status"], 429);
+    assert!(j2["channel_errors"][0]["error"].as_str().unwrap().contains("429"));
+
+    // 3. Cached read preserves chan-secret and omits channel_errors key
+    let out3 = run_cli(&tmp, &["teams", "--cached", "--json"]).await;
+    assert!(out3.status.success());
+    let j3: Value = serde_json::from_slice(&out3.stdout).unwrap();
+    let tb3 = j3["teams"].as_array().unwrap().iter().find(|t| t["id"] == "team-b").unwrap();
+    assert_eq!(tb3["channels"][0]["id"], "chan-secret");
+    assert!(j3.get("channel_errors").is_none(), "cached response must omit channel_errors: {j3}");
+
+    // 4. channels Restricted --json fails with exit 1 and empty stdout
+    let out4 = run_cli(&tmp, &["channels", "Restricted", "--json"]).await;
+    assert_eq!(out4.status.code(), Some(1));
+    assert!(out4.stdout.is_empty());
+    let stderr4 = String::from_utf8_lossy(&out4.stderr);
+    assert!(
+        stderr4.contains(r#"Could not list channels for team "Restricted" (team-b)"#),
+        "{stderr4}"
+    );
+
+    // 5. channels EmptyTeam --json succeeds with total 0
+    let out5 = run_cli(&tmp, &["channels", "EmptyTeam", "--json"]).await;
+    assert!(out5.status.success(), "stderr={}", String::from_utf8_lossy(&out5.stderr));
+    let j5: Value = serde_json::from_slice(&out5.stdout).unwrap();
+    assert_eq!(j5["channels"], json!([]));
+    assert_eq!(j5["total"], 0);
+    assert_eq!(j5["returned"], 0);
+    assert_eq!(j5["has_more"], false);
+    assert!(j5["next_cursor"].is_null());
+
+    // 6. Fresh profile with 403 -> Restricted has channels: [] and is in channel_errors; EmptyTeam is not
+    *state.batch_fail_status.write().unwrap() = Some(403);
+    *state.direct_fail_status.write().unwrap() = Some(403);
+    let tmp_fresh = tempfile::tempdir().unwrap();
+    let out6 = run_cli(&tmp_fresh, &["teams", "--refresh", "--json"]).await;
+    assert!(out6.status.success());
+    let j6: Value = serde_json::from_slice(&out6.stdout).unwrap();
+    let tb6 = j6["teams"].as_array().unwrap().iter().find(|t| t["id"] == "team-b").unwrap();
+    assert_eq!(tb6["channels"], json!([]));
+    let errs6 = j6["channel_errors"].as_array().unwrap();
+    assert_eq!(errs6.len(), 1);
+    assert_eq!(errs6[0]["team_id"], "team-b");
+    assert_eq!(errs6[0]["status"], 403);
+    assert!(!errs6.iter().any(|e| e["team_id"] == "team-c"));
+
+    // 7. $batch returns 429, direct GET succeeds -> channel_errors empty, chan-secret returned, direct_get_count >= 1
+    *state.batch_fail_status.write().unwrap() = Some(429);
+    *state.direct_fail_status.write().unwrap() = None;
+    *state.direct_get_count.write().unwrap() = 0;
+    let out7 = run_cli(&tmp_fresh, &["teams", "--refresh", "--json"]).await;
+    assert!(out7.status.success(), "stderr={}", String::from_utf8_lossy(&out7.stderr));
+    let j7: Value = serde_json::from_slice(&out7.stdout).unwrap();
+    assert_eq!(j7["channel_errors"], json!([]));
+    let tb7 = j7["teams"].as_array().unwrap().iter().find(|t| t["id"] == "team-b").unwrap();
+    assert_eq!(tb7["channels"][0]["id"], "chan-secret");
+    assert!(*state.direct_get_count.read().unwrap() >= 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_18_thread_window_reply_count() {
+    #[derive(Default)]
+    struct Bug18State {
+        base_url: RwLock<String>,
+    }
+
+    let state = Arc::new(Bug18State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route("/v1.0/me/chats", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({
+                    "value": [{ "id": "team-a", "displayName": "Engineering" }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        json!({
+                            "id": req["id"].as_str().unwrap_or("0"),
+                            "status": 200,
+                            "body": { "value": [{ "id": "chan-general", "displayName": "General", "membershipType": "standard" }] }
+                        })
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/team-a/channels/chan-general/messages/root-1",
+            get(|| async {
+                Json(json!({
+                    "id": "root-1",
+                    "messageType": "message",
+                    "createdDateTime": "2026-11-20T09:30:00Z",
+                    "subject": "Q4 Rollout Plan",
+                    "importance": "high",
+                    "from": { "user": { "id": "u-alice", "displayName": "Alice Kim" } },
+                    "body": { "contentType": "html", "content": "<p>Rollout plan body</p>" },
+                    "mentions": [],
+                    "attachments": [],
+                    "reactions": []
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/team-a/channels/chan-general/messages/root-1/replies",
+            get(|State(st): State<Arc<Bug18State>>, RawQuery(query): RawQuery| async move {
+                let q = query.unwrap_or_default();
+                let base = st.base_url.read().unwrap().clone();
+                let all_newest_first = vec![
+                    json!({
+                        "id": "reply-3",
+                        "replyToId": "root-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-20T10:03:00Z",
+                        "from": { "user": { "id": "u-alice", "displayName": "Alice Kim" } },
+                        "body": { "contentType": "html", "content": "<p>reply number 3</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }),
+                    json!({
+                        "id": "reply-2",
+                        "replyToId": "root-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-20T10:02:00Z",
+                        "from": { "user": { "id": "u-alice", "displayName": "Alice Kim" } },
+                        "body": { "contentType": "html", "content": "<p>reply number 2</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }),
+                    json!({
+                        "id": "reply-1",
+                        "replyToId": "root-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-20T10:01:00Z",
+                        "from": { "user": { "id": "u-alice", "displayName": "Alice Kim" } },
+                        "body": { "contentType": "html", "content": "<p>reply number 1</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }),
+                ];
+
+                if q.contains("page=2") {
+                    return Json(json!({ "value": [all_newest_first[2]] }));
+                }
+                let top = q
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("$top=").or_else(|| kv.strip_prefix("%24top=")))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(50);
+                if top < all_newest_first.len() {
+                    Json(json!({
+                        "value": all_newest_first[..top],
+                        "@odata.nextLink": format!("{base}/teams/team-a/channels/chan-general/messages/root-1/replies?page=2")
+                    }))
+                } else {
+                    Json(json!({ "value": all_newest_first }))
+                }
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    *state.base_url.write().unwrap() = graph_base.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // limit 2 -> truncated: reply_count null, returned 2, has_more true
+    let out2 = run_cli(&tmp, &["thread", "Engineering/General", "root-1", "--limit", "2", "--json"]).await;
+    assert!(out2.status.success(), "stderr={}", String::from_utf8_lossy(&out2.stderr));
+    let j2: Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert!(j2["thread"]["root"]["reply_count"].is_null(), "{j2}");
+    assert_eq!(j2["thread"]["returned"], 2);
+    assert_eq!(j2["thread"]["has_more"], true);
+    assert_eq!(j2["thread"]["replies"][0]["msg_id"], "reply-2");
+    assert_eq!(j2["thread"]["replies"][1]["msg_id"], "reply-3");
+
+    // limit 3 and limit 50 -> complete: reply_count 3, has_more false
+    for lim in ["3", "50"] {
+        let out = run_cli(&tmp, &["thread", "Engineering/General", "root-1", "--limit", lim, "--json"]).await;
+        assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+        let j: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(j["thread"]["root"]["reply_count"], 3, "limit={lim} {j}");
+        assert_eq!(j["thread"]["returned"], 3);
+        assert_eq!(j["thread"]["has_more"], false);
+    }
+
+    // Text output with --limit 2 -> includes "more exist", no "[💬"
+    let txt_out = run_cli(&tmp, &["thread", "Engineering/General", "root-1", "--limit", "2"]).await;
+    assert!(txt_out.status.success());
+    let txt = String::from_utf8_lossy(&txt_out.stdout);
+    assert!(txt.contains("more exist"), "{txt}");
+    assert!(!txt.contains("[💬"), "{txt}");
+
+    // Fresh profile: online --limit 2 -> offline --limit 2 (ok) and offline --limit 3 (exit 1)
+    let tmp2 = tempfile::tempdir().unwrap();
+    assert!(
+        run_cli(&tmp2, &["thread", "Engineering/General", "root-1", "--limit", "2", "--json"])
+            .await
+            .status
+            .success()
+    );
+    let off2 = run_cli(
+        &tmp2,
+        &["thread", "Engineering/General", "root-1", "--offline", "--limit", "2", "--json"],
+    )
+    .await;
+    assert!(off2.status.success(), "stderr={}", String::from_utf8_lossy(&off2.stderr));
+    let j_off2: Value = serde_json::from_slice(&off2.stdout).unwrap();
+    assert!(j_off2["thread"]["root"]["reply_count"].is_null());
+    assert_eq!(j_off2["thread"]["returned"], 2);
+    assert_eq!(j_off2["thread"]["has_more"], true);
+
+    let off3 = run_cli(
+        &tmp2,
+        &["thread", "Engineering/General", "root-1", "--offline", "--limit", "3", "--json"],
+    )
+    .await;
+    assert_eq!(off3.status.code(), Some(1));
+    assert!(off3.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&off3.stderr).contains("reply limit 3"));
+
+    // MCP get_thread with limit 2
+    let dl_tmp = tempfile::tempdir().unwrap();
+    let (cfg, graph) = build_direct_graph_client(&auth_base, dl_tmp.path(), &jwt);
+    let storage = Storage::open_in_memory().unwrap();
+    let mcp_resp = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "get_thread",
+                "arguments": { "target": "Engineering/General", "root_msg_id": "root-1", "limit": 2 }
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_resp["result"]["isError"], false, "{mcp_resp}");
+    let mcp_payload: Value =
+        serde_json::from_str(mcp_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(mcp_payload["thread"]["root"]["reply_count"].is_null());
+    assert_eq!(mcp_payload["thread"]["returned"], 2);
+    assert_eq!(mcp_payload["thread"]["has_more"], true);
+    assert!(mcp_payload["hint"].as_str().unwrap().contains("get_thread"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_19_members_and_channels_paging() {
+    #[derive(Default)]
+    struct Bug19State {
+        base_url: RwLock<String>,
+        member_gets: RwLock<HashMap<String, usize>>,
+        batch_calls: RwLock<usize>,
+    }
+
+    let state = Arc::new(Bug19State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        { "id": "19:release-room@thread.v2", "chatType": "group", "topic": "Release Room", "lastUpdatedDateTime": "2026-11-21T05:00:00Z", "members": [] },
+                        { "id": "19:chat-1@thread.v2", "chatType": "group", "topic": "Chat 1", "lastUpdatedDateTime": "2026-11-21T04:00:00Z", "members": [] },
+                        { "id": "19:empty-room@thread.v2", "chatType": "group", "topic": "Empty Room", "lastUpdatedDateTime": "2026-11-21T03:00:00Z", "members": [] },
+                        { "id": "19:chat-2@thread.v2", "chatType": "group", "topic": "Chat 2", "lastUpdatedDateTime": "2026-11-21T02:00:00Z", "members": [] },
+                        { "id": "19:broken-room@thread.v2", "chatType": "group", "topic": "Broken Room", "lastUpdatedDateTime": "2026-11-21T01:00:00Z", "members": [] }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/members",
+            get(
+                |State(st): State<Arc<Bug19State>>,
+                 Path(chat_id): Path<String>,
+                 RawQuery(query): RawQuery| async move {
+                    *st.member_gets.write().unwrap().entry(chat_id.clone()).or_insert(0) += 1;
+                    let base = st.base_url.read().unwrap().clone();
+                    let q = query.unwrap_or_default();
+                    let page = q
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("page="))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(1);
+
+                    match chat_id.as_str() {
+                        "19:release-room@thread.v2" => {
+                            let start = (page - 1) * 50;
+                            let end = (start + 50).min(120);
+                            let vals: Vec<Value> = (start..end)
+                                .map(|i| {
+                                    json!({
+                                        "id": format!("mem-{i:04}"),
+                                        "userId": format!("u-{i:04}"),
+                                        "displayName": format!("Member {i:04}"),
+                                        "email": format!("m{i:04}@contoso.com"),
+                                        "roles": ["member"]
+                                    })
+                                })
+                                .collect();
+                            if end < 120 {
+                                Json(json!({
+                                    "value": vals,
+                                    "@odata.nextLink": format!("{base}/chats/{}/members?page={}", urlencoding::encode(&chat_id), page + 1)
+                                }))
+                                .into_response()
+                            } else {
+                                Json(json!({ "value": vals })).into_response()
+                            }
+                        }
+                        "19:chat-1@thread.v2" => Json(json!({
+                            "value": [
+                                { "id": "m1", "userId": "u-a", "displayName": "Alice", "email": "a@contoso.com", "roles": [] },
+                                { "id": "m2", "userId": "u-b", "displayName": "Bob", "email": "b@contoso.com", "roles": [] },
+                                { "id": "m3", "userId": "u-c", "displayName": "Carol", "email": "c@contoso.com", "roles": [] }
+                            ]
+                        }))
+                        .into_response(),
+                        "19:empty-room@thread.v2" => Json(json!({ "value": [] })).into_response(),
+                        "19:broken-room@thread.v2" => {
+                            if page == 1 {
+                                Json(json!({
+                                    "value": [{ "id": "mb1", "userId": "u-b1", "displayName": "Partial User", "roles": [] }],
+                                    "@odata.nextLink": format!("{base}/chats/{}/members?page=2", urlencoding::encode(&chat_id))
+                                }))
+                                .into_response()
+                            } else {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({ "error": { "code": "InternalServerError", "message": "boom" } })),
+                                )
+                                    .into_response()
+                            }
+                        }
+                        _ => Json(json!({ "value": [] })).into_response(),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        { "id": "team-big", "displayName": "Big" },
+                        { "id": "team-zero", "displayName": "Zero" }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|State(st): State<Arc<Bug19State>>, Json(payload): Json<Value>| async move {
+                *st.batch_calls.write().unwrap() += 1;
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        let req_id = req["id"].as_str().unwrap_or("0");
+                        let url = req["url"].as_str().unwrap_or("");
+                        if url.contains("/teams/team-big/channels") {
+                            let chs: Vec<Value> = (0..55)
+                                .map(|i| {
+                                    json!({
+                                        "id": format!("ch-{i:03}"),
+                                        "displayName": format!("Channel {i:03}"),
+                                        "membershipType": "standard"
+                                    })
+                                })
+                                .collect();
+                            json!({ "id": req_id, "status": 200, "body": { "value": chs } })
+                        } else {
+                            json!({ "id": req_id, "status": 200, "body": { "value": [] } })
+                        }
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    *state.base_url.write().unwrap() = graph_base.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp, &["chats", "--json"]).await.status.success());
+
+    // 1. Release Room 3 pages via cursor with 0 Graph calls on pages 2 & 3
+    let p1_out = run_cli(&tmp, &["members", "Release Room", "--json"]).await;
+    assert!(p1_out.status.success(), "stderr={}", String::from_utf8_lossy(&p1_out.stderr));
+    let p1: Value = serde_json::from_slice(&p1_out.stdout).unwrap();
+    assert_eq!(p1["returned"], 50);
+    assert_eq!(p1["has_more"], true);
+    assert_eq!(p1["total"], 120);
+    let c1 = p1["next_cursor"].as_str().unwrap().to_string();
+    assert!(c1.starts_with("50-") && c1[3..].chars().all(|c| c.is_ascii_digit()), "{c1}");
+    let fetched_at = p1["fetched_at"].as_str().unwrap().to_string();
+    assert_eq!(p1["members"][0]["display_name"], "Member 0000");
+    assert_eq!(
+        state.member_gets.read().unwrap().get("19:release-room@thread.v2").copied(),
+        Some(3)
+    );
+
+    let p2_out = run_cli(&tmp, &["members", "Release Room", "--json", "--cursor", &c1]).await;
+    assert!(p2_out.status.success(), "stderr={}", String::from_utf8_lossy(&p2_out.stderr));
+    let p2: Value = serde_json::from_slice(&p2_out.stdout).unwrap();
+    assert_eq!(p2["returned"], 50);
+    assert_eq!(p2["has_more"], true);
+    assert_eq!(p2["total"], 120);
+    assert_eq!(p2["fetched_at"], fetched_at);
+    assert_eq!(p2["members"][0]["display_name"], "Member 0050");
+    let c2 = p2["next_cursor"].as_str().unwrap().to_string();
+    assert!(c2.starts_with("100-"));
+    assert_eq!(
+        state.member_gets.read().unwrap().get("19:release-room@thread.v2").copied(),
+        Some(3)
+    );
+
+    let p3_out = run_cli(&tmp, &["members", "Release Room", "--json", "--cursor", &c2]).await;
+    assert!(p3_out.status.success(), "stderr={}", String::from_utf8_lossy(&p3_out.stderr));
+    let p3: Value = serde_json::from_slice(&p3_out.stdout).unwrap();
+    assert_eq!(p3["returned"], 20);
+    assert_eq!(p3["has_more"], false);
+    assert!(p3["next_cursor"].is_null());
+    assert_eq!(p3["total"], 120);
+    assert_eq!(p3["fetched_at"], fetched_at);
+    assert_eq!(p3["members"][0]["display_name"], "Member 0100");
+    assert_eq!(
+        state.member_gets.read().unwrap().get("19:release-room@thread.v2").copied(),
+        Some(3)
+    );
+
+    let mut all_ids = std::collections::HashSet::new();
+    let mut all_names = Vec::new();
+    for page in [&p1, &p2, &p3] {
+        for m in page["members"].as_array().unwrap() {
+            all_ids.insert(m["user_id"].as_str().unwrap().to_string());
+            all_names.push(m["display_name"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(all_ids.len(), 120);
+    let mut sorted_names = all_names.clone();
+    sorted_names.sort();
+    assert_eq!(all_names, sorted_names);
+
+    // 2. Re-fetch advances stamp -> old cursor is rejected as Stale cursor
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let refetch_out = run_cli(&tmp, &["members", "Release Room", "--json"]).await;
+    assert!(refetch_out.status.success());
+    let refetch: Value = serde_json::from_slice(&refetch_out.stdout).unwrap();
+    let current_cursor = refetch["next_cursor"].as_str().unwrap().to_string();
+    assert_eq!(
+        state.member_gets.read().unwrap().get("19:release-room@thread.v2").copied(),
+        Some(6)
+    );
+    let stale_out = run_cli(&tmp, &["members", "Release Room", "--json", "--cursor", &c1]).await;
+    assert_eq!(stale_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stale_out.stderr).contains("Stale cursor"));
+
+    // 3. Cursor from Release Room rejected on Chat 1
+    let chat1_out = run_cli(&tmp, &["members", "Chat 1", "--json"]).await;
+    assert!(chat1_out.status.success());
+    let chat1: Value = serde_json::from_slice(&chat1_out.stdout).unwrap();
+    assert_eq!(chat1["returned"], 3);
+    assert_eq!(chat1["total"], 3);
+    assert_eq!(chat1["has_more"], false);
+    let cross_cursor = format!("1-{}", current_cursor.split_once('-').unwrap().1);
+    let cross_out = run_cli(&tmp, &["members", "Chat 1", "--json", "--cursor", &cross_cursor]).await;
+    assert_eq!(cross_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&cross_out.stderr).contains("Stale cursor"));
+
+    // 4. Empty Room online -> offline succeeds with total 0 and 0 Graph calls offline
+    let empty_on = run_cli(&tmp, &["members", "Empty Room", "--json"]).await;
+    assert!(empty_on.status.success());
+    let j_empty_on: Value = serde_json::from_slice(&empty_on.stdout).unwrap();
+    assert_eq!(j_empty_on["members"], json!([]));
+    assert_eq!(j_empty_on["total"], 0);
+    assert_eq!(j_empty_on["has_more"], false);
+    assert!(j_empty_on["fetched_at"].is_string());
+    let empty_count_before = state
+        .member_gets
+        .read()
+        .unwrap()
+        .get("19:empty-room@thread.v2")
+        .copied()
+        .unwrap_or(0);
+    let empty_off = run_cli(&tmp, &["members", "Empty Room", "--json", "--offline"]).await;
+    assert!(empty_off.status.success());
+    let j_empty_off: Value = serde_json::from_slice(&empty_off.stdout).unwrap();
+    assert_eq!(j_empty_off["members"], json!([]));
+    assert_eq!(j_empty_off["total"], 0);
+    assert!(j_empty_off["fetched_at"].is_string());
+    assert_eq!(
+        state
+            .member_gets
+            .read()
+            .unwrap()
+            .get("19:empty-room@thread.v2")
+            .copied()
+            .unwrap_or(0),
+        empty_count_before
+    );
+
+    // 5. Chat 2 offline without prior fetch -> exit 1
+    let chat2_off = run_cli(&tmp, &["members", "Chat 2", "--json", "--offline"]).await;
+    assert_eq!(chat2_off.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&chat2_off.stderr).contains("have not been fetched yet"));
+
+    // 6. Broken Room fails on page 2 -> offline still fails with "have not been fetched yet"
+    let broken_on = run_cli(&tmp, &["members", "Broken Room", "--json"]).await;
+    assert_eq!(broken_on.status.code(), Some(1));
+    let broken_off = run_cli(&tmp, &["members", "Broken Room", "--json", "--offline"]).await;
+    assert_eq!(broken_off.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&broken_off.stderr).contains("have not been fetched yet"));
+
+    // 7. Text members: no flags -> 120 lines; --limit 50 -> 50 lines + footer
+    let txt_all = run_cli(&tmp, &["members", "Release Room", "--offline"]).await;
+    assert!(txt_all.status.success());
+    let txt_all_str = String::from_utf8_lossy(&txt_all.stdout);
+    let member_lines_all = txt_all_str.lines().filter(|l| l.starts_with("  Member ")).count();
+    assert_eq!(member_lines_all, 120);
+
+    let txt_50 = run_cli(&tmp, &["members", "Release Room", "--offline", "--limit", "50"]).await;
+    assert!(txt_50.status.success());
+    let txt_50_str = String::from_utf8_lossy(&txt_50.stdout);
+    let member_lines_50 = txt_50_str.lines().filter(|l| l.starts_with("  Member ")).count();
+    assert_eq!(member_lines_50, 50);
+    assert!(txt_50_str.contains("Next page: --cursor 50-"), "{txt_50_str}");
+
+    // 8. channels Big paging (0 $batch on page 2) + teams paging
+    let ch1_out = run_cli(&tmp, &["channels", "Big", "--json"]).await;
+    assert!(ch1_out.status.success(), "stderr={}", String::from_utf8_lossy(&ch1_out.stderr));
+    let ch1: Value = serde_json::from_slice(&ch1_out.stdout).unwrap();
+    assert_eq!(ch1["returned"], 50);
+    assert_eq!(ch1["has_more"], true);
+    assert_eq!(ch1["total"], 55);
+    let ch_cursor = ch1["next_cursor"].as_str().unwrap().to_string();
+    let batch_before = *state.batch_calls.read().unwrap();
+    let ch2_out = run_cli(&tmp, &["channels", "Big", "--json", "--cursor", &ch_cursor]).await;
+    assert!(ch2_out.status.success(), "stderr={}", String::from_utf8_lossy(&ch2_out.stderr));
+    let ch2: Value = serde_json::from_slice(&ch2_out.stdout).unwrap();
+    assert_eq!(ch2["returned"], 5);
+    assert_eq!(ch2["has_more"], false);
+    assert!(ch2["next_cursor"].is_null());
+    assert_eq!(*state.batch_calls.read().unwrap(), batch_before);
+
+    let teams_out = run_cli(&tmp, &["teams", "--json"]).await;
+    assert!(teams_out.status.success());
+    let tj: Value = serde_json::from_slice(&teams_out.stdout).unwrap();
+    assert_eq!(tj["returned"], tj["total"]);
+
+    // 9. Fresh profile via MCP: list_members paging, Empty Room, Chat 2 offline
+    state.member_gets.write().unwrap().clear();
+    let dl_tmp = tempfile::tempdir().unwrap();
+    let (cfg, graph) = build_direct_graph_client(&auth_base, dl_tmp.path(), &jwt);
+    let storage = Storage::open_in_memory().unwrap();
+    let list_chats = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_chats","arguments":{"refresh":true}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(list_chats["result"]["isError"], false);
+
+    let m1_resp = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_members","arguments":{"target":"Release Room","limit":50}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(m1_resp["result"]["isError"], false, "{m1_resp}");
+    let mp1: Value =
+        serde_json::from_str(m1_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mp1["returned"], 50);
+    assert_eq!(mp1["total"], 120);
+    let mc1 = mp1["next_cursor"].as_str().unwrap().to_string();
+    assert_eq!(
+        state.member_gets.read().unwrap().get("19:release-room@thread.v2").copied(),
+        Some(3)
+    );
+
+    let m2_resp = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_members","arguments":{"target":"Release Room","limit":50,"cursor":mc1}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(m2_resp["result"]["isError"], false, "{m2_resp}");
+    let mp2: Value =
+        serde_json::from_str(m2_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(mp2["returned"], 50);
+    assert_eq!(mp2["members"][0]["display_name"], "Member 0050");
+    assert_eq!(
+        state.member_gets.read().unwrap().get("19:release-room@thread.v2").copied(),
+        Some(3)
+    );
+
+    let m_empty = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_members","arguments":{"target":"Empty Room"}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(m_empty["result"]["isError"], false);
+    let m_empty_off = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_members","arguments":{"target":"Empty Room","offline":true}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(m_empty_off["result"]["isError"], false);
+    let me_payload: Value =
+        serde_json::from_str(m_empty_off["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap();
+    assert_eq!(me_payload["total"], 0);
+    assert_eq!(me_payload["members"], json!([]));
+
+    let m_unfetched = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"list_members","arguments":{"target":"Chat 2","offline":true}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(m_unfetched["result"]["isError"], true);
+    assert!(m_unfetched["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("have not been fetched yet"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_20_compact_default_and_full() {
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:release-room@thread.v2",
+                        "chatType": "group",
+                        "topic": "Release Room",
+                        "lastUpdatedDateTime": "2026-11-20T08:06:00Z",
+                        "members": [
+                            { "userId": "u-alice", "displayName": "Alice Kim" },
+                            { "userId": "u-bob", "displayName": "Bob Lee" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route("/v1.0/me/joinedTeams", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(|Path(_chat_id): Path<String>| async {
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "c-msg-6",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-20T08:06:00Z",
+                            "from": { "user": { "id": "u-bob", "displayName": "Bob Lee" } },
+                            "body": {
+                                "contentType": "html",
+                                "content": "<blockquote itemscope=\"\" itemtype=\"http://schema.skype.com/Reply\" itemid=\"c-msg-1\"><strong itemprop=\"mri\" itemid=\"u-alice\">Alice Kim</strong><span itemprop=\"time\" itemid=\"c-msg-1\">11/20/2026 8:00 AM</span><p itemprop=\"preview\">Check the rollout plan</p></blockquote><p>Legacy quote reply</p>"
+                            },
+                            "attachments": [],
+                            "mentions": [],
+                            "reactions": []
+                        },
+                        {
+                            "id": "c-msg-5",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-20T08:04:00Z",
+                            "from": { "user": { "id": "u-bob", "displayName": "Bob Lee" } },
+                            "body": { "contentType": "html", "content": "<p>(deleted message)</p>" },
+                            "attachments": [],
+                            "mentions": [],
+                            "reactions": []
+                        },
+                        {
+                            "id": "c-msg-4",
+                            "messageType": "systemEventMessage",
+                            "createdDateTime": "2026-11-20T08:03:00Z",
+                            "from": null,
+                            "body": { "contentType": "html", "content": "<systemEventMessage/>" },
+                            "eventDetail": { "@odata.type": "#microsoft.graph.membersAddedEventMessageDetail" },
+                            "attachments": [],
+                            "mentions": [],
+                            "reactions": []
+                        },
+                        {
+                            "id": "c-msg-3",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-20T08:02:00Z",
+                            "deletedDateTime": "2026-11-20T08:02:30Z",
+                            "from": { "user": { "id": "u-bob", "displayName": "Bob Lee" } },
+                            "body": { "contentType": "html", "content": "" },
+                            "attachments": [],
+                            "mentions": [],
+                            "reactions": []
+                        },
+                        {
+                            "id": "c-msg-2",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-20T08:01:00Z",
+                            "from": { "user": { "id": "u-bob", "displayName": "Bob Lee" } },
+                            "body": { "contentType": "html", "content": "<attachment id=\"c-msg-1\"></attachment><p>Looks good</p>" },
+                            "attachments": [{
+                                "id": "c-msg-1",
+                                "contentType": "messageReference",
+                                "contentUrl": null,
+                                "name": null,
+                                "content": "{\"messageId\":\"c-msg-1\",\"messagePreview\":\"Check the rollout plan\",\"messageSender\":{\"user\":{\"id\":\"u-alice\",\"displayName\":\"Alice Kim\"}}}"
+                            }],
+                            "mentions": [],
+                            "reactions": []
+                        },
+                        {
+                            "id": "c-msg-1",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-20T08:00:00Z",
+                            "from": { "user": { "id": "u-alice", "displayName": "Alice Kim" } },
+                            "body": { "contentType": "html", "content": "<p>Check the rollout plan</p>" },
+                            "attachments": [],
+                            "mentions": [],
+                            "reactions": []
+                        }
+                    ]
+                }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let def_out = run_cli(&tmp, &["read", "Release Room", "--json"]).await;
+    assert!(def_out.status.success(), "stderr={}", String::from_utf8_lossy(&def_out.stderr));
+    let alias_out = run_cli(&tmp, &["read", "Release Room", "--json", "--compact"]).await;
+    assert!(alias_out.status.success());
+    assert_eq!(def_out.stdout, alias_out.stdout);
+
+    let j: Value = serde_json::from_slice(&def_out.stdout).unwrap();
+    let msgs = j["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 6);
+
+    let m2 = msgs.iter().find(|m| m["msg_id"] == "c-msg-2").unwrap();
+    assert_eq!(m2["body_plain"], "Looks good");
+    assert_eq!(m2["reply_to_id"], "c-msg-1");
+    assert!(m2.get("attachments").is_none(), "{m2}");
+
+    let m3 = msgs.iter().find(|m| m["msg_id"] == "c-msg-3").unwrap();
+    assert_eq!(m3["body_plain"], "(deleted message)");
+    assert_eq!(m3["deleted"], true);
+
+    let m4 = msgs.iter().find(|m| m["msg_id"] == "c-msg-4").unwrap();
+    assert_eq!(m4["message_type"], "systemEventMessage");
+
+    let m5 = msgs.iter().find(|m| m["msg_id"] == "c-msg-5").unwrap();
+    assert_eq!(m5["body_plain"], "(deleted message)");
+    assert!(m5.get("deleted").is_none(), "{m5}");
+
+    let m6 = msgs.iter().find(|m| m["msg_id"] == "c-msg-6").unwrap();
+    assert_eq!(m6["body_plain"], "> Alice Kim\n> Check the rollout plan\nLegacy quote reply");
+    assert_eq!(m6["reply_to_id"], "c-msg-1");
+
+    assert!(j["hint"].as_str().unwrap().ends_with("--json --full --limit 30"));
+    assert_eq!(j["omitted"]["fields"].as_array().unwrap().len(), 25);
+
+    // --json --full returns full objects without omitted/hint and preserves messageReference attachment
+    let full_out = run_cli(&tmp, &["read", "Release Room", "--json", "--full"]).await;
+    assert!(full_out.status.success());
+    let jf: Value = serde_json::from_slice(&full_out.stdout).unwrap();
+    assert!(jf.get("omitted").is_none());
+    assert!(jf.get("hint").is_none());
+    let fm2 = jf["messages"].as_array().unwrap().iter().find(|m| m["msg_id"] == "c-msg-2").unwrap();
+    assert!(fm2.get("body_html").is_some());
+    assert_eq!(fm2["attachments"][0]["content_type"], "messageReference");
+
+    // --json --compact --full exits 2
+    let conflict = run_cli(&tmp, &["read", "Release Room", "--json", "--compact", "--full"]).await;
+    assert_eq!(conflict.status.code(), Some(2));
+
+    // MCP get_messages default (compact) vs compact: false (full)
+    let dl_tmp = tempfile::tempdir().unwrap();
+    let (cfg, graph) = build_direct_graph_client(&auth_base, dl_tmp.path(), &jwt);
+    let storage = Storage::open_in_memory().unwrap();
+
+    let mcp_def = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_messages","arguments":{"target":"Release Room"}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_def["result"]["isError"], false, "{mcp_def}");
+    let mp_def: Value =
+        serde_json::from_str(mcp_def["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(mp_def["hint"].as_str().unwrap().contains("get_messages"));
+    assert!(mp_def["messages"][0].get("body_html").is_none());
+
+    let mcp_full = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"get_messages","arguments":{"target":"Release Room","compact":false}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_full["result"]["isError"], false, "{mcp_full}");
+    let mp_full: Value =
+        serde_json::from_str(mcp_full["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(mp_full.get("omitted").is_none());
+    assert!(mp_full.get("hint").is_none());
+    assert!(mp_full["messages"][0].get("body_html").is_some());
 
     server.abort();
 }

@@ -451,8 +451,8 @@ pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> 
         save_initial_chats_list_cursor_if_absent(st, page.next_link)
     })
     .await?;
-    if let Ok(teams) = teams_res {
-        let _ = run_storage(storage, move |st| st.upsert_teams(&teams)).await;
+    if let Ok(fetched) = teams_res {
+        let _ = run_storage(storage, move |st| st.upsert_joined_teams(&fetched)).await;
     }
     Ok(())
 }
@@ -2070,9 +2070,8 @@ async fn refresh_all_conversations_with_cache(
         graph.list_joined_teams_with_channels(),
     );
     chats_res?;
-    if let Ok(teams) = teams_res {
-        let teams_for_db = teams.clone();
-        run_storage(storage, move |st| st.upsert_teams(&teams_for_db)).await?;
+    if let Ok(fetched) = teams_res {
+        let teams = run_storage(storage, move |st| st.upsert_joined_teams(&fetched)).await?;
 
         // Explicit refresh also reconciles inactive joined channels via delta so new posts,
         // @me mentions, deletions, and unread counts surface without focusing each channel.

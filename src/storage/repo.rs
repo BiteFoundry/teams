@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 use crate::models::{
     AttachmentInfo, ChannelSummary, ConversationKind, ConversationSummary, ConversationTarget,
     MemberInfo, MentionInfo, MessageItem, PresenceStatus, ReactionSummary, SyncCursor, TeamSummary,
-    ThreadView,
+    ThreadCoverage, ThreadView,
 };
 
 pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]) -> Result<()> {
@@ -927,7 +927,7 @@ pub(crate) fn get_fetched_thread(
     conv_key: &str,
     root_msg_id: &str,
     limit: usize,
-) -> Result<Option<ThreadView>> {
+) -> Result<Option<(ThreadView, ThreadCoverage)>> {
     let tx = conn.unchecked_transaction()?;
     let window: Option<(String, bool)> = tx
         .query_row(
@@ -956,11 +956,25 @@ pub(crate) fn get_fetched_thread(
         return Ok(None);
     }
     tx.commit()?;
-    Ok(Some(ThreadView {
-        conv_key: conv_key.to_string(),
-        root,
-        replies,
-    }))
+    let coverage = if complete {
+        ThreadCoverage {
+            has_more: ids.len() > limit,
+            reply_total: Some(ids.len()),
+        }
+    } else {
+        ThreadCoverage {
+            has_more: true,
+            reply_total: None,
+        }
+    };
+    Ok(Some((
+        ThreadView {
+            conv_key: conv_key.to_string(),
+            root,
+            replies,
+        },
+        coverage,
+    )))
 }
 
 pub fn list_mentions_for_user(
@@ -1035,6 +1049,56 @@ pub fn upsert_members(conn: &mut Connection, conv_key: &str, members: &[MemberIn
     Ok(())
 }
 
+pub fn replace_members(conn: &mut Connection, conv_key: &str, members: &[MemberInfo]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        if !members.is_empty() {
+            let mut stmt = tx.prepare_cached(
+                "
+                INSERT INTO members (conv_key, user_id, member_id, display_name, email, roles_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(conv_key, user_id) DO UPDATE SET
+                    member_id = COALESCE(excluded.member_id, members.member_id),
+                    display_name = excluded.display_name,
+                    email = COALESCE(excluded.email, members.email),
+                    roles_json = excluded.roles_json
+                ",
+            )?;
+            for m in members {
+                let roles_json = serde_json::to_string(&m.roles)?;
+                stmt.execute(params![
+                    conv_key,
+                    m.user_id,
+                    m.member_id,
+                    m.display_name,
+                    m.email,
+                    roles_json,
+                ])?;
+            }
+        }
+
+        let keep: HashSet<&str> = members.iter().map(|m| m.user_id.as_str()).collect();
+        let existing_ids: Vec<String> = {
+            let mut sel = tx.prepare_cached("SELECT user_id FROM members WHERE conv_key = ?1")?;
+            let rows = sel.query_map(params![conv_key], |row| row.get::<_, String>(0))?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row?);
+            }
+            ids
+        };
+        let mut del =
+            tx.prepare_cached("DELETE FROM members WHERE conv_key = ?1 AND user_id = ?2")?;
+        for uid in existing_ids {
+            if !keep.contains(uid.as_str()) {
+                del.execute(params![conv_key, uid])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn list_members(conn: &Connection, conv_key: &str) -> Result<Vec<MemberInfo>> {
     let mut stmt = conn.prepare_cached(
         "
@@ -1044,7 +1108,7 @@ pub fn list_members(conn: &Connection, conv_key: &str) -> Result<Vec<MemberInfo>
         FROM members m
         LEFT JOIN presences p ON m.user_id = p.user_id
         WHERE m.conv_key = ?1
-        ORDER BY m.display_name ASC
+        ORDER BY m.display_name ASC, m.user_id ASC
         ",
     )?;
     let rows = stmt.query_map(params![conv_key], |row| {
@@ -1315,7 +1379,7 @@ fn build_message_preview(msg: &MessageItem) -> String {
 
     if let Some(subj) = msg.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         truncate_chars(subj, MAX_CHARS)
-    } else if let Some(att) = msg.attachments.first() {
+    } else if let Some(att) = msg.attachments.iter().find(|a| !a.is_message_reference()) {
         let label = format!(
             "[Attachment: {}]",
             att.name.as_deref().unwrap_or(att.id.as_str())

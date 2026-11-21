@@ -23,8 +23,8 @@ use crate::{
     img_preview,
     models::{
         AttachmentInfo, ConversationKind, ConversationSummary, ConversationTarget, DownloadedFile,
-        InlineImageUpload, MentionInfo, MessageItem, QuotedReply, SyncCursor, TeamSummary,
-        ThreadView,
+        InlineImageUpload, MemberInfo, MentionInfo, MessageItem, QuotedReply, SyncCursor,
+        TeamChannelError, TeamSummary, ThreadCoverage, ThreadView,
     },
     parser, resolver,
     serve::{self, ServeOptions},
@@ -403,7 +403,7 @@ pub enum Command {
     /// List 1:1, group, and meeting chats
     #[command(visible_alias = "ls")]
     Chats {
-        /// Maximum number of chats to fetch [default: 50]
+        /// Maximum number of chats to fetch
         #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -439,6 +439,12 @@ pub enum Command {
     },
     /// List joined teams and channels
     Teams {
+        /// Maximum number of teams per page [JSON default: 50; text output lists all]
+        #[arg(long, visible_alias = "top")]
+        limit: Option<usize>,
+        /// Read the next page from the local cache; pass next_cursor from the previous page
+        #[arg(long, conflicts_with = "refresh")]
+        cursor: Option<String>,
         #[arg(long)]
         refresh: bool,
         /// Read from local SQLite cache first (skips network requests)
@@ -450,6 +456,12 @@ pub enum Command {
     /// List channels for a specific team
     Channels {
         team_query: String,
+        /// Maximum number of channels per page [JSON default: 50; text output lists all]
+        #[arg(long, visible_alias = "top")]
+        limit: Option<usize>,
+        /// Read the next page from the local cache; pass next_cursor from the previous page
+        #[arg(long, conflicts_with = "refresh")]
+        cursor: Option<String>,
         #[arg(long)]
         refresh: bool,
         /// Read from local SQLite cache first (skips network requests)
@@ -481,9 +493,12 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
-        /// Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names
+        /// Compatibility alias: compact output is the --json default
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return complete conversation and message objects instead of the compact default
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Read a team channel root post and its thread replies
     Thread {
@@ -497,9 +512,12 @@ pub enum Command {
         offline: bool,
         #[arg(long)]
         json: bool,
-        /// Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names
+        /// Compatibility alias: compact output is the --json default
         #[arg(long, requires = "json")]
         compact: bool,
+        /// Return complete conversation and message objects instead of the compact default
+        #[arg(long, requires = "json", conflicts_with = "compact")]
+        full: bool,
     },
     /// Send a Markdown message
     #[command(visible_alias = "msg")]
@@ -604,6 +622,12 @@ pub enum Command {
     /// List members of a chat or channel
     Members {
         target: String,
+        /// Maximum number of members per page [JSON default: 50; text output lists all]
+        #[arg(long, visible_alias = "top")]
+        limit: Option<usize>,
+        /// Read the next page from the local cache; pass next_cursor from the previous page
+        #[arg(long)]
+        cursor: Option<String>,
         #[arg(long)]
         offline: bool,
         #[arg(long)]
@@ -614,7 +638,7 @@ pub enum Command {
         query: String,
         #[arg(long)]
         target: Option<String>,
-        /// Maximum number of results to return [default: 50]
+        /// Maximum number of results to return
         #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -625,10 +649,10 @@ pub enum Command {
         /// Deep-sync only a specific conversation or channel
         #[arg(long)]
         target: Option<String>,
-        /// Number of recent chats to sync [default: 100]
+        /// Number of recent chats to sync
         #[arg(long, default_value_t = 100)]
         chats: usize,
-        /// Number of messages per conversation/channel to backfill into local FTS5 cache [default: 50]
+        /// Number of messages per conversation/channel to backfill into local FTS5 cache
         #[arg(long, visible_aliases = ["limit", "top"], default_value_t = 50)]
         depth: usize,
         #[arg(long)]
@@ -641,7 +665,7 @@ pub enum Command {
         format: String,
         #[arg(long)]
         include_threads: bool,
-        /// Maximum number of messages to export [default: 200]
+        /// Maximum number of messages to export
         #[arg(long, visible_alias = "top", default_value_t = 200)]
         limit: usize,
         #[arg(long)]
@@ -843,16 +867,31 @@ async fn dispatch_command(
             Box::pin(cmd_update_chat(cfg, &target, &topic, json)).await
         }
         Some(Command::Teams {
+            limit,
+            cursor,
             refresh,
             cached,
             json,
-        }) => Box::pin(cmd_teams(cfg, refresh, cached, json)).await,
+        }) => Box::pin(cmd_teams(cfg, limit, cursor.as_deref(), refresh, cached, json)).await,
         Some(Command::Channels {
             team_query,
+            limit,
+            cursor,
             refresh,
             cached,
             json,
-        }) => Box::pin(cmd_channels(cfg, &team_query, refresh, cached, json)).await,
+        }) => {
+            Box::pin(cmd_channels(
+                cfg,
+                &team_query,
+                limit,
+                cursor.as_deref(),
+                refresh,
+                cached,
+                json,
+            ))
+            .await
+        }
         Some(Command::Read {
             target,
             limit,
@@ -861,8 +900,10 @@ async fn dispatch_command(
             offline,
             cached,
             json,
-            compact,
+            compact: _,
+            full,
         }) => {
+            let full_args = format_full_args(limit, before.as_deref(), offline);
             Box::pin(cmd_read(
                 cfg,
                 &target,
@@ -871,7 +912,11 @@ async fn dispatch_command(
                 thread.as_deref(),
                 offline,
                 cached,
-                ReadOutput { json, compact },
+                ReadOutput {
+                    json,
+                    compact: !full,
+                    full_args,
+                },
             ))
             .await
         }
@@ -881,8 +926,10 @@ async fn dispatch_command(
             limit,
             offline,
             json,
-            compact,
+            compact: _,
+            full,
         }) => {
+            let full_args = format_full_args(limit, None, offline);
             Box::pin(cmd_thread_with_cache(
                 cfg,
                 &channel_target,
@@ -890,7 +937,11 @@ async fn dispatch_command(
                 limit,
                 offline,
                 false,
-                ReadOutput { json, compact },
+                ReadOutput {
+                    json,
+                    compact: !full,
+                    full_args,
+                },
             ))
             .await
         }
@@ -1024,9 +1075,11 @@ async fn dispatch_command(
         }) => Box::pin(cmd_delete(cfg, &target, &msg_id, thread.as_deref(), yes, json)).await,
         Some(Command::Members {
             target,
+            limit,
+            cursor,
             offline,
             json,
-        }) => Box::pin(cmd_members(cfg, &target, offline, json)).await,
+        }) => Box::pin(cmd_members(cfg, &target, limit, cursor.as_deref(), offline, json)).await,
         Some(Command::Search {
             query,
             target,
@@ -1458,7 +1511,7 @@ fn is_cursor_fresh(storage: &Storage, scope_keys: &[&str], ttl_secs: u64) -> boo
     false
 }
 
-fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
+pub(crate) fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
     let cursor = crate::models::SyncCursor {
         scope_key: scope_key.to_string(),
         delta_link: None,
@@ -2180,16 +2233,27 @@ async fn cmd_new_chat(
     Ok(())
 }
 
-fn print_teams_output(teams: &[TeamSummary], json_out: bool) -> Result<()> {
+fn print_teams_output(
+    page: &Page<TeamSummary>,
+    channel_errors: Option<&[TeamChannelError]>,
+    json_out: bool,
+) -> Result<()> {
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "teams": teams }))?
-        );
-    } else if teams.is_empty() {
+        let mut obj = json!({
+            "teams": page.items,
+            "returned": page.items.len(),
+            "has_more": page.has_more,
+            "next_cursor": page.next_cursor,
+            "total": page.total,
+        });
+        if let Some(errors) = channel_errors {
+            obj["channel_errors"] = json!(errors);
+        }
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else if page.items.is_empty() {
         println!("No joined teams found.");
     } else {
-        for team in teams {
+        for team in &page.items {
             println!("{} ({})", team.display_name, team.id);
             for ch in &team.channels {
                 println!(
@@ -2200,13 +2264,20 @@ fn print_teams_output(teams: &[TeamSummary], json_out: bool) -> Result<()> {
                 );
             }
         }
+        if let Some(ref next) = page.next_cursor {
+            println!(
+                "(Showing {} of {} teams. Next page: --cursor {next})",
+                page.items.len(),
+                page.total
+            );
+        }
     }
     Ok(())
 }
 
 fn print_channels_output(
     team: &TeamSummary,
-    channels: &[crate::models::ChannelSummary],
+    page: &Page<crate::models::ChannelSummary>,
     json_out: bool,
 ) -> Result<()> {
     if json_out {
@@ -2214,12 +2285,16 @@ fn print_channels_output(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "team": { "id": team.id, "display_name": team.display_name },
-                "channels": channels,
+                "channels": page.items,
+                "returned": page.items.len(),
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+                "total": page.total,
             }))?
         );
     } else {
         println!("# {} ({})", team.display_name, team.id);
-        for ch in channels {
+        for ch in &page.items {
             println!(
                 "  {}  [{}]  {}",
                 ch.conv_key(),
@@ -2227,11 +2302,47 @@ fn print_channels_output(
                 ch.display_name
             );
         }
+        if let Some(ref next) = page.next_cursor {
+            println!(
+                "(Showing {} of {} channels. Next page: --cursor {next})",
+                page.items.len(),
+                page.total
+            );
+        }
     }
     Ok(())
 }
 
-async fn cmd_teams(cfg: &AppConfig, refresh: bool, cached: bool, json_out: bool) -> Result<()> {
+fn paged_list_limit(
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    json_out: bool,
+    total: usize,
+) -> usize {
+    if json_out || limit.is_some() || cursor.is_some() {
+        clamp_limit(limit.unwrap_or(50))
+    } else {
+        total.max(1)
+    }
+}
+
+async fn cmd_teams(
+    cfg: &AppConfig,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    refresh: bool,
+    cached: bool,
+    json_out: bool,
+) -> Result<()> {
+    if cursor.is_some() {
+        let storage = open_storage_only(cfg)?;
+        let teams = storage.list_teams()?;
+        let stamp = fetch_stamp(&storage, "cli:teams").map_or(0, |(s, _)| s);
+        let page_limit = paged_list_limit(limit, cursor, json_out, teams.len());
+        let page = paginate(teams, page_limit, cursor, stamp)?;
+        return print_teams_output(&page, None, json_out);
+    }
+
     let ttl = cli_cache_ttl_secs(cfg);
     let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
     if !refresh && (cached || daemon_warm || ttl > 0) {
@@ -2239,7 +2350,10 @@ async fn cmd_teams(cfg: &AppConfig, refresh: bool, cached: bool, json_out: bool)
             if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:teams"], ttl) {
                 let teams = storage.list_teams()?;
                 if !teams.is_empty() {
-                    return print_teams_output(&teams, json_out);
+                    let stamp = fetch_stamp(&storage, "cli:teams").map_or(0, |(s, _)| s);
+                    let page_limit = paged_list_limit(limit, None, json_out, teams.len());
+                    let page = paginate(teams, page_limit, None, stamp)?;
+                    return print_teams_output(&page, None, json_out);
                 }
             }
         }
@@ -2250,17 +2364,40 @@ async fn cmd_teams(cfg: &AppConfig, refresh: bool, cached: bool, json_out: bool)
         || (!cached
             && !daemon_warm
             && !(ttl > 0 && is_cursor_fresh(&storage, &["cli:teams"], ttl)));
-    let teams = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
-    print_teams_output(&teams, json_out)
+    let (teams, channel_errors) = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
+    if let Some(ref errors) = channel_errors {
+        for err in errors {
+            eprintln!(
+                "Warning: could not refresh channels for team \"{}\" ({}): {}. Cached channels are kept.",
+                err.display_name, err.team_id, err.error
+            );
+        }
+    }
+    let stamp = fetch_stamp(&storage, "cli:teams").map_or(0, |(s, _)| s);
+    let page_limit = paged_list_limit(limit, None, json_out, teams.len());
+    let page = paginate(teams, page_limit, None, stamp)?;
+    print_teams_output(&page, channel_errors.as_deref(), json_out)
 }
 
 async fn cmd_channels(
     cfg: &AppConfig,
     team_query: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
     refresh: bool,
     cached: bool,
     json_out: bool,
 ) -> Result<()> {
+    if cursor.is_some() {
+        let storage = open_storage_only(cfg)?;
+        let teams = storage.list_teams()?;
+        let team = resolve_team_from_slice(&teams, team_query)?;
+        let stamp = fetch_stamp(&storage, "cli:teams").map_or(0, |(s, _)| s);
+        let page_limit = paged_list_limit(limit, cursor, json_out, team.channels.len());
+        let page = paginate(team.channels.clone(), page_limit, cursor, stamp)?;
+        return print_channels_output(&team, &page, json_out);
+    }
+
     let ttl = cli_cache_ttl_secs(cfg);
     let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
     if !refresh && (cached || daemon_warm || ttl > 0) {
@@ -2269,7 +2406,11 @@ async fn cmd_channels(
                 let teams = storage.list_teams()?;
                 if !teams.is_empty() {
                     if let Ok(team) = resolve_team_from_slice(&teams, team_query) {
-                        return print_channels_output(&team, &team.channels, json_out);
+                        let stamp = fetch_stamp(&storage, "cli:teams").map_or(0, |(s, _)| s);
+                        let page_limit =
+                            paged_list_limit(limit, None, json_out, team.channels.len());
+                        let page = paginate(team.channels.clone(), page_limit, None, stamp)?;
+                        return print_channels_output(&team, &page, json_out);
                     }
                 }
             }
@@ -2281,8 +2422,20 @@ async fn cmd_channels(
         || (!cached
             && !daemon_warm
             && !(ttl > 0 && is_cursor_fresh(&storage, &["cli:teams"], ttl)));
-    let teams = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
+    let (teams, channel_errors) = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
     let mut team = resolve_team_from_slice(&teams, team_query)?;
+
+    if let Some(err) = channel_errors
+        .as_deref()
+        .and_then(|errs| errs.iter().find(|e| e.team_id == team.id))
+    {
+        bail!(
+            "Could not list channels for team \"{}\" ({}): {}",
+            err.display_name,
+            err.team_id,
+            err.error
+        );
+    }
 
     let channels = if refresh && team.channels.is_empty() {
         let fetched = graph.list_team_channels(&team.id, &team.display_name).await?;
@@ -2295,27 +2448,27 @@ async fn cmd_channels(
         team.channels.clone()
     };
 
-    print_channels_output(&team, &channels, json_out)
+    let stamp = fetch_stamp(&storage, "cli:teams").map_or(0, |(s, _)| s);
+    let page_limit = paged_list_limit(limit, None, json_out, channels.len());
+    let page = paginate(channels, page_limit, None, stamp)?;
+    print_channels_output(&team, &page, json_out)
 }
 
 async fn load_teams_with_refresh(
     graph: &GraphClient,
     storage: &Storage,
     refresh: bool,
-) -> Result<Vec<TeamSummary>> {
+) -> Result<(Vec<TeamSummary>, Option<Vec<TeamChannelError>>)> {
     let cached = storage.list_teams()?;
     if refresh || cached.is_empty() {
         let fetched = graph.list_joined_teams_with_channels().await?;
-        storage.upsert_teams(&fetched)?;
+        let merged = storage.upsert_joined_teams(&fetched)?;
         record_cli_sync_cursor(storage, "cli:teams");
         let stored = storage.list_teams()?;
-        if stored.is_empty() {
-            Ok(fetched)
-        } else {
-            Ok(stored)
-        }
+        let teams = if stored.is_empty() { merged } else { stored };
+        Ok((teams, Some(fetched.channel_errors)))
     } else {
-        Ok(cached)
+        Ok((cached, None))
     }
 }
 
@@ -2352,21 +2505,41 @@ fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSum
     }
 }
 
-#[derive(Clone, Copy)]
 struct ReadOutput {
     json: bool,
     compact: bool,
+    /// Arguments to repeat in the --full hint, e.g. " --limit 30 --before c-msg-3 --offline".
+    full_args: String,
+}
+
+fn format_full_args(limit: usize, before: Option<&str>, offline: bool) -> String {
+    let mut out = format!(" --limit {}", clamp_limit(limit));
+    if let Some(b) = before.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(&format!(" --before {b}"));
+    }
+    if offline {
+        out.push_str(" --offline");
+    }
+    out
 }
 
 fn print_read_output(
     conv: &ConversationSummary,
     res: &ReadMessagesResult,
-    output: ReadOutput,
+    output: &ReadOutput,
 ) -> Result<()> {
     if output.json {
+        let hint = output.compact.then(|| {
+            format!(
+                "{} read {} --json --full{}",
+                Persona::detect().bin_name(),
+                conv.conv_key,
+                output.full_args
+            )
+        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&read_messages_json(conv, res, output.compact))?
+            serde_json::to_string_pretty(&read_messages_json(conv, res, hint.as_deref()))?
         );
     } else {
         println!("# {} ({})", conv.title, conv.conv_key);
@@ -2411,7 +2584,7 @@ async fn cmd_read(
         let cached_convs = storage.list_conversations()?;
         let conv = resolver::resolve_from_slice(&cached_convs, target)?;
         let res = read_conversation_messages_offline(&storage, &conv, limit, before)?;
-        return print_read_output(&conv, &res, output);
+        return print_read_output(&conv, &res, &output);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -2427,7 +2600,7 @@ async fn cmd_read(
                             .flatten()
                             .is_some_and(|c| c.is_history_eof());
                         if res.messages.len() >= limit || is_eof {
-                            return print_read_output(&conv, &res, output);
+                            return print_read_output(&conv, &res, &output);
                         }
                     } else {
                         let cursor_key = format!("cli:read:{}", conv.conv_key);
@@ -2445,7 +2618,7 @@ async fn cmd_read(
                                 .flatten()
                                 .is_some_and(|c| c.is_history_eof());
                             if res.messages.len() >= limit || is_eof {
-                                return print_read_output(&conv, &res, output);
+                                return print_read_output(&conv, &res, &output);
                             }
                         }
                     }
@@ -2461,7 +2634,7 @@ async fn cmd_read(
         record_cli_sync_cursor(&storage, &format!("cli:read:{}", conv.conv_key));
     }
 
-    print_read_output(&conv, &res, output)
+    print_read_output(&conv, &res, &output)
 }
 
 async fn cmd_thread_with_cache(
@@ -2477,16 +2650,18 @@ async fn cmd_thread_with_cache(
     if offline {
         let storage = open_storage_only(cfg)?;
         let conv = resolver::resolve_from_slice(&storage.list_conversations()?, channel_target)?;
-        let thread = read_thread_offline(&storage, &conv, root_msg_id, limit)?
+        let (thread, coverage) = read_thread_offline(&storage, &conv, root_msg_id, limit)?
             .ok_or_else(|| thread_cache_miss(root_msg_id, limit))?;
-        return print_thread_output(&conv, &thread, output);
+        return print_thread_output(&conv, &thread, coverage, &output);
     }
     if cached {
         if let Ok(storage) = open_storage_only(cfg) {
             if let Ok(cached_convs) = storage.list_conversations() {
                 if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, channel_target) {
-                    if let Some(thread) = read_thread_offline(&storage, &conv, root_msg_id, limit)? {
-                        return print_thread_output(&conv, &thread, output);
+                    if let Some((thread, coverage)) =
+                        read_thread_offline(&storage, &conv, root_msg_id, limit)?
+                    {
+                        return print_thread_output(&conv, &thread, coverage, &output);
                     }
                 }
             }
@@ -2495,31 +2670,56 @@ async fn cmd_thread_with_cache(
 
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, channel_target, false).await?;
-    let thread = match read_thread(&storage, &graph, &conv, root_msg_id, limit).await {
-        Ok(thread) => thread,
+    let (thread, coverage) = match read_thread(&storage, &graph, &conv, root_msg_id, limit).await {
+        Ok(found) => found,
         Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
-    print_thread_output(&conv, &thread, output)
+    print_thread_output(&conv, &thread, coverage, &output)
 }
 
 fn print_thread_output(
     conv: &ConversationSummary,
     thread: &ThreadView,
-    output: ReadOutput,
+    coverage: ThreadCoverage,
+    output: &ReadOutput,
 ) -> Result<()> {
     if output.json {
+        let hint = output.compact.then(|| {
+            format!(
+                "{} thread {} {} --json --full{}",
+                Persona::detect().bin_name(),
+                conv.conv_key,
+                thread.root.msg_id,
+                output.full_args
+            )
+        });
         println!(
             "{}",
-            serde_json::to_string_pretty(&thread_json(conv, thread, output.compact))?
+            serde_json::to_string_pretty(&thread_json(conv, thread, coverage, hint.as_deref()))?
         );
     } else {
         println!("# {} ({}) — Thread {}", conv.title, conv.conv_key, thread.root.msg_id);
-        print_message_line(&thread.root, "");
+        let mut display_root = thread.root.clone();
+        display_root.reply_count = coverage.reply_total.unwrap_or(0);
+        print_message_line(&display_root, "");
         if thread.replies.is_empty() {
             println!("  (No replies)");
         } else {
             for reply in &thread.replies {
                 print_message_line(reply, "  ↳ ");
+            }
+        }
+        if coverage.has_more {
+            match coverage.reply_total {
+                Some(total) => println!(
+                    "  (Showing the newest {} of {} replies. Raise --limit to read more.)",
+                    thread.replies.len(),
+                    total
+                ),
+                None => println!(
+                    "  (Showing the newest {} replies; more exist. Raise --limit, up to 1000, to read more.)",
+                    thread.replies.len()
+                ),
             }
         }
     }
@@ -2555,13 +2755,16 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
     if !attachments.is_empty() {
         let names: Vec<String> = attachments
             .iter()
+            .filter(|a| !a.is_message_reference())
             .map(|a| {
                 a.name
                     .clone()
                     .unwrap_or_else(|| a.content_type.clone())
             })
             .collect();
-        tags.push(format!("[📎 {}]", names.join(", ")));
+        if !names.is_empty() {
+            tags.push(format!("[📎 {}]", names.join(", ")));
+        }
     }
     if !msg.reactions.is_empty() {
         let reacts: Vec<String> = msg
@@ -2936,49 +3139,119 @@ fn delete_gate(yes: bool, json: bool, answer: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_members(cfg: &AppConfig, target: &str, offline: bool, json_out: bool) -> Result<()> {
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let conv = resolve_target(&storage, &graph, target, offline).await?;
+/// One complete Graph fetch: replaces the cached member list, then records the completion marker.
+pub(crate) async fn refresh_members(
+    storage: &Storage,
+    graph: &GraphClient,
+    conv: &ConversationSummary,
+) -> Result<()> {
+    let fetched = graph.list_members(&conv.target).await?;
+    storage
+        .replace_members(&conv.conv_key, &fetched)
+        .context("Graph returned the members, but updating the local cache failed")?;
+    record_cli_sync_cursor(storage, &format!("cli:members:{}", conv.conv_key));
+    Ok(())
+}
 
-    let members = if offline {
-        storage.list_members(&conv.conv_key)?
+/// Reads one page from the cached member list.
+pub(crate) fn members_page(
+    storage: &Storage,
+    conv: &ConversationSummary,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<serde_json::Value> {
+    let marker = fetch_stamp(storage, &format!("cli:members:{}", conv.conv_key));
+    let members = storage.list_members(&conv.conv_key)?;
+    if marker.is_none() && members.is_empty() {
+        bail!(
+            "Members of {} have not been fetched yet. Read the members online first.",
+            conv.conv_key
+        );
+    }
+    let stamp = marker.as_ref().map_or(0, |(stamp, _)| *stamp);
+    let page = paginate(members, limit, cursor, stamp)?;
+    let known = marker.is_some();
+    let returned = page.items.len();
+    Ok(json!({
+        "conv_key": conv.conv_key,
+        "title": conv.title,
+        "members": page.items,
+        "returned": returned,
+        "has_more": if page.has_more || known { json!(page.has_more) } else { serde_json::Value::Null },
+        "next_cursor": page.next_cursor,
+        "total": if known { json!(page.total) } else { serde_json::Value::Null },
+        "fetched_at": marker.map(|(_, at)| at),
+    }))
+}
+
+async fn cmd_members(
+    cfg: &AppConfig,
+    target: &str,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+    offline: bool,
+    json_out: bool,
+) -> Result<()> {
+    let from_cache = offline || cursor.is_some();
+    let (_auth, graph, storage) = open_runtime(cfg, !from_cache).await?;
+    let conv = resolve_target(&storage, &graph, target, from_cache).await?;
+
+    if !from_cache {
+        refresh_members(&storage, &graph, &conv).await?;
+    }
+
+    let page_limit = if json_out {
+        clamp_limit(limit.unwrap_or(50))
+    } else if limit.is_none() && cursor.is_none() {
+        1_000
     } else {
-        let fetched = graph.list_members(&conv.target).await?;
-        let _ = storage.upsert_members(&conv.conv_key, &fetched);
-        fetched
+        clamp_limit(limit.unwrap_or(50))
     };
 
+    let payload = members_page(&storage, &conv, page_limit, cursor)?;
+
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "conv_key": conv.conv_key,
-                "title": conv.title,
-                "members": members,
-            }))?
-        );
-    } else if members.is_empty() {
-        println!("No member information available.");
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("# {} ({}) Members ({})", conv.title, conv.conv_key, members.len());
-        for m in &members {
-            let role = if m.roles.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", m.roles.join(","))
-            };
-            let pres = m
-                .presence
-                .as_ref()
-                .map(|p| format!(" ({})", p.availability))
-                .unwrap_or_default();
-            println!(
-                "  {}  <{}>{}{}",
-                m.display_name,
-                m.email.as_deref().unwrap_or(&m.user_id),
-                role,
-                pres
-            );
+        let members: Vec<MemberInfo> =
+            serde_json::from_value(payload["members"].clone()).unwrap_or_default();
+        if members.is_empty() {
+            println!("No member information available.");
+        } else {
+            let returned = payload["returned"].as_u64().unwrap_or(members.len() as u64);
+            let header_count = payload["total"].as_u64().unwrap_or(returned);
+            println!("# {} ({}) Members ({})", conv.title, conv.conv_key, header_count);
+            for m in &members {
+                let role = if m.roles.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", m.roles.join(","))
+                };
+                let pres = m
+                    .presence
+                    .as_ref()
+                    .map(|p| format!(" ({})", p.availability))
+                    .unwrap_or_default();
+                println!(
+                    "  {}  <{}>{}{}",
+                    m.display_name,
+                    m.email.as_deref().unwrap_or(&m.user_id),
+                    role,
+                    pres
+                );
+            }
+            if let Some(next) = payload["next_cursor"].as_str() {
+                match payload["total"].as_u64() {
+                    Some(total) => println!(
+                        "(Showing {} of {} members. Next page: --cursor {next})",
+                        returned, total
+                    ),
+                    None => println!(
+                        "(Showing {} members. Next page: --cursor {next})",
+                        returned
+                    ),
+                }
+            }
         }
     }
     Ok(())
@@ -3146,8 +3419,8 @@ async fn cmd_sync(
             )?;
             record_chats_list_cursor(&storage, fetched_chats.next_link, fetched_chats.eof);
             match teams_res {
-                Ok(teams) => {
-                    storage.upsert_teams(&teams)?;
+                Ok(fetched) => {
+                    let _ = storage.upsert_joined_teams(&fetched)?;
                 }
                 Err(err) => {
                     let wrapped = wrap_graph_permission_error(&graph, err).await;
@@ -3532,6 +3805,60 @@ pub(crate) fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, 1_000)
 }
 
+pub(crate) struct Page<T> {
+    pub items: Vec<T>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+}
+
+/// Offset paging over a fully loaded list. A cursor is "<offset>-<stamp>"; the stamp ties it
+/// to one completed fetch of one resource, so a cursor from another list or an older fetch is rejected.
+pub(crate) fn paginate<T>(
+    items: Vec<T>,
+    limit: usize,
+    cursor: Option<&str>,
+    stamp: i64,
+) -> Result<Page<T>> {
+    let total = items.len();
+    let offset = match cursor {
+        None => 0,
+        Some(raw) => {
+            let (offset, cursor_stamp) = raw
+                .trim()
+                .split_once('-')
+                .and_then(|(o, s)| Some((o.parse::<usize>().ok()?, s.parse::<i64>().ok()?)))
+                .filter(|(offset, _)| *offset <= total)
+                .with_context(|| {
+                    format!(
+                        "Invalid cursor: {raw}. Pass the next_cursor value from the previous page."
+                    )
+                })?;
+            if cursor_stamp != stamp {
+                bail!(
+                    "Stale cursor: {raw}. The list was refreshed or belongs to another target; start again without a cursor."
+                );
+            }
+            offset
+        }
+    };
+    let end = offset.saturating_add(limit).min(total);
+    let has_more = end < total;
+    Ok(Page {
+        items: items.into_iter().skip(offset).take(limit).collect(),
+        has_more,
+        next_cursor: has_more.then(|| format!("{end}-{stamp}")),
+        total,
+    })
+}
+
+/// Milliseconds of the completed-fetch marker for a scope; None when no complete fetch was recorded.
+pub(crate) fn fetch_stamp(storage: &Storage, scope_key: &str) -> Option<(i64, String)> {
+    let cursor = storage.get_sync_cursor(scope_key).ok().flatten()?;
+    let at = chrono::DateTime::parse_from_rfc3339(&cursor.synced_at).ok()?;
+    Some((at.timestamp_millis(), cursor.synced_at))
+}
+
 pub(crate) struct ReadMessagesResult {
     pub messages: Vec<MessageItem>,
     pub has_more: bool,
@@ -3638,6 +3965,34 @@ pub(crate) async fn update_group_chat_topic(
     )
 }
 
+const COMPACT_OMITTED_FIELDS: &[&str] = &[
+    "msg_key",
+    "conv_key",
+    "reply_to_author",
+    "reply_to_preview",
+    "is_me",
+    "body_html",
+    "web_url",
+    "attachments.content_type",
+    "attachments.content_url",
+    "attachments.content_json",
+    "attachments.thumbnail_url",
+    "conversation.target",
+    "conversation.kind",
+    "conversation.team_id",
+    "conversation.team_name",
+    "conversation.topic",
+    "conversation.unread_count",
+    "conversation.last_read_at",
+    "conversation.last_msg_id",
+    "conversation.last_msg_author",
+    "conversation.last_msg_preview",
+    "conversation.last_updated_at",
+    "conversation.pinned",
+    "conversation.peer_user_id",
+    "conversation.web_url",
+];
+
 fn compact_conversation(conv: &ConversationSummary) -> serde_json::Value {
     json!({ "conv_key": conv.conv_key, "title": conv.title })
 }
@@ -3659,51 +4014,114 @@ fn compact_message(msg: &MessageItem) -> serde_json::Value {
             value[key] = json!(text);
         }
     }
-    if !msg.attachments.is_empty() {
-        value["attachments"] = serde_json::Value::Array(
-            msg.attachments
-                .iter()
-                .map(|att| json!({ "id": att.id, "name": att.name }))
-                .collect(),
-        );
+    if let Some(subj) = msg.subject.as_deref().filter(|s| !s.trim().is_empty()) {
+        value["subject"] = json!(subj);
+    }
+    if msg.deleted {
+        value["deleted"] = json!(true);
+    }
+    if msg.message_type != "message" {
+        value["message_type"] = json!(msg.message_type);
+    }
+    if !msg.importance.eq_ignore_ascii_case("normal") {
+        value["importance"] = json!(msg.importance);
+    }
+    if msg.reply_count > 0 {
+        value["reply_count"] = json!(msg.reply_count);
+    }
+    let attachments: Vec<serde_json::Value> = msg
+        .attachments
+        .iter()
+        .filter(|att| !att.is_message_reference())
+        .map(|att| json!({ "id": att.id, "name": att.name }))
+        .collect();
+    if !attachments.is_empty() {
+        value["attachments"] = serde_json::Value::Array(attachments);
+    }
+    if !msg.mentions.is_empty() || !msg.reactions.is_empty() {
+        value["omitted"] = json!({
+            "mentions": msg.mentions.len(),
+            "reactions": msg.reactions.len(),
+        });
     }
     value
+}
+
+pub(crate) fn finish_thread_value(
+    mut thread: serde_json::Value,
+    returned: usize,
+    coverage: ThreadCoverage,
+) -> serde_json::Value {
+    thread["root"]["reply_count"] = json!(coverage.reply_total);
+    thread["returned"] = json!(returned);
+    thread["has_more"] = json!(coverage.has_more);
+    thread
 }
 
 pub(crate) fn read_messages_json(
     conv: &ConversationSummary,
     res: &ReadMessagesResult,
-    compact: bool,
+    hint: Option<&str>,
 ) -> serde_json::Value {
-    let (conversation, messages) = if compact {
-        (
-            compact_conversation(conv),
-            serde_json::Value::Array(res.messages.iter().map(compact_message).collect()),
-        )
+    if let Some(hint) = hint {
+        let omitted_mentions: usize = res.messages.iter().map(|m| m.mentions.len()).sum();
+        let omitted_reactions: usize = res.messages.iter().map(|m| m.reactions.len()).sum();
+        json!({
+            "conversation": compact_conversation(conv),
+            "messages": serde_json::Value::Array(res.messages.iter().map(compact_message).collect()),
+            "has_more": res.has_more,
+            "next_before": res.next_before,
+            "omitted": {
+                "mentions": omitted_mentions,
+                "reactions": omitted_reactions,
+                "fields": COMPACT_OMITTED_FIELDS,
+            },
+            "hint": hint,
+        })
     } else {
-        (json!(conv), json!(res.messages))
-    };
-    json!({
-        "conversation": conversation,
-        "messages": messages,
-        "has_more": res.has_more,
-        "next_before": res.next_before,
-    })
+        json!({
+            "conversation": conv,
+            "messages": res.messages,
+            "has_more": res.has_more,
+            "next_before": res.next_before,
+        })
+    }
 }
 
 pub(crate) fn thread_json(
     conv: &ConversationSummary,
     thread: &ThreadView,
-    compact: bool,
+    coverage: ThreadCoverage,
+    hint: Option<&str>,
 ) -> serde_json::Value {
-    if compact {
+    if let Some(hint) = hint {
+        let omitted_mentions: usize = std::iter::once(&thread.root)
+            .chain(&thread.replies)
+            .map(|m| m.mentions.len())
+            .sum();
+        let omitted_reactions: usize = std::iter::once(&thread.root)
+            .chain(&thread.replies)
+            .map(|m| m.reactions.len())
+            .sum();
         let replies: Vec<_> = thread.replies.iter().map(compact_message).collect();
+        let thread_val = finish_thread_value(
+            json!({ "root": compact_message(&thread.root), "replies": replies }),
+            thread.replies.len(),
+            coverage,
+        );
         json!({
             "conversation": compact_conversation(conv),
-            "thread": { "root": compact_message(&thread.root), "replies": replies },
+            "thread": thread_val,
+            "omitted": {
+                "mentions": omitted_mentions,
+                "reactions": omitted_reactions,
+                "fields": COMPACT_OMITTED_FIELDS,
+            },
+            "hint": hint,
         })
     } else {
-        json!({ "conversation": conv, "thread": thread })
+        let thread_val = finish_thread_value(json!(thread), thread.replies.len(), coverage);
+        json!({ "conversation": conv, "thread": thread_val })
     }
 }
 
@@ -3712,15 +4130,15 @@ pub(crate) fn read_thread_offline(
     conv: &ConversationSummary,
     root_msg_id: &str,
     limit: usize,
-) -> Result<Option<ThreadView>> {
+) -> Result<Option<(ThreadView, ThreadCoverage)>> {
     if !matches!(conv.target, ConversationTarget::Channel { .. }) {
         bail!("Thread reads require a team channel target: {}", conv.conv_key);
     }
-    let mut thread = storage.get_fetched_thread(&conv.conv_key, root_msg_id, limit)?;
-    if let Some(view) = thread.as_mut() {
+    let mut found = storage.get_fetched_thread(&conv.conv_key, root_msg_id, limit)?;
+    if let Some((view, _)) = found.as_mut() {
         hydrate_thread_attachments(view);
     }
-    Ok(thread)
+    Ok(found)
 }
 
 pub(crate) fn thread_cache_miss(root_msg_id: &str, limit: usize) -> anyhow::Error {
@@ -3736,7 +4154,7 @@ pub(crate) async fn read_thread(
     conv: &ConversationSummary,
     root_msg_id: &str,
     limit: usize,
-) -> Result<ThreadView> {
+) -> Result<(ThreadView, ThreadCoverage)> {
     let ConversationTarget::Channel { team_id, channel_id } = &conv.target else {
         bail!("Thread reads require a team channel target: {}", conv.conv_key);
     };
@@ -3745,7 +4163,11 @@ pub(crate) async fn read_thread(
         .await?;
     storage.save_fetched_thread(&thread, complete)?;
     hydrate_thread_attachments(&mut thread);
-    Ok(thread)
+    let coverage = ThreadCoverage {
+        has_more: !complete,
+        reply_total: complete.then_some(thread.replies.len()),
+    };
+    Ok((thread, coverage))
 }
 
 pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
@@ -4541,6 +4963,7 @@ mod tests {
                 cached,
                 json,
                 compact,
+                full,
             } => {
                 assert_eq!(target, "Engineering/General");
                 assert_eq!(limit, 30);
@@ -4550,6 +4973,7 @@ mod tests {
                 assert!(!cached);
                 assert!(!json);
                 assert!(!compact);
+                assert!(!full);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -4749,6 +5173,16 @@ mod tests {
         assert!(Cli::try_parse_from(["teams", "read", "chat:c", "--compact"]).is_err());
         assert!(Cli::try_parse_from([
             "teams", "thread", "chan:t:c", "m1", "--json", "--compact",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["teams", "read", "chat:c", "--json", "--full"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "teams", "read", "chat:c", "--json", "--compact", "--full",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["teams", "read", "chat:c", "--full"]).is_err());
+        assert!(Cli::try_parse_from([
+            "teams", "thread", "chan:t:c", "m1", "--json", "--full",
         ])
         .is_ok());
     }
@@ -5759,5 +6193,280 @@ mod tests {
                 "expected candidate detection for {candidate:?}"
             );
         }
+    }
+
+    #[test]
+    fn paginate_boundaries_and_cursor_errors() {
+        let items: Vec<usize> = (0..120).collect();
+
+        let p1 = paginate(items.clone(), 50, None, 7).unwrap();
+        assert_eq!(p1.items.len(), 50);
+        assert_eq!(p1.items[0], 0);
+        assert!(p1.has_more);
+        assert_eq!(p1.next_cursor.as_deref(), Some("50-7"));
+        assert_eq!(p1.total, 120);
+
+        let p2 = paginate(items.clone(), 50, Some("50-7"), 7).unwrap();
+        assert_eq!(p2.items.len(), 50);
+        assert_eq!(p2.items[0], 50);
+        assert!(p2.has_more);
+        assert_eq!(p2.next_cursor.as_deref(), Some("100-7"));
+
+        let p3 = paginate(items.clone(), 50, Some("100-7"), 7).unwrap();
+        assert_eq!(p3.items.len(), 20);
+        assert_eq!(p3.items[0], 100);
+        assert!(!p3.has_more);
+        assert_eq!(p3.next_cursor, None);
+
+        let p_end = paginate(items.clone(), 50, Some("120-7"), 7).unwrap();
+        assert!(p_end.items.is_empty());
+        assert!(!p_end.has_more);
+        assert_eq!(p_end.next_cursor, None);
+
+        let p_all = paginate(items.clone(), 120, None, 7).unwrap();
+        assert_eq!(p_all.items.len(), 120);
+        assert!(!p_all.has_more);
+        assert_eq!(p_all.next_cursor, None);
+
+        let p_empty = paginate(Vec::<usize>::new(), 50, None, 7).unwrap();
+        assert!(p_empty.items.is_empty());
+        assert!(!p_empty.has_more);
+        assert_eq!(p_empty.next_cursor, None);
+        assert_eq!(p_empty.total, 0);
+
+        for bad in ["abc", "50", "121-7", "-1-7"] {
+            let err = paginate(items.clone(), 50, Some(bad), 7)
+                .err()
+                .expect("expected invalid cursor error");
+            assert!(
+                err.to_string().contains("Invalid cursor"),
+                "cursor={bad} err={err}"
+            );
+        }
+
+        let stale = paginate(items, 50, Some("50-8"), 7)
+            .err()
+            .expect("expected stale cursor error");
+        assert!(stale.to_string().contains("Stale cursor"), "{stale}");
+    }
+
+    #[test]
+    fn compact_json_reports_omissions_and_hint() {
+        use crate::models::ReactionSummary;
+
+        let conv = ConversationSummary {
+            conv_key: "chat:c1".to_string(),
+            target: ConversationTarget::Chat {
+                chat_id: "c1".to_string(),
+            },
+            kind: ConversationKind::Group,
+            team_id: None,
+            team_name: None,
+            title: "Release Room".to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        };
+
+        let base_msg = |id: &str| MessageItem {
+            msg_key: format!("chat:c1|{id}"),
+            conv_key: "chat:c1".to_string(),
+            msg_id: id.to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: Some("u1".to_string()),
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-20T08:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: "<p>hi</p>".to_string(),
+            body_plain: "hi".to_string(),
+            attachments: vec![],
+            mentions: vec![],
+            reactions: vec![],
+            reply_count: 0,
+            web_url: None,
+        };
+
+        let m1 = base_msg("m1");
+        let mut m2 = base_msg("m2");
+        m2.deleted = true;
+        m2.body_plain = "(deleted message)".to_string();
+
+        let mut m3 = base_msg("m3");
+        m3.subject = Some("Q4 Plan".to_string());
+        m3.importance = "high".to_string();
+        m3.mentions = vec![
+            MentionInfo {
+                id: 0,
+                user_id: "u1".to_string(),
+                display_name: "Alice".to_string(),
+            },
+            MentionInfo {
+                id: 1,
+                user_id: "u2".to_string(),
+                display_name: "Bob".to_string(),
+            },
+        ];
+        m3.reactions = vec![ReactionSummary {
+            reaction_type: "like".to_string(),
+            count: 2,
+            me_reacted: false,
+            users: vec!["Alice".to_string(), "Bob".to_string()],
+        }];
+
+        let mut m4 = base_msg("m4");
+        m4.reply_to_id = Some("m1".to_string());
+        m4.attachments = vec![AttachmentInfo {
+            id: "m1".to_string(),
+            content_type: "messageReference".to_string(),
+            content_url: None,
+            name: None,
+            content_json: Some("{}".to_string()),
+            thumbnail_url: None,
+        }];
+
+        let res = ReadMessagesResult {
+            messages: vec![m1.clone(), m2, m3, m4],
+            has_more: false,
+            next_before: Some("m1".to_string()),
+        };
+
+        let compact = read_messages_json(&conv, &res, Some("H"));
+        assert_eq!(compact["omitted"]["mentions"], 2);
+        assert_eq!(compact["omitted"]["reactions"], 1);
+        assert_eq!(compact["omitted"]["fields"].as_array().unwrap().len(), 25);
+        assert_eq!(compact["hint"], "H");
+        let msgs = compact["messages"].as_array().unwrap();
+        assert!(msgs[0].get("deleted").is_none());
+        assert!(msgs[0].get("subject").is_none());
+        assert!(msgs[0].get("omitted").is_none());
+        assert_eq!(msgs[1]["deleted"], true);
+        assert_eq!(msgs[2]["subject"], "Q4 Plan");
+        assert_eq!(msgs[2]["importance"], "high");
+        assert_eq!(msgs[2]["omitted"], json!({ "mentions": 2, "reactions": 1 }));
+        assert!(msgs[3].get("attachments").is_none());
+
+        let full = read_messages_json(&conv, &res, None);
+        assert!(full.get("omitted").is_none());
+        assert!(full.get("hint").is_none());
+
+        let thread = ThreadView {
+            conv_key: conv.conv_key.clone(),
+            root: m1,
+            replies: vec![],
+        };
+        let t_compact = thread_json(
+            &conv,
+            &thread,
+            ThreadCoverage {
+                has_more: true,
+                reply_total: None,
+            },
+            Some("H"),
+        );
+        assert!(t_compact["thread"]["root"]["reply_count"].is_null());
+        assert_eq!(t_compact["thread"]["returned"], 0);
+        assert_eq!(t_compact["thread"]["has_more"], true);
+    }
+
+    #[test]
+    fn members_page_distinguishes_empty_unknown_and_legacy() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mk_conv = |id: &str| ConversationSummary {
+            conv_key: format!("chat:{id}"),
+            target: ConversationTarget::Chat {
+                chat_id: id.to_string(),
+            },
+            kind: ConversationKind::Group,
+            team_id: None,
+            team_name: None,
+            title: id.to_string(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        };
+        let mk_member = |uid: &str, name: &str| MemberInfo {
+            user_id: uid.to_string(),
+            member_id: None,
+            display_name: name.to_string(),
+            email: None,
+            roles: vec![],
+            presence: None,
+        };
+
+        // (a) Marker only, 0 rows -> verified empty
+        let conv_a = mk_conv("a");
+        record_cli_sync_cursor(&storage, &format!("cli:members:{}", conv_a.conv_key));
+        let page_a = members_page(&storage, &conv_a, 50, None).unwrap();
+        assert_eq!(page_a["total"], 0);
+        assert_eq!(page_a["has_more"], false);
+        assert!(page_a["fetched_at"].is_string());
+
+        // (b) Neither marker nor rows -> unfetched error
+        let conv_b = mk_conv("b");
+        let err_b = members_page(&storage, &conv_b, 50, None).unwrap_err();
+        assert!(
+            err_b.to_string().contains("have not been fetched yet"),
+            "{err_b}"
+        );
+
+        // (c) Legacy cache: 3 rows via upsert_members, no marker
+        let conv_c = mk_conv("c");
+        storage
+            .upsert_members(
+                &conv_c.conv_key,
+                &[
+                    mk_member("u1", "Alice"),
+                    mk_member("u2", "Bob"),
+                    mk_member("u3", "Carol"),
+                ],
+            )
+            .unwrap();
+        let page_c = members_page(&storage, &conv_c, 50, None).unwrap();
+        assert!(page_c["total"].is_null());
+        assert!(page_c["has_more"].is_null());
+        assert!(page_c["fetched_at"].is_null());
+        let page_c2 = members_page(&storage, &conv_c, 2, None).unwrap();
+        assert_eq!(page_c2["has_more"], true);
+        assert_eq!(page_c2["next_cursor"], "2-0");
+
+        // (d) 3 rows + marker
+        let conv_d = mk_conv("d");
+        storage
+            .replace_members(
+                &conv_d.conv_key,
+                &[
+                    mk_member("u1", "Alice"),
+                    mk_member("u2", "Bob"),
+                    mk_member("u3", "Carol"),
+                ],
+            )
+            .unwrap();
+        record_cli_sync_cursor(&storage, &format!("cli:members:{}", conv_d.conv_key));
+        let page_d = members_page(&storage, &conv_d, 50, None).unwrap();
+        assert_eq!(page_d["total"], 3);
+        assert_eq!(page_d["has_more"], false);
+        assert!(page_d["fetched_at"].is_string());
     }
 }

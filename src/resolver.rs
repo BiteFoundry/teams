@@ -192,8 +192,8 @@ pub async fn resolve_conversation(
     }
 
     if q.starts_with("chan:") {
-        let teams = graph.list_joined_teams_with_channels().await?;
-        storage.upsert_teams(&teams)?;
+        let fetched = graph.list_joined_teams_with_channels().await?;
+        storage.upsert_joined_teams(&fetched)?;
         let refreshed = storage.list_conversations()?;
         if let Ok(found) = resolve_from_slice(&refreshed, q) {
             return Ok(found);
@@ -221,7 +221,7 @@ pub async fn resolve_conversation(
     }
     match teams_res {
         Ok(t) => {
-            storage.upsert_teams(&t)?;
+            storage.upsert_joined_teams(&t)?;
         }
         Err(err) => {
             teams_err = Some(err);

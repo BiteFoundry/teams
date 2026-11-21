@@ -323,29 +323,71 @@ async fn call_tool(
 
         "list_teams_channels" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
-            let cached = with_storage(storage, |s| s.list_teams())
-                .await
-                .map_err(format_error)?;
-            let teams = if refresh || cached.is_empty() {
-                let fetched =
-                    map_graph_result(graph, graph.list_joined_teams_with_channels().await).await?;
-                let fetched_clone = fetched.clone();
-                let stored = with_storage(storage, move |s| {
-                    s.upsert_teams(&fetched_clone)?;
-                    s.list_teams()
+            let limit = bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(50),
+                1,
+                1_000,
+            )?;
+            let cursor = args.optional_str("cursor")?;
+            if refresh && cursor.is_some() {
+                return Err("cursor cannot be combined with refresh".to_string());
+            }
+
+            let (teams, channel_errors, stamp) = if cursor.is_some() {
+                with_storage(storage, |s| {
+                    let teams = s.list_teams()?;
+                    let stamp = cli::fetch_stamp(s, "cli:teams").map_or(0, |(st, _)| st);
+                    Ok((teams, None, stamp))
                 })
                 .await
-                .map_err(format_error)?;
-                if stored.is_empty() {
-                    fetched
-                } else {
-                    stored
-                }
+                .map_err(format_error)?
             } else {
-                cached
+                let cached = with_storage(storage, |s| s.list_teams())
+                    .await
+                    .map_err(format_error)?;
+                if refresh || cached.is_empty() {
+                    let fetched = map_graph_result(
+                        graph,
+                        graph.list_joined_teams_with_channels().await,
+                    )
+                    .await?;
+                    let errors = fetched.channel_errors.clone();
+                    let (teams, stamp) = with_storage(storage, move |s| {
+                        let merged = s.upsert_joined_teams(&fetched)?;
+                        cli::record_cli_sync_cursor(s, "cli:teams");
+                        let stored = s.list_teams()?;
+                        let teams = if stored.is_empty() { merged } else { stored };
+                        let stamp = cli::fetch_stamp(s, "cli:teams").map_or(0, |(st, _)| st);
+                        Ok((teams, stamp))
+                    })
+                    .await
+                    .map_err(format_error)?;
+                    (teams, Some(errors), stamp)
+                } else {
+                    let stamp = with_storage(storage, |s| {
+                        Ok(cli::fetch_stamp(s, "cli:teams").map_or(0, |(st, _)| st))
+                    })
+                    .await
+                    .map_err(format_error)?;
+                    (cached, None, stamp)
+                }
             };
 
-            Ok(json!({ "teams": teams }))
+            let page =
+                cli::paginate(teams, limit, cursor.as_deref(), stamp).map_err(format_error)?;
+            let returned = page.items.len();
+            let mut out = json!({
+                "teams": page.items,
+                "returned": returned,
+                "has_more": page.has_more,
+                "next_cursor": page.next_cursor,
+                "total": page.total,
+            });
+            if let Some(errors) = channel_errors {
+                out["channel_errors"] = json!(errors);
+            }
+            Ok(out)
         }
 
         "get_messages" => {
@@ -358,7 +400,7 @@ async fn call_tool(
             )?;
             let before = args.optional_str("before")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let conv = resolve_target_mcp(storage, graph, &target, offline).await?;
 
@@ -392,7 +434,10 @@ async fn call_tool(
                 .await?
             };
 
-            Ok(cli::read_messages_json(&conv, &res, compact))
+            let hint = compact.then_some(
+                "Call get_messages with the same arguments and \"compact\": false for full message objects.",
+            );
+            Ok(cli::read_messages_json(&conv, &res, hint))
         }
 
         "get_thread" => {
@@ -406,10 +451,10 @@ async fn call_tool(
             )?;
 
             let offline = args.optional_bool("offline")?.unwrap_or(false);
-            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
             let conv = resolve_target_mcp(storage, graph, &target, offline).await?;
 
-            let thread = if offline {
+            let (thread, coverage) = if offline {
                 let conv = conv.clone();
                 let root_id = root_msg_id.clone();
                 with_storage(storage, move |s| cli::read_thread_offline(s, &conv, &root_id, limit))
@@ -424,7 +469,10 @@ async fn call_tool(
                 .await?
             };
 
-            Ok(cli::thread_json(&conv, &thread, compact))
+            let hint = compact.then_some(
+                "Call get_thread with the same arguments and \"compact\": false for full message objects.",
+            );
+            Ok(cli::thread_json(&conv, &thread, coverage, hint))
         }
 
         "send_message" => {
@@ -701,20 +749,26 @@ async fn call_tool(
 
         "list_members" => {
             let target = args.required_str("target")?;
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let members = map_graph_result(graph, graph.list_members(&conv.target).await).await?;
-            let conv_key = conv.conv_key.clone();
-            let members_clone = members.clone();
-            let _ = with_storage(storage, move |s| {
-                s.upsert_members(&conv_key, &members_clone)
+            let limit = bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(50),
+                1,
+                1_000,
+            )?;
+            let cursor = args.optional_str("cursor")?;
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let from_cache = offline || cursor.is_some();
+            let conv = resolve_target_mcp(storage, graph, &target, from_cache).await?;
+            if !from_cache {
+                map_graph_result(graph, cli::refresh_members(storage, graph, &conv).await).await?;
+            }
+            let conv_clone = conv.clone();
+            let cursor_clone = cursor.clone();
+            with_storage(storage, move |s| {
+                cli::members_page(s, &conv_clone, limit, cursor_clone.as_deref())
             })
-            .await;
-
-            Ok(json!({
-                "conv_key": conv.conv_key,
-                "title": conv.title,
-                "members": members,
-            }))
+            .await
+            .map_err(format_error)
         }
 
         "mark_read" => {
@@ -879,7 +933,7 @@ fn initialize_result(message: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (17 Teams tools)
+// Tool catalog (18 Teams tools)
 // ---------------------------------------------------------------------------
 
 fn mentions_schema() -> Value {
@@ -955,7 +1009,9 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync teams and channels from Microsoft Graph before returning." }
+                    "refresh": { "type": "boolean", "description": "Sync teams and channels from Microsoft Graph before returning." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous page; reads the next page from the local cache without calling Microsoft Graph." }
                 },
                 "additionalProperties": false
             }
@@ -970,7 +1026,7 @@ fn tool_catalog() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to read older messages preceding it." },
                     "offline": { "type": "boolean", "default": false, "description": "Read from the local SQLite cache." },
-                    "compact": { "type": "boolean", "default": false, "description": "Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names." }
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -986,7 +1042,7 @@ fn tool_catalog() -> Vec<Value> {
                     "root_msg_id": { "type": "string", "minLength": 1 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "offline": { "type": "boolean", "default": false, "description": "Read verified replies from the local SQLite cache. A cache miss or insufficient reply coverage returns an error." },
-                    "compact": { "type": "boolean", "default": false, "description": "Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names." }
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target", "root_msg_id"],
                 "additionalProperties": false
@@ -1130,7 +1186,10 @@ fn tool_catalog() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string" }
+                    "target": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous page; reads the next page from the local cache without calling Microsoft Graph." },
+                    "offline": { "type": "boolean", "default": false, "description": "Read cached members from the local SQLite cache without calling Microsoft Graph." }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -1265,7 +1324,17 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.required_text("topic")?;
         }
         "list_teams_channels" => {
-            args.optional_bool("refresh")?;
+            let refresh = args.optional_bool("refresh")?.unwrap_or(false);
+            bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(50),
+                1,
+                1_000,
+            )?;
+            let cursor = args.optional_str("cursor")?;
+            if refresh && cursor.is_some() {
+                return Err("cursor cannot be combined with refresh".to_string());
+            }
         }
         "get_messages" => {
             args.reject_unknown(&["target", "limit", "before", "offline", "compact"])?;
@@ -1354,7 +1423,18 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
                 1_000,
             )?;
         }
-        "list_members" | "mark_read" => {
+        "list_members" => {
+            args.required_str("target")?;
+            bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(50),
+                1,
+                1_000,
+            )?;
+            args.optional_str("cursor")?;
+            args.optional_bool("offline")?;
+        }
+        "mark_read" => {
             args.required_str("target")?;
         }
         "get_presence" => {
@@ -2177,7 +2257,7 @@ mod tests {
                 "method": "tools/call",
                 "params": {
                     "name": "get_messages",
-                    "arguments": { "target": "chat:c1", "offline": true }
+                    "arguments": { "target": "chat:c1", "offline": true, "compact": false }
                 }
             })
             .to_string(),
@@ -2225,5 +2305,28 @@ mod tests {
         assert_eq!(std::fs::read(saved_path).unwrap(), png_bytes);
 
         mock_server.abort();
+    }
+
+    #[test]
+    fn paged_list_tools_validate_limit_and_cursor() {
+        validate_tool_args(
+            "list_members",
+            &json!({ "target": "chat:c1", "limit": 5, "cursor": "10-0", "offline": true }),
+        )
+        .unwrap();
+        assert!(validate_tool_args("list_members", &json!({ "target": "chat:c1", "limit": 0 })).is_err());
+        assert!(validate_tool_args("list_members", &json!({ "target": "chat:c1", "limit": 1001 })).is_err());
+        assert!(validate_tool_args("list_members", &json!({ "target": "chat:c1", "cursor": 5 })).is_err());
+        validate_tool_args(
+            "list_teams_channels",
+            &json!({ "limit": 50, "cursor": "0-0" }),
+        )
+        .unwrap();
+        assert!(validate_tool_args("list_teams_channels", &json!({ "bogus": 1 })).is_err());
+        assert!(validate_tool_args(
+            "list_teams_channels",
+            &json!({ "refresh": true, "cursor": "0-0" })
+        )
+        .is_err());
     }
 }

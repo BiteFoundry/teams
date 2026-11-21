@@ -266,7 +266,11 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          $ref: "#/components/responses/NotFound"
+          description: Target conversation not found, or cached thread missing or lacking reply coverage when offline=true
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalError"
   /conversations/{key}/messages/{msg_id}/replies:
@@ -906,12 +910,13 @@ components:
           items:
             $ref: "#/components/schemas/ReactionSummary"
         reply_count:
-          type: integer
+          type: [integer, "null"]
+          description: Total reply count when known; null on a thread root when truncated by limit.
         web_url:
           type: [string, "null"]
     ThreadView:
       type: object
-      required: [conv_key, root, replies]
+      required: [conv_key, root, replies, returned, has_more]
       properties:
         conv_key:
           type: string
@@ -921,6 +926,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/MessageItem"
+        returned:
+          type: integer
+          description: Number of replies returned in this window.
+        has_more:
+          type: boolean
+          description: True when older replies exist beyond the returned window.
     PresenceStatus:
       type: object
       required: [user_id, availability, activity]

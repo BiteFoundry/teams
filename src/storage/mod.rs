@@ -13,8 +13,8 @@ use std::{
 use anyhow::Result;
 
 use crate::models::{
-    ConversationSummary, MemberInfo, MessageItem, PresenceStatus, ReactionSummary, SearchHit,
-    SyncCursor, TeamSummary, ThreadView,
+    ConversationSummary, JoinedTeams, MemberInfo, MessageItem, PresenceStatus, ReactionSummary,
+    SearchHit, SyncCursor, TeamSummary, ThreadCoverage, ThreadView,
 };
 
 pub use repo::UpsertMessagesOutcome;
@@ -202,6 +202,22 @@ impl Storage {
         repo::upsert_teams(&mut conn, teams)
     }
 
+    /// Stores fetched teams; a team whose channel fetch failed keeps its cached channels.
+    pub fn upsert_joined_teams(&self, fetched: &JoinedTeams) -> Result<Vec<TeamSummary>> {
+        let cached = self.list_teams()?;
+        let mut merged = fetched.teams.clone();
+        for failed in &fetched.channel_errors {
+            if let (Some(team), Some(old)) = (
+                merged.iter_mut().find(|t| t.id == failed.team_id),
+                cached.iter().find(|t| t.id == failed.team_id),
+            ) {
+                team.channels = old.channels.clone();
+            }
+        }
+        self.upsert_teams(&merged)?;
+        Ok(merged)
+    }
+
     pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>> {
         let conn = self.read_conn()?;
         repo::list_conversations(&conn)
@@ -377,7 +393,7 @@ impl Storage {
         conv_key: &str,
         root_msg_id: &str,
         limit: usize,
-    ) -> Result<Option<ThreadView>> {
+    ) -> Result<Option<(ThreadView, ThreadCoverage)>> {
         let conn = self.read_conn()?;
         repo::get_fetched_thread(&conn, conv_key, root_msg_id, limit)
     }
@@ -396,6 +412,11 @@ impl Storage {
     pub fn upsert_members(&self, conv_key: &str, members: &[MemberInfo]) -> Result<()> {
         let mut conn = self.lock_conn()?;
         repo::upsert_members(&mut conn, conv_key, members)
+    }
+
+    pub fn replace_members(&self, conv_key: &str, members: &[MemberInfo]) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        repo::replace_members(&mut conn, conv_key, members)
     }
 
     pub fn list_members(&self, conv_key: &str) -> Result<Vec<MemberInfo>> {
@@ -742,17 +763,30 @@ mod tests {
         storage.save_fetched_thread(&window, false).unwrap();
         assert!(storage.get_fetched_thread(conv_key, "m1", 2).unwrap().is_none());
         assert_eq!(
-            storage.get_fetched_thread(conv_key, "m1", 1).unwrap().unwrap().replies,
+            storage
+                .get_fetched_thread(conv_key, "m1", 1)
+                .unwrap()
+                .map(|(thread, _)| thread)
+                .unwrap()
+                .replies,
             window.replies
         );
         storage.save_fetched_thread(&thread, true).unwrap();
         assert_eq!(
-            storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap(),
+            storage
+                .get_fetched_thread(conv_key, "m1", 50)
+                .unwrap()
+                .map(|(thread, _)| thread)
+                .unwrap(),
             thread
         );
         window.replies.clear();
         storage.save_fetched_thread(&window, true).unwrap();
-        let verified_empty = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        let verified_empty = storage
+            .get_fetched_thread(conv_key, "m1", 50)
+            .unwrap()
+            .map(|(thread, _)| thread)
+            .unwrap();
         assert!(verified_empty.replies.is_empty());
         assert_eq!(verified_empty.root.reply_count, 0);
 
@@ -1380,5 +1414,187 @@ mod tests {
         let newest_5 = storage.list_thread_replies(conv_key, "root", 5).unwrap();
         let ids: Vec<&str> = newest_5.iter().map(|m| m.msg_id.as_str()).collect();
         assert_eq!(ids, vec!["rep-08", "rep-09", "rep-10", "rep-11", "rep-12"]);
+    }
+
+    #[test]
+    fn fetched_thread_reports_coverage() {
+        let storage = Storage::open_in_memory().unwrap();
+        let conv_key = "chan:t1:ch1";
+        let root = sample_msg(conv_key, "m1", None, "Alice", "root", None, "2026-11-20T09:00:00Z");
+        let r1 = sample_msg(conv_key, "r1", Some("m1"), "Bob", "reply 1", None, "2026-11-20T09:01:00Z");
+        let r2 = sample_msg(conv_key, "r2", Some("m1"), "Bob", "reply 2", None, "2026-11-20T09:02:00Z");
+        let r3 = sample_msg(conv_key, "r3", Some("m1"), "Bob", "reply 3", None, "2026-11-20T09:03:00Z");
+
+        // 1) Incomplete window of newest 2 replies
+        let partial = ThreadView {
+            conv_key: conv_key.to_string(),
+            root: root.clone(),
+            replies: vec![r2.clone(), r3.clone()],
+        };
+        storage.save_fetched_thread(&partial, false).unwrap();
+        let (t1, cov1) = storage.get_fetched_thread(conv_key, "m1", 1).unwrap().unwrap();
+        assert_eq!(t1.replies.len(), 1);
+        assert_eq!(t1.replies[0].msg_id, "r3");
+        assert_eq!(cov1, ThreadCoverage { has_more: true, reply_total: None });
+        let (t2, cov2) = storage.get_fetched_thread(conv_key, "m1", 2).unwrap().unwrap();
+        assert_eq!(t2.replies.len(), 2);
+        assert_eq!(cov2, ThreadCoverage { has_more: true, reply_total: None });
+        assert!(storage.get_fetched_thread(conv_key, "m1", 3).unwrap().is_none());
+
+        // 2) Complete window of all 3 replies
+        let full = ThreadView {
+            conv_key: conv_key.to_string(),
+            root: root.clone(),
+            replies: vec![r1, r2, r3],
+        };
+        storage.save_fetched_thread(&full, true).unwrap();
+        let (t2c, cov2c) = storage.get_fetched_thread(conv_key, "m1", 2).unwrap().unwrap();
+        assert_eq!(t2c.replies.len(), 2);
+        assert_eq!(cov2c, ThreadCoverage { has_more: true, reply_total: Some(3) });
+        let (t3c, cov3c) = storage.get_fetched_thread(conv_key, "m1", 3).unwrap().unwrap();
+        assert_eq!(t3c.replies.len(), 3);
+        assert_eq!(cov3c, ThreadCoverage { has_more: false, reply_total: Some(3) });
+        let (t50c, cov50c) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        assert_eq!(t50c.replies.len(), 3);
+        assert_eq!(cov50c, ThreadCoverage { has_more: false, reply_total: Some(3) });
+
+        // 3) Verified empty thread (0 replies, complete)
+        let empty = ThreadView {
+            conv_key: conv_key.to_string(),
+            root,
+            replies: Vec::new(),
+        };
+        storage.save_fetched_thread(&empty, true).unwrap();
+        let (te, cove) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        assert!(te.replies.is_empty());
+        assert_eq!(cove, ThreadCoverage { has_more: false, reply_total: Some(0) });
+    }
+
+    #[test]
+    fn upsert_joined_teams_keeps_cached_channels_for_failed_team() {
+        use crate::models::TeamChannelError;
+
+        let storage = Storage::open_in_memory().unwrap();
+        let secret_ch = ChannelSummary {
+            id: "secret".to_string(),
+            team_id: "tb".to_string(),
+            team_name: "Restricted".to_string(),
+            display_name: "Secret".to_string(),
+            description: None,
+            membership_type: "private".to_string(),
+            web_url: None,
+        };
+        storage
+            .upsert_teams(&[
+                TeamSummary {
+                    id: "tb".to_string(),
+                    display_name: "Restricted".to_string(),
+                    description: None,
+                    channels: vec![secret_ch.clone()],
+                },
+                TeamSummary {
+                    id: "tc".to_string(),
+                    display_name: "EmptyTeam".to_string(),
+                    description: None,
+                    channels: vec![],
+                },
+            ])
+            .unwrap();
+
+        let fetched = JoinedTeams {
+            teams: vec![
+                TeamSummary {
+                    id: "tb".to_string(),
+                    display_name: "Restricted".to_string(),
+                    description: None,
+                    channels: vec![],
+                },
+                TeamSummary {
+                    id: "tc".to_string(),
+                    display_name: "EmptyTeam".to_string(),
+                    description: None,
+                    channels: vec![],
+                },
+                TeamSummary {
+                    id: "tn".to_string(),
+                    display_name: "NewFailed".to_string(),
+                    description: None,
+                    channels: vec![],
+                },
+            ],
+            channel_errors: vec![
+                TeamChannelError {
+                    team_id: "tb".to_string(),
+                    display_name: "Restricted".to_string(),
+                    status: Some(429),
+                    error: "429 Too Many Requests".to_string(),
+                },
+                TeamChannelError {
+                    team_id: "tn".to_string(),
+                    display_name: "NewFailed".to_string(),
+                    status: Some(403),
+                    error: "403 Forbidden".to_string(),
+                },
+            ],
+        };
+
+        let merged = storage.upsert_joined_teams(&fetched).unwrap();
+        for list in [&merged, &storage.list_teams().unwrap()] {
+            let tb = list.iter().find(|t| t.id == "tb").unwrap();
+            assert_eq!(tb.channels, vec![secret_ch.clone()]);
+            let tc = list.iter().find(|t| t.id == "tc").unwrap();
+            assert!(tc.channels.is_empty());
+            let tn = list.iter().find(|t| t.id == "tn").unwrap();
+            assert!(tn.channels.is_empty());
+        }
+    }
+
+    #[test]
+    fn replace_members_drops_departed_and_orders_stably() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mk = |uid: &str, name: &str, email: Option<&str>| MemberInfo {
+            user_id: uid.to_string(),
+            member_id: None,
+            display_name: name.to_string(),
+            email: email.map(str::to_string),
+            roles: vec![],
+            presence: None,
+        };
+
+        storage
+            .upsert_members(
+                "chat:c1",
+                &[
+                    mk("u2", "Bob", Some("b@x")),
+                    mk("u1", "Bob", None),
+                    mk("u3", "alice", None),
+                ],
+            )
+            .unwrap();
+        storage
+            .upsert_members("chat:c2", &[mk("u9", "Other", None)])
+            .unwrap();
+
+        let before = storage.list_members("chat:c1").unwrap();
+        let before_order: Vec<(&str, &str)> = before
+            .iter()
+            .map(|m| (m.user_id.as_str(), m.display_name.as_str()))
+            .collect();
+        assert_eq!(before_order, vec![("u1", "Bob"), ("u2", "Bob"), ("u3", "alice")]);
+
+        storage
+            .replace_members("chat:c1", &[mk("u2", "Bob", None), mk("u4", "Carol", None)])
+            .unwrap();
+        let after = storage.list_members("chat:c1").unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].user_id, "u2");
+        assert_eq!(after[0].display_name, "Bob");
+        assert_eq!(after[0].email.as_deref(), Some("b@x"));
+        assert_eq!(after[1].user_id, "u4");
+        assert_eq!(after[1].display_name, "Carol");
+
+        storage.replace_members("chat:c1", &[]).unwrap();
+        assert!(storage.list_members("chat:c1").unwrap().is_empty());
+        assert_eq!(storage.list_members("chat:c2").unwrap().len(), 1);
     }
 }

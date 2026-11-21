@@ -21,7 +21,7 @@ use crate::{
     cli,
     config::AppConfig,
     graph::GraphClient,
-    models::{ConversationKind, ConversationTarget, MentionInfo},
+    models::{ConversationKind, ConversationTarget, MentionInfo, ThreadCoverage},
     parser, resolver,
     storage::Storage,
     sync::{self, SyncCommand},
@@ -530,8 +530,8 @@ async fn list_conversations(
                     &chats.explicit_null_topic_keys,
                 )?;
                 cli::record_chats_list_cursor(s, chats.next_link, chats.eof);
-                if let Ok(teams) = teams_res {
-                    s.upsert_teams(&teams)?;
+                if let Ok(fetched) = teams_res {
+                    s.upsert_joined_teams(&fetched)?;
                 }
                 Ok(())
             })
@@ -603,9 +603,9 @@ async fn list_teams(
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
         with_storage(&state.storage, move |s| {
-            s.upsert_teams(&fetched)?;
+            let merged = s.upsert_joined_teams(&fetched)?;
             let stored = s.list_teams()?;
-            Ok(if stored.is_empty() { fetched } else { stored })
+            Ok(if stored.is_empty() { merged } else { stored })
         })
         .await?
     } else {
@@ -738,14 +738,16 @@ async fn get_thread(
         )));
     };
 
-    let mut thread = if query.offline {
-        let conv_key = conv.conv_key.clone();
+    let (thread, coverage) = if query.offline {
+        let conv_clone = conv.clone();
         let root_id_clone = root_id.clone();
-        with_storage(&state.storage, move |s| s.get_thread(&conv_key, &root_id_clone, limit))
-            .await?
-            .ok_or_else(|| ApiError::not_found(format!("thread not found in cache: {root_id}")))?
+        with_storage(&state.storage, move |s| {
+            cli::read_thread_offline(s, &conv_clone, &root_id_clone, limit)
+        })
+        .await?
+        .ok_or_else(|| ApiError::not_found(cli::thread_cache_miss(&root_id, limit).to_string()))?
     } else {
-        let (view, complete) = match state
+        let (mut view, complete) = match state
             .graph
             .get_thread_with_coverage(team_id, channel_id, &root_id, limit)
             .await
@@ -755,11 +757,18 @@ async fn get_thread(
         };
         let cached = view.clone();
         with_storage(&state.storage, move |s| s.save_fetched_thread(&cached, complete)).await?;
-        view
+        cli::hydrate_thread_attachments(&mut view);
+        let coverage = ThreadCoverage {
+            has_more: !complete,
+            reply_total: complete.then_some(view.replies.len()),
+        };
+        (view, coverage)
     };
-    cli::hydrate_thread_attachments(&mut thread);
 
-    Ok(Json(json!({ "thread": thread })))
+    let returned = thread.replies.len();
+    Ok(Json(json!({
+        "thread": cli::finish_thread_value(json!(thread), returned, coverage)
+    })))
 }
 
 async fn reply_message(
@@ -1945,18 +1954,29 @@ mod tests {
             }
         };
 
+        let root_1 = mk_cached(
+            "chan:t1:ch1",
+            "root-1",
+            None,
+            "2026-11-18T10:02:00Z",
+            graph_hosted_url,
+        );
         storage
             .upsert_messages(&[
                 mk_cached("chat:c1", "m1", None, "2026-11-18T10:00:00Z", graph_hosted_url),
                 mk_cached("chat:c1", "m2", None, "2026-11-18T10:01:00Z", &local_hosted_url),
-                mk_cached(
-                    "chan:t1:ch1",
-                    "root-1",
-                    None,
-                    "2026-11-18T10:02:00Z",
-                    graph_hosted_url,
-                ),
+                root_1.clone(),
             ])
+            .unwrap();
+        storage
+            .save_fetched_thread(
+                &crate::models::ThreadView {
+                    conv_key: "chan:t1:ch1".to_string(),
+                    root: root_1,
+                    replies: vec![],
+                },
+                true,
+            )
             .unwrap();
 
         let router = build_router(cfg, graph, storage, None);
@@ -2015,5 +2035,147 @@ mod tests {
 
         api_server.abort();
         mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn offline_thread_requires_reply_coverage() {
+        use crate::models::{ConversationSummary, MessageItem, ThreadView};
+
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_conversations(&[ConversationSummary {
+                conv_key: "chan:t1:ch1".to_string(),
+                target: ConversationTarget::Channel {
+                    team_id: "t1".to_string(),
+                    channel_id: "ch1".to_string(),
+                },
+                kind: ConversationKind::Channel,
+                team_id: Some("t1".to_string()),
+                team_name: Some("Eng".to_string()),
+                title: "General".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: None,
+                last_msg_author: None,
+                last_msg_preview: None,
+                last_updated_at: None,
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            }])
+            .unwrap();
+
+        let mk = |msg_id: &str, parent: Option<&str>, ts: &str| MessageItem {
+            msg_key: format!("chan:t1:ch1|{msg_id}"),
+            conv_key: "chan:t1:ch1".to_string(),
+            msg_id: msg_id.to_string(),
+            parent_msg_id: parent.map(str::to_string),
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: Some("u1".to_string()),
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: ts.to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: format!("<p>{msg_id}</p>"),
+            body_plain: msg_id.to_string(),
+            attachments: vec![],
+            mentions: vec![],
+            reactions: vec![],
+            reply_count: 0,
+            web_url: None,
+        };
+
+        let root = mk("root-1", None, "2026-11-20T09:00:00Z");
+        let r1 = mk("reply-1", Some("root-1"), "2026-11-20T09:01:00Z");
+        let r2 = mk("reply-2", Some("root-1"), "2026-11-20T09:02:00Z");
+        let r3 = mk("reply-3", Some("root-1"), "2026-11-20T09:03:00Z");
+
+        storage
+            .save_fetched_thread(
+                &ThreadView {
+                    conv_key: "chan:t1:ch1".to_string(),
+                    root: root.clone(),
+                    replies: vec![r2.clone(), r3.clone()],
+                },
+                false,
+            )
+            .unwrap();
+
+        let router = build_router(cfg, graph, storage.clone(), None);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api_server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // limit=2 matches incomplete window -> 200 with reply_count: null
+        let res = client
+            .get(format!(
+                "{base}/conversations/chan%3At1%3Ach1/threads/root-1?offline=true&limit=2"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["thread"]["returned"], 2);
+        assert_eq!(body["thread"]["has_more"], true);
+        assert!(body["thread"]["root"]["reply_count"].is_null(), "{body}");
+
+        // limit=3 exceeds incomplete window -> 404 with coverage message
+        let res = client
+            .get(format!(
+                "{base}/conversations/chan%3At1%3Ach1/threads/root-1?offline=true&limit=3"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let err_body: Value = res.json().await.unwrap();
+        assert!(
+            err_body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("reply limit 3"),
+            "{err_body}"
+        );
+
+        // Save complete window (all 3 replies) -> limit=2 returns 200 with has_more: true and reply_count: 3
+        storage
+            .save_fetched_thread(
+                &ThreadView {
+                    conv_key: "chan:t1:ch1".to_string(),
+                    root,
+                    replies: vec![r1, r2, r3],
+                },
+                true,
+            )
+            .unwrap();
+        let res = client
+            .get(format!(
+                "{base}/conversations/chan%3At1%3Ach1/threads/root-1?offline=true&limit=2"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["thread"]["returned"], 2);
+        assert_eq!(body["thread"]["has_more"], true);
+        assert_eq!(body["thread"]["root"]["reply_count"], 3);
+
+        api_server.abort();
     }
 }

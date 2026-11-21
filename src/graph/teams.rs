@@ -16,8 +16,8 @@ use super::{
     GraphClient,
 };
 use crate::models::{
-    ChannelSummary, ConversationTarget, MemberInfo, MessageItem, OutgoingMessage, QuotedReply,
-    TeamSummary, ThreadView,
+    ChannelSummary, ConversationTarget, JoinedTeams, MemberInfo, MessageItem, OutgoingMessage,
+    QuotedReply, TeamChannelError, TeamSummary, ThreadView,
 };
 
 #[derive(Debug, Deserialize)]
@@ -63,7 +63,7 @@ impl GraphChannel {
 }
 
 impl GraphClient {
-    pub async fn list_joined_teams_with_channels(&self) -> Result<Vec<TeamSummary>> {
+    pub async fn list_joined_teams_with_channels(&self) -> Result<JoinedTeams> {
         let mut next_url = Some("/me/joinedTeams?$select=id,displayName,description".to_string());
         let mut teams = Vec::new();
         while let Some(url) = next_url {
@@ -73,7 +73,10 @@ impl GraphClient {
         }
 
         if teams.is_empty() {
-            return Ok(Vec::new());
+            return Ok(JoinedTeams {
+                teams: Vec::new(),
+                channel_errors: Vec::new(),
+            });
         }
 
         let requests: Vec<BatchSubRequest> = teams
@@ -94,23 +97,47 @@ impl GraphClient {
         let responses = self.batch(&requests).await?;
         let mut channels_by_idx: HashMap<usize, (Vec<GraphChannel>, Option<String>)> =
             HashMap::new();
+        let mut failed: HashMap<usize, (Option<u16>, String)> = HashMap::new();
         for resp in responses {
             let Ok(idx) = resp.id.parse::<usize>() else {
                 continue;
             };
             if !(200..300).contains(&resp.status) {
+                let code = resp
+                    .body
+                    .pointer("/error/code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let message = resp
+                    .body
+                    .pointer("/error/message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                failed.insert(
+                    idx,
+                    (Some(resp.status), format!("{} [{code}] {message}", resp.status)),
+                );
                 continue;
             }
-            if let Ok(page) = serde_json::from_value::<GraphListPage<GraphChannel>>(resp.body) {
-                let next_link = page
-                    .next_link
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                channels_by_idx.insert(idx, (page.value, next_link));
+            match serde_json::from_value::<GraphListPage<GraphChannel>>(resp.body) {
+                Ok(page) => {
+                    let next_link = page
+                        .next_link
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    channels_by_idx.insert(idx, (page.value, next_link));
+                }
+                Err(_) => {
+                    failed.insert(
+                        idx,
+                        (Some(resp.status), "invalid channel list payload".to_string()),
+                    );
+                }
             }
         }
 
         let mut summaries = Vec::with_capacity(teams.len());
+        let mut channel_errors = Vec::new();
         for (idx, team) in teams.into_iter().enumerate() {
             let team_name = team
                 .display_name
@@ -126,7 +153,19 @@ impl GraphClient {
                     )
                     .await?
                 }
-                None => Vec::new(),
+                None => match self.list_team_channels(&team.id, &team_name).await {
+                    Ok(channels) => channels,
+                    Err(err) => {
+                        let (status, _) = failed.remove(&idx).unwrap_or((None, String::new()));
+                        channel_errors.push(TeamChannelError {
+                            team_id: team.id.clone(),
+                            display_name: team_name.clone(),
+                            status,
+                            error: format!("{err:#}"),
+                        });
+                        Vec::new()
+                    }
+                },
             };
             summaries.push(TeamSummary {
                 id: team.id,
@@ -136,7 +175,10 @@ impl GraphClient {
             });
         }
 
-        Ok(summaries)
+        Ok(JoinedTeams {
+            teams: summaries,
+            channel_errors,
+        })
     }
 
     async fn collect_team_channels_from_page(
