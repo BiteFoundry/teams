@@ -24,6 +24,7 @@ use crate::{
     models::{
         AttachmentInfo, ConversationKind, ConversationSummary, ConversationTarget, DownloadedFile,
         InlineImageUpload, MentionInfo, MessageItem, QuotedReply, SyncCursor, TeamSummary,
+        ThreadView,
     },
     parser, resolver,
     serve::{self, ServeOptions},
@@ -129,6 +130,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Change the topic of an existing group chat
+    #[command(after_help = "Requires delegated Chat.ReadWrite and access to the group chat.")]
+    UpdateChat {
+        target: String,
+        /// New group chat topic (up to 250 characters, without colons)
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// List joined teams and channels
     Teams {
         #[arg(long)]
@@ -154,7 +165,7 @@ pub enum Command {
     #[command(visible_alias = "cat")]
     Read {
         target: String,
-        /// Maximum number of messages to fetch [default: 30]
+        /// Maximum number of messages, or replies when --thread includes the root separately
         #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
         /// Fetch messages older than this timestamp (ISO-8601 / YYYY-MM-DD) or message ID
@@ -170,18 +181,25 @@ pub enum Command {
         cached: bool,
         #[arg(long)]
         json: bool,
+        /// Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Read a team channel root post and its thread replies
     Thread {
         channel_target: String,
         root_msg_id: String,
-        /// Maximum number of replies to fetch [default: 50]
+        /// Maximum number of replies (the root is included separately)
         #[arg(long, visible_alias = "top", default_value_t = 50)]
         limit: usize,
+        /// Read a previous thread fetch from the local cache
         #[arg(long)]
         offline: bool,
         #[arg(long)]
         json: bool,
+        /// Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names
+        #[arg(long, requires = "json")]
+        compact: bool,
     },
     /// Send a Markdown message
     #[command(visible_alias = "msg")]
@@ -251,10 +269,22 @@ pub enum Command {
         json: bool,
     },
     /// Edit a message you sent
+    #[command(after_help = "Channel edits require delegated ChannelMessage.ReadWrite (or legacy Group.ReadWrite.All). Chat edits require delegated Chat.ReadWrite. Graph reports permission and policy denials as errors.")]
     Edit {
         target: String,
         msg_id: String,
-        new_markdown: String,
+        /// Replace the entire message body with this Markdown
+        #[arg(required_unless_present_any = ["find", "subject"], conflicts_with_all = ["find", "replace", "subject"])]
+        new_markdown: Option<String>,
+        /// Find one exact phrase in a single editable text node in the current body
+        #[arg(long, requires = "replace")]
+        find: Option<String>,
+        /// Replace the phrase with literal text and preserve the surrounding HTML
+        #[arg(long, requires = "find")]
+        replace: Option<String>,
+        /// Set the subject of a channel root post you sent
+        #[arg(long, conflicts_with_all = ["new_markdown", "find", "replace", "thread"])]
+        subject: Option<String>,
         #[arg(long)]
         thread: Option<String>,
         #[arg(long)]
@@ -509,6 +539,9 @@ async fn dispatch_command(
             message,
             json,
         }) => Box::pin(cmd_new_chat(cfg, to, topic, message, json)).await,
+        Some(Command::UpdateChat { target, topic, json }) => {
+            Box::pin(cmd_update_chat(cfg, &target, &topic, json)).await
+        }
         Some(Command::Teams {
             refresh,
             cached,
@@ -528,6 +561,7 @@ async fn dispatch_command(
             offline,
             cached,
             json,
+            compact,
         }) => {
             Box::pin(cmd_read(
                 cfg,
@@ -537,7 +571,7 @@ async fn dispatch_command(
                 thread.as_deref(),
                 offline,
                 cached,
-                json,
+                ReadOutput { json, compact },
             ))
             .await
         }
@@ -547,14 +581,16 @@ async fn dispatch_command(
             limit,
             offline,
             json,
+            compact,
         }) => {
-            Box::pin(cmd_thread(
+            Box::pin(cmd_thread_with_cache(
                 cfg,
                 &channel_target,
                 &root_msg_id,
                 limit,
                 offline,
-                json,
+                false,
+                ReadOutput { json, compact },
             ))
             .await
         }
@@ -657,14 +693,23 @@ async fn dispatch_command(
             target,
             msg_id,
             new_markdown,
+            find,
+            replace,
+            subject,
             thread,
             json,
         }) => {
+            let edit = MessageEdit::from_args(
+                new_markdown.as_deref(),
+                find.as_deref(),
+                replace.as_deref(),
+                subject.as_deref(),
+            )?;
             Box::pin(cmd_edit(
                 cfg,
                 &target,
                 &msg_id,
-                &new_markdown,
+                edit,
                 thread.as_deref(),
                 json,
             ))
@@ -1960,22 +2005,21 @@ fn resolve_team_from_slice(teams: &[TeamSummary], query: &str) -> Result<TeamSum
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReadOutput {
+    json: bool,
+    compact: bool,
+}
+
 fn print_read_output(
     conv: &ConversationSummary,
     res: &ReadMessagesResult,
-    json_out: bool,
+    output: ReadOutput,
 ) -> Result<()> {
-    if json_out {
-        let mut messages = res.messages.clone();
-        hydrate_messages_attachments(&mut messages);
+    if output.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "conversation": conv,
-                "messages": messages,
-                "has_more": res.has_more,
-                "next_before": res.next_before,
-            }))?
+            serde_json::to_string_pretty(&read_messages_json(conv, res, output.compact))?
         );
     } else {
         println!("# {} ({})", conv.title, conv.conv_key);
@@ -2007,10 +2051,10 @@ async fn cmd_read(
     thread: Option<&str>,
     offline: bool,
     cached: bool,
-    json_out: bool,
+    output: ReadOutput,
 ) -> Result<()> {
     if let Some(root_msg_id) = thread.map(str::trim).filter(|s| !s.is_empty()) {
-        return cmd_thread_with_cache(cfg, target, root_msg_id, limit, offline, cached, json_out)
+        return cmd_thread_with_cache(cfg, target, root_msg_id, limit, offline, cached, output)
             .await;
     }
 
@@ -2020,7 +2064,7 @@ async fn cmd_read(
         let cached_convs = storage.list_conversations()?;
         let conv = resolver::resolve_from_slice(&cached_convs, target)?;
         let res = read_conversation_messages_offline(&storage, &conv, limit, before)?;
-        return print_read_output(&conv, &res, json_out);
+        return print_read_output(&conv, &res, output);
     }
 
     let ttl = cli_cache_ttl_secs(cfg);
@@ -2036,7 +2080,7 @@ async fn cmd_read(
                             .flatten()
                             .is_some_and(|c| c.is_history_eof());
                         if res.messages.len() >= limit || is_eof {
-                            return print_read_output(&conv, &res, json_out);
+                            return print_read_output(&conv, &res, output);
                         }
                     } else {
                         let cursor_key = format!("cli:read:{}", conv.conv_key);
@@ -2049,7 +2093,7 @@ async fn cmd_read(
                         {
                             let res = read_conversation_messages_offline(&storage, &conv, limit, None)?;
                             if !res.messages.is_empty() && (cached || res.messages.len() >= limit) {
-                                return print_read_output(&conv, &res, json_out);
+                                return print_read_output(&conv, &res, output);
                             }
                         }
                     }
@@ -2065,18 +2109,7 @@ async fn cmd_read(
         record_cli_sync_cursor(&storage, &format!("cli:read:{}", conv.conv_key));
     }
 
-    print_read_output(&conv, &res, json_out)
-}
-
-async fn cmd_thread(
-    cfg: &AppConfig,
-    channel_target: &str,
-    root_msg_id: &str,
-    limit: usize,
-    offline: bool,
-    json_out: bool,
-) -> Result<()> {
-    cmd_thread_with_cache(cfg, channel_target, root_msg_id, limit, offline, false, json_out).await
+    print_read_output(&conv, &res, output)
 }
 
 async fn cmd_thread_with_cache(
@@ -2086,73 +2119,46 @@ async fn cmd_thread_with_cache(
     limit: usize,
     offline: bool,
     cached: bool,
-    json_out: bool,
+    output: ReadOutput,
 ) -> Result<()> {
     let limit = clamp_limit(limit);
-    if offline || cached {
+    if offline {
+        let storage = open_storage_only(cfg)?;
+        let conv = resolver::resolve_from_slice(&storage.list_conversations()?, channel_target)?;
+        let thread = read_thread_offline(&storage, &conv, root_msg_id, limit)?
+            .ok_or_else(|| thread_cache_miss(root_msg_id, limit))?;
+        return print_thread_output(&conv, &thread, output);
+    }
+    if cached {
         if let Ok(storage) = open_storage_only(cfg) {
             if let Ok(cached_convs) = storage.list_conversations() {
                 if let Ok(conv) = resolver::resolve_from_slice(&cached_convs, channel_target) {
-                    if let Some(mut thread) = storage.get_thread(&conv.conv_key, root_msg_id, limit)? {
-                        hydrate_thread_attachments(&mut thread);
-                        return print_thread_output(&conv, &thread, json_out);
+                    if let Some(thread) = read_thread_offline(&storage, &conv, root_msg_id, limit)? {
+                        return print_thread_output(&conv, &thread, output);
                     }
                 }
             }
         }
-        if offline {
-            bail!("Thread not found in local cache: {root_msg_id}");
-        }
     }
 
-    let (_auth, graph, storage) = open_runtime(cfg, !offline).await?;
-    let conv = resolve_target(&storage, &graph, channel_target, offline).await?;
-
-    let ConversationTarget::Channel {
-        ref team_id,
-        ref channel_id,
-    } = conv.target
-    else {
-        bail!("The `thread` command can only be used in team channels: {}", conv.conv_key);
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let conv = resolve_target(&storage, &graph, channel_target, false).await?;
+    let thread = match read_thread(&storage, &graph, &conv, root_msg_id, limit).await {
+        Ok(thread) => thread,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
     };
-
-    let mut thread = if offline {
-        storage
-            .get_thread(&conv.conv_key, root_msg_id, limit)?
-            .with_context(|| format!("Thread not found in local cache: {root_msg_id}"))?
-    } else {
-        let view = match graph
-            .get_thread(team_id, channel_id, root_msg_id, limit)
-            .await
-        {
-            Ok(v) => v,
-            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
-        };
-        let mut all = Vec::with_capacity(1 + view.replies.len());
-        all.push(view.root.clone());
-        all.extend(view.replies.iter().cloned());
-        storage.upsert_messages(&all)?;
-        view
-    };
-    hydrate_thread_attachments(&mut thread);
-
-    print_thread_output(&conv, &thread, json_out)
+    print_thread_output(&conv, &thread, output)
 }
 
 fn print_thread_output(
     conv: &ConversationSummary,
-    thread: &crate::models::ThreadView,
-    json_out: bool,
+    thread: &ThreadView,
+    output: ReadOutput,
 ) -> Result<()> {
-    if json_out {
-        let mut hydrated = thread.clone();
-        hydrate_thread_attachments(&mut hydrated);
+    if output.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({
-                "conversation": conv,
-                "thread": hydrated,
-            }))?
+            serde_json::to_string_pretty(&thread_json(conv, thread, output.compact))?
         );
     } else {
         println!("# {} ({}) — Thread {}", conv.title, conv.conv_key, thread.root.msg_id);
@@ -2457,30 +2463,42 @@ async fn cmd_react(
     Ok(())
 }
 
+async fn cmd_update_chat(
+    cfg: &AppConfig,
+    target: &str,
+    topic: &str,
+    json_out: bool,
+) -> Result<()> {
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
+    let result = update_group_chat_topic(&storage, &graph, target, topic).await;
+    let chat = match result {
+        Ok(chat) => chat,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "conversation": chat,
+        }))?);
+    } else {
+        println!("Group chat topic updated: {} ({})", chat.title, chat.conv_key);
+    }
+    Ok(())
+}
+
 async fn cmd_edit(
     cfg: &AppConfig,
     target: &str,
     msg_id: &str,
-    new_markdown: &str,
+    edit: MessageEdit<'_>,
     thread: Option<&str>,
     json_out: bool,
 ) -> Result<()> {
-    if new_markdown.trim().is_empty() {
-        bail!("Edited message body is empty.");
-    }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
-    let compiled =
-        parser::compile_outgoing_markdown(new_markdown, None, vec![], vec![], vec![], None);
-    graph
-        .edit_message(&conv.target, msg_id, thread, &compiled.body_html)
-        .await?;
-    let _ = storage.apply_local_edit(
-        &conv.conv_key,
-        msg_id,
-        &compiled.body_html,
-        &Utc::now().to_rfc3339(),
-    );
+    if let Err(err) = edit_sent_message(&storage, &graph, &conv, msg_id, thread, edit).await {
+        return Err(wrap_graph_permission_error(&graph, err).await);
+    }
 
     if json_out {
         println!(
@@ -3106,6 +3124,216 @@ pub(crate) struct ReadMessagesResult {
     pub messages: Vec<MessageItem>,
     pub has_more: bool,
     pub next_before: Option<String>,
+}
+
+pub(crate) enum MessageEdit<'a> {
+    Markdown(&'a str),
+    Text { find: &'a str, replace: &'a str },
+    Subject(&'a str),
+}
+
+impl<'a> MessageEdit<'a> {
+    pub(crate) fn from_args(
+        markdown: Option<&'a str>,
+        find: Option<&'a str>,
+        replace: Option<&'a str>,
+        subject: Option<&'a str>,
+    ) -> Result<Self> {
+        if let Some(subject) = subject {
+            if markdown.is_some() || find.is_some() || replace.is_some() {
+                bail!("Subject edits must be requested on their own.");
+            }
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('\0') {
+                bail!("Subject must be non-empty text without NUL characters.");
+            }
+            return Ok(Self::Subject(subject));
+        }
+        match (markdown, find, replace) {
+            (Some(markdown), None, None) if !markdown.trim().is_empty() => {
+                Ok(Self::Markdown(markdown))
+            }
+            (Some(_), None, None) => bail!("Edited message body is empty."),
+            (None, Some(find), Some(replace)) if !find.is_empty() => {
+                if find.contains('\0') || replace.contains('\0') {
+                    bail!("Find and replacement text must be free of NUL characters.");
+                }
+                Ok(Self::Text { find, replace })
+            }
+            (None, Some(_), Some(_)) => bail!("Find text is empty."),
+            _ => bail!("Choose a full Markdown body, both find and replace text, or a subject."),
+        }
+    }
+}
+
+pub(crate) async fn edit_sent_message(
+    storage: &Storage,
+    graph: &GraphClient,
+    conv: &ConversationSummary,
+    msg_id: &str,
+    parent_msg_id: Option<&str>,
+    edit: MessageEdit<'_>,
+) -> Result<()> {
+    let parent_msg_id = parent_msg_id.filter(|id| !id.trim().is_empty());
+    let saved = match edit {
+        MessageEdit::Markdown(markdown) => {
+            let compiled =
+                parser::compile_outgoing_markdown(markdown, None, vec![], vec![], vec![], None);
+            graph
+                .edit_message(&conv.target, msg_id, parent_msg_id, &compiled.body_html)
+                .await?;
+            let _ = storage.apply_local_edit(
+                &conv.conv_key,
+                msg_id,
+                &compiled.body_html,
+                &Utc::now().to_rfc3339(),
+            );
+            return Ok(());
+        }
+        MessageEdit::Text { find, replace } => graph
+            .replace_message_text(&conv.target, msg_id, parent_msg_id, find, replace)
+            .await?,
+        MessageEdit::Subject(subject) => {
+            if parent_msg_id.is_some() {
+                bail!("Subject edits require a channel root post.");
+            }
+            graph.edit_channel_post_subject(&conv.target, msg_id, subject).await?
+        }
+    };
+    storage.upsert_messages(&[saved]).context(
+        "Graph returned the edited message, but updating the local cache failed",
+    )?;
+    Ok(())
+}
+
+pub(crate) async fn update_group_chat_topic(
+    storage: &Storage,
+    graph: &GraphClient,
+    target: &str,
+    topic: &str,
+) -> Result<ConversationSummary> {
+    let topic = topic.trim();
+    if topic.is_empty() || topic.contains([':', '\0']) || topic.chars().count() > 250 {
+        bail!("Group chat topic must contain 1 to 250 characters and cannot contain colons or NUL characters.");
+    }
+    let conv = resolve_target(storage, graph, target, false).await?;
+    let ConversationTarget::Chat { chat_id } = conv.target else {
+        bail!("Chat topic changes require an existing group chat.");
+    };
+    let updated = graph.update_group_chat_topic(&chat_id, topic).await?;
+    storage.save_updated_chat_topic(&updated).context(
+        "Graph returned the updated group chat topic, but updating the local cache failed",
+    )
+}
+
+fn compact_conversation(conv: &ConversationSummary) -> serde_json::Value {
+    json!({ "conv_key": conv.conv_key, "title": conv.title })
+}
+
+fn compact_message(msg: &MessageItem) -> serde_json::Value {
+    let mut value = json!({
+        "msg_id": msg.msg_id,
+        "author_id": msg.author_id,
+        "author_name": msg.author_name,
+        "created_at": msg.created_at,
+        "body_plain": msg.body_plain,
+    });
+    for (key, value_if_present) in [
+        ("last_modified_at", &msg.last_modified_at),
+        ("parent_msg_id", &msg.parent_msg_id),
+        ("reply_to_id", &msg.reply_to_id),
+    ] {
+        if let Some(text) = value_if_present {
+            value[key] = json!(text);
+        }
+    }
+    if !msg.attachments.is_empty() {
+        value["attachments"] = serde_json::Value::Array(
+            msg.attachments
+                .iter()
+                .map(|att| json!({ "id": att.id, "name": att.name }))
+                .collect(),
+        );
+    }
+    value
+}
+
+pub(crate) fn read_messages_json(
+    conv: &ConversationSummary,
+    res: &ReadMessagesResult,
+    compact: bool,
+) -> serde_json::Value {
+    let (conversation, messages) = if compact {
+        (
+            compact_conversation(conv),
+            serde_json::Value::Array(res.messages.iter().map(compact_message).collect()),
+        )
+    } else {
+        (json!(conv), json!(res.messages))
+    };
+    json!({
+        "conversation": conversation,
+        "messages": messages,
+        "has_more": res.has_more,
+        "next_before": res.next_before,
+    })
+}
+
+pub(crate) fn thread_json(
+    conv: &ConversationSummary,
+    thread: &ThreadView,
+    compact: bool,
+) -> serde_json::Value {
+    if compact {
+        let replies: Vec<_> = thread.replies.iter().map(compact_message).collect();
+        json!({
+            "conversation": compact_conversation(conv),
+            "thread": { "root": compact_message(&thread.root), "replies": replies },
+        })
+    } else {
+        json!({ "conversation": conv, "thread": thread })
+    }
+}
+
+pub(crate) fn read_thread_offline(
+    storage: &Storage,
+    conv: &ConversationSummary,
+    root_msg_id: &str,
+    limit: usize,
+) -> Result<Option<ThreadView>> {
+    if !matches!(conv.target, ConversationTarget::Channel { .. }) {
+        bail!("Thread reads require a team channel target: {}", conv.conv_key);
+    }
+    let mut thread = storage.get_fetched_thread(&conv.conv_key, root_msg_id, limit)?;
+    if let Some(view) = thread.as_mut() {
+        hydrate_thread_attachments(view);
+    }
+    Ok(thread)
+}
+
+pub(crate) fn thread_cache_miss(root_msg_id: &str, limit: usize) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Thread not found in local cache at reply limit {limit}: {root_msg_id}. \
+         Read the thread online to cache the requested replies."
+    )
+}
+
+pub(crate) async fn read_thread(
+    storage: &Storage,
+    graph: &GraphClient,
+    conv: &ConversationSummary,
+    root_msg_id: &str,
+    limit: usize,
+) -> Result<ThreadView> {
+    let ConversationTarget::Channel { team_id, channel_id } = &conv.target else {
+        bail!("Thread reads require a team channel target: {}", conv.conv_key);
+    };
+    let (mut thread, complete) = graph
+        .get_thread_with_coverage(team_id, channel_id, root_msg_id, limit)
+        .await?;
+    storage.save_fetched_thread(&thread, complete)?;
+    hydrate_thread_attachments(&mut thread);
+    Ok(thread)
 }
 
 pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
@@ -3872,6 +4100,7 @@ mod tests {
                 offline,
                 cached,
                 json,
+                compact,
             } => {
                 assert_eq!(target, "Engineering/General");
                 assert_eq!(limit, 30);
@@ -3880,6 +4109,7 @@ mod tests {
                 assert!(!offline);
                 assert!(!cached);
                 assert!(!json);
+                assert!(!compact);
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -4006,6 +4236,44 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_compact_reads_and_exclusive_edit_modes() {
+        let edit = Cli::try_parse_from([
+            "teams", "edit", "chan:t:c", "m1", "--find", "text", "--replace=",
+        ])
+        .unwrap();
+        assert!(matches!(
+            edit.command,
+            Some(Command::Edit { new_markdown: None, find: Some(_), replace: Some(ref value), .. })
+                if value.is_empty()
+        ));
+        assert!(Cli::try_parse_from(["teams", "edit", "chat:c", "m1", "Markdown"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "teams", "edit", "chan:t:c", "m1", "--subject", "New title",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "teams", "edit", "chan:t:c", "m1", "--thread", "root", "--subject", "New title",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "teams", "update-chat", "chat:c", "--topic", "New topic", "--json",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "teams", "edit", "chat:c", "m1", "Markdown", "--find", "old", "--replace", "new",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["teams", "edit", "chat:c", "m1", "--find", "old"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["teams", "read", "chat:c", "--compact"]).is_err());
+        assert!(Cli::try_parse_from([
+            "teams", "thread", "chan:t:c", "m1", "--json", "--compact",
+        ])
+        .is_ok());
     }
 
     #[test]

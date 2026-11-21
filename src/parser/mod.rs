@@ -1,6 +1,7 @@
 //! Bidirectional parser between Teams HTML / Adaptive Cards, Plain Text / Markdown, and Rich Terminal AST.
 
 pub mod card_in;
+pub(crate) mod edit_text;
 pub mod html_in;
 pub mod md_out;
 

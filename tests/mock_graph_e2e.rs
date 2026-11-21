@@ -38,6 +38,20 @@ use teams_cli::{
 static INIT_TEST_ENV: Once = Once::new();
 static TEST_CONFIG_DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
 
+#[cfg(windows)]
+#[test]
+fn windows_cli_starts_and_reports_its_version() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+        .arg("--version")
+        .output()
+        .expect("start Windows CLI");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        format!("teams {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
 fn ensure_isolated_env() {
     INIT_TEST_ENV.call_once(|| {
         let dir = tempfile::tempdir().expect("create shared test config tempdir");
@@ -99,6 +113,7 @@ struct MockState {
     me_auth_headers: RwLock<Vec<String>>,
     next_msg_seq: RwLock<u64>,
     chat_messages: RwLock<HashMap<String, Vec<StoredChatMsg>>>,
+    group_topic: RwLock<Option<String>>,
     channel_messages: RwLock<HashMap<(String, String), Vec<StoredChatMsg>>>,
     channel_replies: RwLock<HashMap<(String, String, String), Vec<StoredChatMsg>>>,
     uploaded_files: RwLock<HashMap<String, Vec<u8>>>,
@@ -260,7 +275,56 @@ async fn list_chats_handler(State(state): State<Arc<MockState>>, headers: Header
     if let Err(resp) = state.check_bearer(&headers) {
         return resp;
     }
-    Json(json!({ "value": mock_chats_payload() })).into_response()
+    let mut chats = mock_chats_payload();
+    if let Some(topic) = state.group_topic.read().unwrap().as_ref() {
+        chats[1]["topic"] = json!(topic);
+    }
+    Json(json!({ "value": chats })).into_response()
+}
+
+async fn get_chat_handler(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    Path(chat_id): Path<String>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let Some(mut chat) = mock_chats_payload().into_iter().find(|chat| chat["id"] == chat_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if chat["chatType"] == "group" {
+        if let Some(topic) = state.group_topic.read().unwrap().as_ref() {
+            chat["topic"] = json!(topic);
+        }
+    }
+    Json(chat).into_response()
+}
+
+async fn patch_chat_handler(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    Path(chat_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let Some(mut chat) = mock_chats_payload()
+        .into_iter()
+        .find(|chat| chat["id"] == chat_id && chat["chatType"] == "group")
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(topic) = payload["topic"].as_str() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if payload != json!({"topic": topic}) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    *state.group_topic.write().unwrap() = Some(topic.to_string());
+    chat["topic"] = json!(topic);
+    Json(chat).into_response()
 }
 
 async fn list_chat_messages_handler(
@@ -465,6 +529,35 @@ async fn get_channel_root_handler(
         Some(m) => Json(m.to_graph_json(None)).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({ "error": { "code": "NotFound", "message": "missing root" } }))).into_response(),
     }
+}
+
+async fn patch_channel_root_handler(
+    State(state): State<Arc<MockState>>,
+    headers: HeaderMap,
+    Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if let Err(resp) = state.check_bearer(&headers) {
+        return resp;
+    }
+    let mut messages = state.channel_messages.write().unwrap();
+    let Some(message) = messages
+        .get_mut(&(team_id, channel_id))
+        .and_then(|list| list.iter_mut().find(|msg| msg.id == root_id))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(subject) = payload["subject"].as_str() {
+        if payload != json!({"subject": subject}) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        message.subject = Some(subject.to_string());
+    } else if let Some(content) = payload.pointer("/body/content").and_then(Value::as_str) {
+        message.body_html = content.to_string();
+    } else {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn list_channel_replies_handler(
@@ -683,6 +776,7 @@ async fn spawn_mock_graph_server(initial_token: &str) -> (String, Arc<MockState>
         .route("/{tenant}/oauth2/v2.0/token", post(oauth_token_handler))
         .route("/v1.0/me", get(get_me_handler))
         .route("/v1.0/me/chats", get(list_chats_handler))
+        .route("/v1.0/chats/{chat_id}", get(get_chat_handler).patch(patch_chat_handler))
         .route(
             "/v1.0/chats/{chat_id}/messages",
             get(list_chat_messages_handler).post(post_chat_message_handler),
@@ -695,7 +789,7 @@ async fn spawn_mock_graph_server(initial_token: &str) -> (String, Arc<MockState>
         )
         .route(
             "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}",
-            get(get_channel_root_handler),
+            get(get_channel_root_handler).patch(patch_channel_root_handler),
         )
         .route(
             "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}/replies",
@@ -874,9 +968,13 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
     );
 
     let chan_post = parser::compile_outgoing_markdown(
-        "Starting production v2.4.0 deployment.",
+        "**Starting production** v2.4.0 deployment. [Runbook](https://example.test/ops) @Alice",
         Some("v2.4.0 Release Notice".to_string()),
-        vec![],
+        vec![MentionInfo {
+            id: 0,
+            user_id: "peer-kim".to_string(),
+            display_name: "Alice".to_string(),
+        }],
         vec![],
         vec![],
         None,
@@ -1066,6 +1164,13 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
             }
         }
     });
+    let mut cold_thread_req = get_thread_req.clone();
+    cold_thread_req["params"]["arguments"]["offline"] = json!(true);
+    let cold_thread = mcp::handle_rpc_line(&cfg, &graph, &storage, &cold_thread_req.to_string())
+        .await
+        .expect("unverified offline thread response");
+    assert_eq!(cold_thread["result"]["isError"], true);
+
     let get_thread_resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &get_thread_req.to_string())
         .await
         .expect("mcp get_thread response");
@@ -1075,6 +1180,111 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
         .expect("get_thread text");
     assert!(thread_text.contains("v2.4.0 Release Notice"));
     assert!(thread_text.contains("Canary health check passed."));
+
+    let mut offline_req = get_thread_req.clone();
+    let arguments = &mut offline_req["params"]["arguments"];
+    arguments["offline"] = json!(true);
+    arguments["compact"] = json!(true);
+    arguments["limit"] = json!(1);
+    let offline_resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &offline_req.to_string())
+        .await
+        .expect("offline compact get_thread response");
+    assert_eq!(offline_resp["result"]["isError"], false, "{offline_resp}");
+    let compact: Value = serde_json::from_str(
+        offline_resp["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(compact["conversation"]["conv_key"], deploy_chan.conv_key);
+    assert_eq!(compact["thread"]["root"]["msg_id"], root_msg.msg_id);
+    assert_eq!(compact["thread"]["root"]["body_plain"], root_msg.body_plain);
+    assert!(compact["thread"]["root"].get("body_html").is_none());
+    assert_eq!(compact["thread"]["replies"].as_array().unwrap().len(), 1);
+    assert_eq!(compact["thread"]["replies"][0]["msg_id"], sent_chan_file.msg_id);
+    assert_eq!(compact["thread"]["replies"][0]["parent_msg_id"], root_msg.msg_id);
+
+    offline_req["params"]["arguments"]["root_msg_id"] = json!("missing");
+    let cache_miss = mcp::handle_rpc_line(&cfg, &graph, &storage, &offline_req.to_string())
+        .await
+        .expect("offline get_thread cache miss");
+    assert_eq!(cache_miss["result"]["isError"], true);
+    assert!(cache_miss["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Thread not found in local cache"));
+
+    let before_edit = storage
+        .get_thread(&deploy_chan.conv_key, &root_msg.msg_id, 50)
+        .unwrap()
+        .unwrap();
+    let edit_req = json!({
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {
+            "name": "edit_message",
+            "arguments": {
+                "target": deploy_chan.conv_key, "msg_id": root_msg.msg_id,
+                "find": "Starting production", "replace": "Ready <QA>",
+            }
+        }
+    });
+    let edited = mcp::handle_rpc_line(&cfg, &graph, &storage, &edit_req.to_string())
+        .await
+        .expect("partial edit response");
+    assert_eq!(edited["result"]["isError"], false, "{edited}");
+    let edited_thread = storage
+        .get_thread(&deploy_chan.conv_key, &root_msg.msg_id, 50)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edited_thread.root.body_html,
+        root_msg.body_html.replace("Starting production", "Ready &lt;QA&gt;")
+    );
+    assert_eq!(edited_thread.root.subject, root_msg.subject);
+    assert_eq!(edited_thread.replies, before_edit.replies);
+
+    let subject_req = json!({
+        "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+        "params": {
+            "name": "edit_message", "arguments": {
+                "target": deploy_chan.conv_key,
+                "msg_id": root_msg.msg_id,
+                "subject": "Release title <QA>"
+            }
+        }
+    });
+    let result = mcp::handle_rpc_line(&cfg, &graph, &storage, &subject_req.to_string())
+        .await
+        .unwrap();
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    let titled_thread = storage
+        .get_thread(&deploy_chan.conv_key, &root_msg.msg_id, 50)
+        .unwrap()
+        .unwrap();
+    let mut expected_root = edited_thread.root;
+    assert_eq!(expected_root.mentions.len(), 1);
+    expected_root.subject = Some("Release title <QA>".to_string());
+    assert_eq!(titled_thread.root, expected_root);
+    assert_eq!(titled_thread.replies, edited_thread.replies);
+
+    storage.set_conversation_pinned(&group_chat.conv_key, true).unwrap();
+    storage.increment_conversation_unread(&group_chat.conv_key, 2).unwrap();
+    let mut expected_chat = storage.get_conversation(&group_chat.conv_key).unwrap().unwrap();
+    let update_topic_req = json!({
+        "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+        "params": {
+            "name": "update_chat",
+            "arguments": { "target": group_chat.conv_key, "topic": "Release group" }
+        }
+    });
+    let result = mcp::handle_rpc_line(&cfg, &graph, &storage, &update_topic_req.to_string())
+        .await
+        .unwrap();
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    expected_chat.title = "Release group".to_string();
+    expected_chat.topic = Some(expected_chat.title.clone());
+    assert_eq!(
+        storage.get_conversation(&group_chat.conv_key).unwrap().unwrap(),
+        expected_chat
+    );
 
     // delete_message without confirm: true must be rejected
     let delete_missing_confirm = json!({

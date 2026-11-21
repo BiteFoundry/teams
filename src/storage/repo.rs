@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use crate::models::{
@@ -83,6 +83,30 @@ pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]
     }
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) fn save_updated_chat_topic(
+    conn: &mut Connection,
+    chat: &ConversationSummary,
+) -> Result<ConversationSummary> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "INSERT INTO conversations (conv_key, target_json, kind, title, topic, last_updated_at, web_url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(conv_key) DO UPDATE SET title = excluded.title, topic = excluded.topic",
+        params![
+            chat.conv_key,
+            serde_json::to_string(&chat.target)?,
+            chat.kind.as_str(),
+            chat.title,
+            chat.topic,
+            chat.last_updated_at,
+            chat.web_url,
+        ],
+    )?;
+    let saved = get_conversation(&tx, &chat.conv_key)?.context("Updated chat is missing from the cache")?;
+    tx.commit()?;
+    Ok(saved)
 }
 
 pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> {
@@ -329,7 +353,7 @@ fn upsert_messages_in_transaction(
             "
             SELECT
                 last_modified_at, deleted, reply_count, reactions_json, body_plain, author_name, subject,
-                attachments_json, mentions_json, parent_msg_id
+                attachments_json, mentions_json, body_html = ?2, parent_msg_id
             FROM messages
             WHERE msg_key = ?1
             ",
@@ -409,9 +433,10 @@ fn upsert_messages_in_transaction(
                 Option<String>,
                 String,
                 String,
+                bool,
                 Option<String>,
             )> = check_stmt
-                .query_row(params![msg_key.as_ref()], |row| {
+                .query_row(params![msg_key.as_ref(), &msg.body_html], |row| {
                     Ok((
                         row.get(0)?,
                         row.get(1)?,
@@ -423,6 +448,7 @@ fn upsert_messages_in_transaction(
                         row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
+                        row.get(10)?,
                     ))
                 })
                 .optional()?;
@@ -441,6 +467,7 @@ fn upsert_messages_in_transaction(
                 ref ex_subject,
                 ref ex_attachments_json,
                 ref ex_mentions_json,
+                body_html_same,
                 _,
             )) = existing
             {
@@ -451,6 +478,7 @@ fn upsert_messages_in_transaction(
                     && ex_deleted == deleted_int
                     && reply_count_i64 <= ex_reply_count
                     && *ex_body_plain == msg.body_plain
+                    && body_html_same
                     && effective_author_same
                     && *ex_subject == msg.subject;
                 if scalars_unchanged {
@@ -839,6 +867,70 @@ pub fn get_thread(
         return Ok(None);
     };
     let replies = list_thread_replies(conn, conv_key, root_msg_id, limit)?;
+    Ok(Some(ThreadView {
+        conv_key: conv_key.to_string(),
+        root,
+        replies,
+    }))
+}
+
+pub(crate) fn save_fetched_thread(
+    conn: &mut Connection,
+    thread: &ThreadView,
+    complete: bool,
+) -> Result<()> {
+    let messages: Vec<_> = std::iter::once(&thread.root)
+        .chain(&thread.replies)
+        .cloned()
+        .collect();
+    let reply_ids: Vec<_> = thread.replies.iter().map(|reply| &reply.msg_id).collect();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    upsert_messages_in_transaction(&tx, &messages, None)?;
+    tx.execute(
+        "INSERT INTO thread_reply_windows (conv_key, root_msg_id, reply_ids_json, complete)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(conv_key, root_msg_id) DO UPDATE SET
+             reply_ids_json = excluded.reply_ids_json, complete = excluded.complete",
+        params![thread.conv_key, thread.root.msg_id, serde_json::to_string(&reply_ids)?, complete],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn get_fetched_thread(
+    conn: &Connection,
+    conv_key: &str,
+    root_msg_id: &str,
+    limit: usize,
+) -> Result<Option<ThreadView>> {
+    let tx = conn.unchecked_transaction()?;
+    let window: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT reply_ids_json, complete FROM thread_reply_windows
+             WHERE conv_key = ?1 AND root_msg_id = ?2",
+            params![conv_key, root_msg_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((reply_ids_json, complete)) = window else {
+        return Ok(None);
+    };
+    let ids: Vec<String> = serde_json::from_str(&reply_ids_json)?;
+    if !complete && ids.len() < limit {
+        return Ok(None);
+    }
+    let Some(mut root) = get_message(&tx, conv_key, root_msg_id)? else {
+        return Ok(None);
+    };
+    if complete {
+        root.reply_count = ids.len();
+    }
+    let requested_ids = &ids[ids.len().saturating_sub(limit)..];
+    let replies = get_messages_by_ids(&tx, conv_key, requested_ids)?;
+    if replies.len() != requested_ids.len() {
+        return Ok(None);
+    }
+    tx.commit()?;
     Ok(Some(ThreadView {
         conv_key: conv_key.to_string(),
         root,

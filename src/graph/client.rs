@@ -204,18 +204,27 @@ impl GraphClient {
         path_or_url: &str,
         body: &B,
     ) -> Result<()> {
+        self.patch_json_with_headers(path_or_url, body, &[]).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn patch_json_with_headers<B: Serialize + ?Sized>(
+        &self,
+        path_or_url: &str,
+        body: &B,
+        headers: &[(&str, String)],
+    ) -> Result<reqwest::Response> {
         let url = self.resolve_url(path_or_url);
         let json_val = serde_json::to_value(body)?;
         self.execute_with_retry(
             Method::PATCH,
             &url,
             RequestBody::Json(json_val),
-            &[],
+            headers,
             true,
             STANDARD_REQUEST_TIMEOUT,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn post_empty(&self, path_or_url: &str) -> Result<()> {
@@ -676,7 +685,7 @@ impl GraphIdentitySet {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct GraphItemBody {
     #[serde(rename = "contentType", default)]
-    pub _content_type: Option<String>,
+    pub content_type: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
 }
@@ -719,6 +728,8 @@ pub(crate) struct GraphReaction {
 pub(crate) struct GraphChatMessage {
     #[serde(default)]
     pub id: String,
+    #[serde(default)]
+    pub etag: Option<String>,
     #[serde(rename = "replyToId", default)]
     pub reply_to_id: Option<String>,
     #[serde(rename = "messageType", default)]

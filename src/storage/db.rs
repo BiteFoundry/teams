@@ -3,8 +3,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 52;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 53;
+const FIRST_PURE_TEAMS_SCHEMA_VERSION: i32 = 52;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 54;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 55;
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -39,6 +40,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             let intact: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')
+                     AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_reply_windows')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_conv_root_created_id')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_has_mentions')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_conversations_sort_v2')",
@@ -50,7 +52,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 return Ok(user_version == SCHEMA_USER_VERSION_TRIGRAM);
             }
         }
-        if user_version < SCHEMA_USER_VERSION_UNICODE61 {
+        if user_version < FIRST_PURE_TEAMS_SCHEMA_VERSION {
             conn.execute_batch(
                 "
                 DROP TABLE IF EXISTS mail_fts;
@@ -165,6 +167,14 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             delta_link TEXT,
             oldest_msg_ts TEXT,
             synced_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_reply_windows (
+            conv_key TEXT NOT NULL,
+            root_msg_id TEXT NOT NULL,
+            reply_ids_json TEXT NOT NULL,
+            complete INTEGER NOT NULL,
+            PRIMARY KEY (conv_key, root_msg_id)
         );
         ",
     )
@@ -350,6 +360,7 @@ mod tests {
                 "members",
                 "presences",
                 "sync_cursors",
+                "thread_reply_windows",
                 "messages_fts",
             ] {
                 assert!(table_exists(&conn, required), "{required} should exist");

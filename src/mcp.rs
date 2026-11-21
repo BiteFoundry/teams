@@ -20,7 +20,6 @@ use crate::{
     models::{ConversationSummary, ConversationTarget, MentionInfo},
     parser, resolver,
     storage::Storage,
-    sync,
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
@@ -134,21 +133,6 @@ async fn resolve_target_mcp(
 
 /// Run the stdio MCP server until stdin reaches EOF.
 pub async fn run(config: AppConfig, graph: GraphClient, storage: Storage) -> Result<()> {
-    let is_empty = with_storage(&storage, |s| Ok(s.list_conversations()?.is_empty()))
-        .await
-        .unwrap_or(false);
-    if is_empty {
-        let bg_graph = graph.clone();
-        let bg_storage = storage.clone();
-        tokio::spawn(async move {
-            if let Err(err) = sync::bootstrap_conversations(&bg_graph, &bg_storage).await {
-                eprintln!(
-                    "{SERVER_NAME} MCP warning: initial conversation bootstrap failed: {err:#}"
-                );
-            }
-        });
-    }
-
     eprintln!(
         "{SERVER_NAME} MCP server ready (protocol {LATEST_PROTOCOL_VERSION}, user_id={})",
         graph.my_user_id().unwrap_or("unknown")
@@ -317,6 +301,17 @@ async fn call_tool(
             }))
         }
 
+        "update_chat" => {
+            let target = args.required_str("target")?;
+            let topic = args.required_text("topic")?;
+            let chat = map_graph_result(
+                graph,
+                cli::update_group_chat_topic(storage, graph, &target, &topic).await,
+            )
+            .await?;
+            Ok(json!({ "ok": true, "conversation": chat }))
+        }
+
         "list_teams_channels" => {
             let refresh = args.optional_bool("refresh")?.unwrap_or(false);
             let cached = with_storage(storage, |s| s.list_teams())
@@ -354,6 +349,7 @@ async fn call_tool(
             )?;
             let before = args.optional_str("before")?;
             let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(false);
 
             let conv = resolve_target_mcp(storage, graph, &target, offline).await?;
 
@@ -387,12 +383,7 @@ async fn call_tool(
                 .await?
             };
 
-            Ok(json!({
-                "conversation": conv,
-                "messages": res.messages,
-                "has_more": res.has_more,
-                "next_before": res.next_before,
-            }))
+            Ok(cli::read_messages_json(&conv, &res, compact))
         }
 
         "get_thread" => {
@@ -405,40 +396,26 @@ async fn call_tool(
                 1_000,
             )?;
 
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let ConversationTarget::Channel {
-                ref team_id,
-                ref channel_id,
-            } = conv.target
-            else {
-                return Err(format!(
-                    "get_thread requires a team channel target, got {}",
-                    conv.conv_key
-                ));
+            let offline = args.optional_bool("offline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(false);
+            let conv = resolve_target_mcp(storage, graph, &target, offline).await?;
+
+            let thread = if offline {
+                let conv = conv.clone();
+                let root_id = root_msg_id.clone();
+                with_storage(storage, move |s| cli::read_thread_offline(s, &conv, &root_id, limit))
+                    .await
+                    .map_err(format_error)?
+                    .ok_or_else(|| format_error(cli::thread_cache_miss(&root_msg_id, limit)))?
+            } else {
+                map_graph_result(
+                    graph,
+                    cli::read_thread(storage, graph, &conv, &root_msg_id, limit).await,
+                )
+                .await?
             };
 
-            let mut thread = map_graph_result(
-                graph,
-                graph
-                    .get_thread(team_id, channel_id, &root_msg_id, limit)
-                    .await,
-            )
-            .await?;
-            let mut all = Vec::with_capacity(1 + thread.replies.len());
-            all.push(thread.root.clone());
-            all.extend(thread.replies.iter().cloned());
-            with_storage(storage, move |s| {
-                s.upsert_messages(&all)?;
-                Ok(())
-            })
-            .await
-            .map_err(format_error)?;
-            cli::hydrate_thread_attachments(&mut thread);
-
-            Ok(json!({
-                "conversation": conv,
-                "thread": thread,
-            }))
+            Ok(cli::thread_json(&conv, &thread, compact))
         }
 
         "send_message" => {
@@ -636,39 +613,16 @@ async fn call_tool(
         "edit_message" => {
             let target = args.required_str("target")?;
             let msg_id = args.required_str("msg_id")?;
-            let markdown = args.required_text("markdown")?;
+            let edit = args.message_edit()?;
             let thread_root_id = args.optional_str("thread_root_id")?;
 
             let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            let compiled = parser::compile_outgoing_markdown(
-                &markdown,
-                None,
-                vec![],
-                vec![],
-                vec![],
-                None,
-            );
             map_graph_result(
                 graph,
-                graph
-                    .edit_message(
-                        &conv.target,
-                        &msg_id,
-                        thread_root_id.as_deref(),
-                        &compiled.body_html,
-                    )
+                cli::edit_sent_message(storage, graph, &conv, &msg_id, thread_root_id.as_deref(), edit)
                     .await,
             )
             .await?;
-
-            let ck = conv.conv_key.clone();
-            let mid = msg_id.clone();
-            let html = compiled.body_html.clone();
-            let now = chrono::Utc::now().to_rfc3339();
-            let _ = with_storage(storage, move |s| {
-                s.apply_local_edit(&ck, &mid, &html, &now).map(|_| ())
-            })
-            .await;
 
             Ok(json!({
                 "ok": true,
@@ -758,9 +712,12 @@ async fn call_tool(
             let target = args.required_str("target")?;
             let conv = resolve_target_mcp(storage, graph, &target, false).await?;
 
-            if let ConversationTarget::Chat { ref chat_id } = conv.target {
+            let scope = if let ConversationTarget::Chat { ref chat_id } = conv.target {
                 map_graph_result(graph, graph.mark_chat_read(chat_id).await).await?;
-            }
+                "server_and_local_cache"
+            } else {
+                "local_cache"
+            };
             let now = chrono::Utc::now().to_rfc3339();
             let conv_key = conv.conv_key.clone();
             with_storage(storage, move |s| s.mark_conversation_read(&conv_key, &now))
@@ -770,6 +727,7 @@ async fn call_tool(
             Ok(json!({
                 "ok": true,
                 "conv_key": conv.conv_key,
+                "scope": scope,
             }))
         }
 
@@ -980,6 +938,19 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "update_chat",
+            "description": "Change an existing group chat's topic. Requires delegated Chat.ReadWrite and access to the group chat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "description": "Group chat conv_key, chat ID, or title." },
+                    "topic": { "type": "string", "minLength": 1, "maxLength": 250, "pattern": "^[^:]+$", "description": "New group chat topic." }
+                },
+                "required": ["target", "topic"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "list_teams_channels",
             "description": "List joined Microsoft Teams and their channels. Set refresh=true to sync from Microsoft Graph first.",
             "inputSchema": {
@@ -992,14 +963,15 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_messages",
-            "description": "Read messages from a chat or team channel, oldest first. Supports pagination into older history via optional before (ISO-8601 timestamp, YYYY-MM-DD, or msg_id) and limit.",
+            "description": "Read messages from a chat or team channel, oldest first. Use before and limit to page through older history.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to read older messages preceding it." },
-                    "offline": { "type": "boolean", "default": false, "description": "Read from local SQLite cache without hitting Graph." }
+                    "offline": { "type": "boolean", "default": false, "description": "Read from the local SQLite cache." },
+                    "compact": { "type": "boolean", "default": false, "description": "Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names." }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -1007,13 +979,15 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_thread",
-            "description": "Fetch a team channel root post and all replies in its thread.",
+            "description": "Read a channel root post and up to limit replies, oldest first. The root is included separately.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "Channel conv_key, \"Team/Channel\", or unique channel title." },
                     "root_msg_id": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
+                    "offline": { "type": "boolean", "default": false, "description": "Read verified replies from the local SQLite cache. A cache miss or insufficient reply coverage returns an error." },
+                    "compact": { "type": "boolean", "default": false, "description": "Return message IDs, authors, timestamps, plain text, reply links, and attachment IDs/names." }
                 },
                 "required": ["target", "root_msg_id"],
                 "additionalProperties": false
@@ -1101,16 +1075,24 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "edit_message",
-            "description": "Edit an existing message sent by the current user.",
+            "description": "Edit a message you sent. Use markdown to replace the entire body, find and replace to change one phrase, or subject to change the title of a channel root post. Graph enforces delegated permissions and Teams messaging policy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string" },
                     "msg_id": { "type": "string", "minLength": 1 },
-                    "markdown": { "type": "string", "minLength": 1 },
+                    "markdown": { "type": "string", "minLength": 1, "description": "Markdown to replace the entire message body." },
+                    "find": { "type": "string", "minLength": 1, "description": "Exact phrase occurring once in a single editable text node." },
+                    "replace": { "type": "string", "description": "Literal replacement text. An empty string removes the phrase." },
+                    "subject": { "type": "string", "minLength": 1, "description": "New plain-text title for a channel root post you sent." },
                     "thread_root_id": { "type": "string" }
                 },
-                "required": ["target", "msg_id", "markdown"],
+                "required": ["target", "msg_id"],
+                "oneOf": [
+                    { "required": ["markdown"], "not": { "anyOf": [{ "required": ["find"] }, { "required": ["replace"] }, { "required": ["subject"] }] } },
+                    { "required": ["find", "replace"], "not": { "anyOf": [{ "required": ["markdown"] }, { "required": ["subject"] }] } },
+                    { "required": ["subject"], "not": { "anyOf": [{ "required": ["markdown"] }, { "required": ["find"] }, { "required": ["replace"] }, { "required": ["thread_root_id"] }] } }
+                ],
                 "additionalProperties": false
             }
         }),
@@ -1157,7 +1139,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "mark_read",
-            "description": "Mark a chat or conversation as read.",
+            "description": "Mark a chat read on Graph and in the local cache. A channel updates the local cache.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1239,10 +1221,16 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.required_str_array("members")?;
             args.optional_str("topic")?;
         }
+        "update_chat" => {
+            args.reject_unknown(&["target", "topic"])?;
+            args.required_str("target")?;
+            args.required_text("topic")?;
+        }
         "list_teams_channels" => {
             args.optional_bool("refresh")?;
         }
         "get_messages" => {
+            args.reject_unknown(&["target", "limit", "before", "offline", "compact"])?;
             args.required_str("target")?;
             bounds(
                 "limit",
@@ -1252,8 +1240,10 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             )?;
             args.optional_str("before")?;
             args.optional_bool("offline")?;
+            args.optional_bool("compact")?;
         }
         "get_thread" => {
+            args.reject_unknown(&["target", "root_msg_id", "limit", "offline", "compact"])?;
             args.required_str("target")?;
             args.required_str("root_msg_id")?;
             bounds(
@@ -1262,6 +1252,8 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
                 1,
                 1_000,
             )?;
+            args.optional_bool("offline")?;
+            args.optional_bool("compact")?;
         }
         "send_message" => {
             args.required_str("target")?;
@@ -1300,9 +1292,12 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_str("thread_root_id")?;
         }
         "edit_message" => {
+            args.reject_unknown(&[
+                "target", "msg_id", "markdown", "find", "replace", "subject", "thread_root_id",
+            ])?;
             args.required_str("target")?;
             args.required_str("msg_id")?;
-            args.required_text("markdown")?;
+            args.message_edit()?;
             args.optional_str("thread_root_id")?;
         }
         "delete_message" => {
@@ -1362,6 +1357,27 @@ impl<'a> Args<'a> {
         self.value
             .as_object()
             .ok_or_else(|| "arguments must be a JSON object".to_string())
+    }
+
+    fn reject_unknown(&self, allowed: &[&str]) -> Result<(), String> {
+        if let Some(key) = self.object()?.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(format!("unsupported argument: {key}"));
+        }
+        Ok(())
+    }
+
+    fn message_edit(&self) -> Result<cli::MessageEdit<'a>, String> {
+        let text = |key| match self.object()?.get(key) {
+            None => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.as_str())),
+            Some(_) => Err(format!("{key} must be a string")),
+        };
+        let subject = text("subject")?;
+        if subject.is_some() && self.object()?.contains_key("thread_root_id") {
+            return Err("Subject edits require a channel root post.".to_string());
+        }
+        cli::MessageEdit::from_args(text("markdown")?, text("find")?, text("replace")?, subject)
+            .map_err(format_error)
     }
 
     fn optional_str(&self, key: &str) -> Result<Option<String>, String> {
@@ -1624,6 +1640,7 @@ mod tests {
             vec![
                 "list_chats",
                 "create_chat",
+                "update_chat",
                 "list_teams_channels",
                 "get_messages",
                 "get_thread",
@@ -1757,6 +1774,46 @@ mod tests {
             &json!({ "availability": "Offline" })
         )
         .is_err());
+    }
+
+    #[test]
+    fn edited_and_compact_tools_validate_their_options() {
+        for arguments in [
+            json!({"target": "chat:c", "msg_id": "m", "markdown": "Full"}),
+            json!({"target": "chat:c", "msg_id": "m", "find": "old", "replace": ""}),
+            json!({"target": "chan:t:c", "msg_id": "m", "subject": "New title"}),
+        ] {
+            validate_tool_args("edit_message", &arguments).unwrap();
+        }
+        for arguments in [
+            json!({"target": "chat:c", "msg_id": "m", "markdown": "Full", "subject": "title"}),
+            json!({"target": "chat:c", "msg_id": "m", "markdown": "Full", "find": "old", "replace": ""}),
+            json!({"target": "chat:c", "msg_id": "m", "find": "old"}),
+            json!({"target": "chat:c", "msg_id": "m", "find": "", "replace": "new"}),
+            json!({"target": "chat:c", "msg_id": "m", "find": "old", "replace": null}),
+            json!({"target": "chan:t:c", "msg_id": "m", "subject": "New title", "thread_root_id": "root"}),
+            json!({"target": "chan:t:c", "msg_id": "m", "subject": " "}),
+        ] {
+            assert!(validate_tool_args("edit_message", &arguments).is_err(), "{arguments}");
+        }
+        validate_tool_args(
+            "get_thread",
+            &json!({"target": "chan:t:c", "root_msg_id": "m", "offline": true, "compact": true}),
+        )
+        .unwrap();
+        assert!(validate_tool_args(
+            "get_thread",
+            &json!({"target": "chan:t:c", "root_msg_id": "m", "offline": "true"}),
+        )
+        .is_err());
+        assert!(validate_tool_args(
+            "get_messages",
+            &json!({"target": "chat:c", "format": "plain"}),
+        )
+        .is_err());
+        assert!(validate_tool_args("update_chat", &json!({
+            "target": "chat:c", "topic": "New topic", "members": []
+        })).is_err());
     }
 
     #[tokio::test]

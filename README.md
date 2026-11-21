@@ -7,11 +7,11 @@
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fteams?color=7aa2f7&label=%40bitefoundry%2Fteams&logo=npm)](https://www.npmjs.com/package/@bitefoundry/teams)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](https://opensource.org/license/mit)
 
 <br />
 
-![teams TUI Demo](assets/demo.gif)
+![teams TUI Demo](https://raw.githubusercontent.com/BiteFoundry/teams/master/assets/demo.gif)
 
 </div>
 
@@ -24,7 +24,7 @@
 | **Minimal-Chrome TUI** | 3-tier responsive `ratatui` layout (`Wide` / `Medium` / `Narrow`), Composer-First workflow, side-by-side Thread Drawer, Link Extractor (`u`), `zoxide` File Picker (`Ctrl+F`), Unified `Ctrl+K` Omni-Switcher, Cozy/Compact density (`Ctrl+D`), and multi-depth themes (`Midnight Dark`, `Daylight Light`, `ANSI 256/16`, `NO_COLOR`). |
 | **High-Res Terminal Images** | Native inline rendering for attachments & pasted `hostedContents` screenshots across **Kitty**, **iTerm2 (`OSC 1337`)**, **Sixel (`DCS q`)**, and **24-bit Half-Blocks (`▀`)** universal fallback with live zoom (`+`/`-`/`0`) and protocol switching (`p`). |
 | **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with `@odata.nextLink` deep history cursors, instant offline hybrid search (`teams search`), and sub-5ms cached CLI reads via `teams daemon`. |
-| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 17 tools)**. |
+| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 18 tools)**. |
 
 ---
 
@@ -79,12 +79,24 @@ teams send "Acme Engineering/platform-release" "**v2.4.0** canary is green!" --s
 teams reply "Acme Engineering/platform-release" 1700000000000 "Confirmed zero 5xx spikes."
 teams send-file "Elena Park" ./latency-p99.png --inline --caption "P99 latency benchmark"
 
+# Read a cached thread and edit a post you sent
+teams thread "Acme Engineering/platform-release" 1700000000000 --offline --limit 2 --json --compact
+teams edit "Acme Engineering/platform-release" 1700000000000 --find "STATE: STAGED" --replace "STATE: READY"
+teams edit "Acme Engineering/platform-release" 1700000000000 --subject "Canary rollout"
+teams update-chat "Release handoff" --topic "Canary war room"
+
 # Offline FTS5 search, deep history sync, presence, and background daemon
 teams search "connection pooling" --json
 teams sync --chats 100 --depth 100
-teams presence --set DoNotDisturb --activity "DeepWork" --expiration-mins 60
+teams presence --set DoNotDisturb --expiration-mins 60
 teams daemon start
 ```
+
+`teams edit TARGET MSG_ID MARKDOWN` replaces the entire body. `--find` and `--replace` edit one exact occurrence in a single text node of the latest body, preserving links, mentions, images, and attachment references. A missing, repeated, or cross-tag match fails before the write. Channel edits require a signed-in author's delegated token with `ChannelMessage.ReadWrite` (or legacy `Group.ReadWrite.All`). Chat edits use `Chat.ReadWrite`. Graph returns an error when permissions or Teams policy deny the edit. [Microsoft Graph message update](https://learn.microsoft.com/en-us/graph/api/chatmessage-update?view=graph-rest-1.0)
+
+`teams edit --subject` changes the plain-text title of a channel root post you sent. Use the subject option by itself for a PATCH containing only `subject`. `teams update-chat --topic` changes an existing group chat's title using delegated `Chat.ReadWrite`. Topics allow up to 250 characters and exclude colons. [Microsoft Graph chat update](https://learn.microsoft.com/en-us/graph/api/chat-patch?view=graph-rest-1.0)
+
+`read` and `thread` accept `--json --compact` to return IDs, authors, timestamps, plain text, reply links, and attachment IDs and names. In a thread, `--limit` caps the replies and the response includes the root separately. Use `--offline` after an online thread read that covered the requested replies.
 
 ### Local HTTP REST API (`teams serve`)
 
@@ -102,7 +114,7 @@ Full endpoint & schema docs: **[docs/API.md](docs/API.md)** · **[docs/openapi.y
 
 ### MCP Server (`teams mcp`)
 
-Exposes **17 Microsoft Teams tools** (`list_chats`, `create_chat`, `list_teams_channels`, `get_messages`, `get_thread`, `send_message`, `reply_message`, `send_file`, `download_attachment`, `react_message`, `edit_message`, `delete_message`, `search_messages`, `list_members`, `mark_read`, `get_presence`, `set_presence`) over newline-delimited stdio JSON-RPC 2.0:
+Exposes **18 Microsoft Teams tools** (`list_chats`, `create_chat`, `update_chat`, `list_teams_channels`, `get_messages`, `get_thread`, `send_message`, `reply_message`, `send_file`, `download_attachment`, `react_message`, `edit_message`, `delete_message`, `search_messages`, `list_members`, `mark_read`, `get_presence`, `set_presence`) over newline-delimited stdio JSON-RPC 2.0:
 
 ```bash
 # Claude Code
@@ -131,15 +143,15 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 | --- | --- | --- | --- |
 | **`@bitefoundry/teams`** *(this repo)* | `teams` | Microsoft Teams (Chats, Channels, Threads, Presence) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/outlook`](https://github.com/BiteFoundry/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar, To Do, Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://github.com/BiteFoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections, Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion`, `nt` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
 
 ---
 
 ## License & Disclaimer
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](https://opensource.org/license/mit).
 
 Unofficial terminal client for Microsoft Teams. Not affiliated with, endorsed by, or sponsored by Microsoft Corporation.

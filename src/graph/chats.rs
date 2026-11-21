@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use super::{
@@ -314,6 +314,30 @@ impl GraphClient {
 
         let created: GraphChat = self.post_json("/chats", &body).await?;
         Ok(map_graph_chat(created, Some(&my_id)))
+    }
+
+    pub(crate) async fn update_group_chat_topic(
+        &self,
+        chat_id: &str,
+        topic: &str,
+    ) -> Result<ConversationSummary> {
+        let path = format!("/chats/{}", urlencoding::encode(chat_id));
+        let current: GraphChat = self.get_json(&path).await?;
+        if current.id != chat_id || current.chat_type.as_deref() != Some("group") {
+            bail!("Chat topic changes require an existing group chat.");
+        }
+
+        let payload = serde_json::json!({ "topic": topic });
+        let updated: GraphChat = self
+            .patch_json_with_headers(&path, &payload, &[])
+            .await?
+            .json()
+            .await
+            .context("Graph accepted the topic update, but its response could not be read")?;
+        if updated.id != chat_id || updated.topic.as_deref() != Some(topic) {
+            bail!("Graph accepted the topic update, but its response did not confirm the requested chat ID and topic.");
+        }
+        Ok(map_graph_chat(updated, self.my_user_id()))
     }
 
     pub async fn list_chat_members(&self, chat_id: &str) -> Result<Vec<MemberInfo>> {

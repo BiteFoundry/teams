@@ -180,6 +180,14 @@ impl Storage {
         repo::upsert_conversations(&mut conn, items)
     }
 
+    pub(crate) fn save_updated_chat_topic(
+        &self,
+        chat: &ConversationSummary,
+    ) -> Result<ConversationSummary> {
+        let mut conn = self.lock_conn()?;
+        repo::save_updated_chat_topic(&mut conn, chat)
+    }
+
     pub fn upsert_teams(&self, teams: &[TeamSummary]) -> Result<()> {
         let mut conn = self.lock_conn()?;
         repo::upsert_teams(&mut conn, teams)
@@ -342,6 +350,21 @@ impl Storage {
     ) -> Result<Option<ThreadView>> {
         let conn = self.read_conn()?;
         repo::get_thread(&conn, conv_key, root_msg_id, limit)
+    }
+
+    pub(crate) fn save_fetched_thread(&self, thread: &ThreadView, complete: bool) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        repo::save_fetched_thread(&mut conn, thread, complete)
+    }
+
+    pub(crate) fn get_fetched_thread(
+        &self,
+        conv_key: &str,
+        root_msg_id: &str,
+        limit: usize,
+    ) -> Result<Option<ThreadView>> {
+        let conn = self.read_conn()?;
+        repo::get_fetched_thread(&conn, conv_key, root_msg_id, limit)
     }
 
     /// Lists messages across all conversations where `@me` is mentioned.
@@ -697,6 +720,26 @@ mod tests {
         assert_eq!(thread.replies.len(), 2);
         assert_eq!(thread.replies[0].msg_id, "m1-r1");
         assert_eq!(thread.replies[1].msg_id, "m1-r2");
+
+        assert!(storage.get_fetched_thread(conv_key, "m1", 1).unwrap().is_none());
+        let mut window = thread.clone();
+        window.replies.remove(0);
+        storage.save_fetched_thread(&window, false).unwrap();
+        assert!(storage.get_fetched_thread(conv_key, "m1", 2).unwrap().is_none());
+        assert_eq!(
+            storage.get_fetched_thread(conv_key, "m1", 1).unwrap().unwrap().replies,
+            window.replies
+        );
+        storage.save_fetched_thread(&thread, true).unwrap();
+        assert_eq!(
+            storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap(),
+            thread
+        );
+        window.replies.clear();
+        storage.save_fetched_thread(&window, true).unwrap();
+        let verified_empty = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        assert!(verified_empty.replies.is_empty());
+        assert_eq!(verified_empty.root.reply_count, 0);
 
         // Conversation last_msg updated from newest reply
         let conv = storage.get_conversation(conv_key).unwrap().unwrap();
@@ -1173,6 +1216,19 @@ mod tests {
             .upsert_messages_returning_changed_ids(&[m1.clone(), m2.clone()])
             .unwrap();
         assert!(unchanged.is_empty());
+
+        let mut html_only = m1.clone();
+        html_only.body_html = "<p><strong>one</strong></p>".to_string();
+        assert_eq!(
+            storage
+                .upsert_messages_returning_changed_ids(std::slice::from_ref(&html_only))
+                .unwrap(),
+            vec!["m1"]
+        );
+        assert_eq!(
+            storage.get_message(&conv_key, "m1").unwrap().unwrap().body_html,
+            html_only.body_html
+        );
 
         // Editing one row and soft-deleting another returns only changed IDs.
         let mut m1_edit = m1.clone();

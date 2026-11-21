@@ -1305,15 +1305,13 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            if let Ok(thread) = graph
-                .get_thread(&team_id, &channel_id, &root_msg_id, 200)
+            if let Ok((thread, complete)) = graph
+                .get_thread_with_coverage(&team_id, &channel_id, &root_msg_id, 200)
                 .await
             {
-                let mut all = Vec::with_capacity(1 + thread.replies.len());
-                all.push(thread.root.clone());
-                all.extend(thread.replies.clone());
+                let cached = thread.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    let _ = storage.upsert_messages(&all);
+                    let _ = storage.save_fetched_thread(&cached, complete);
                 })
                 .await;
                 let _ = tx.send(UiMsg::ThreadLoaded {
@@ -1352,18 +1350,15 @@ impl AppState {
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
             match graph
-                .get_thread(&team_id, &channel_id, &root_msg_id, 200)
+                .get_thread_with_coverage(&team_id, &channel_id, &root_msg_id, 200)
                 .await
             {
-                Ok(fetched_thread) => {
+                Ok((fetched_thread, complete)) => {
                     let db_storage = storage.clone();
                     let db_conv = conv_key.clone();
                     let db_root = root_msg_id.clone();
                     let thread_opt = tokio::task::spawn_blocking(move || {
-                        let mut all = Vec::with_capacity(1 + fetched_thread.replies.len());
-                        all.push(fetched_thread.root.clone());
-                        all.extend(fetched_thread.replies.iter().cloned());
-                        let _ = db_storage.upsert_messages(&all);
+                        let _ = db_storage.save_fetched_thread(&fetched_thread, complete);
                         db_storage
                             .get_thread(&db_conv, &db_root, 200)
                             .ok()

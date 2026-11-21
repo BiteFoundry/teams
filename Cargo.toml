@@ -1,6 +1,6 @@
 [package]
 name = "teams-cli"
-version = "0.7.7"
+version = "0.7.8"
 edition = "2021"
 description = "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
 repository = "https://github.com/BiteFoundry/teams"
@@ -27,6 +27,7 @@ dirs = "5"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+markup5ever = "0.12"
 notify-rust = "4"
 open = "5"
 rand = "0.8"

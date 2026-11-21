@@ -78,14 +78,14 @@ args = ["mcp"]
 
 - **Transport**: JSON-RPC 2.0 over stdio, **newline-delimited JSON** (one JSON object per line, no `Content-Length` headers; maximum `8 MiB` per request line).
 - **Supported `protocolVersion`s**: `2024-11-05`, `2025-03-26`, `2025-06-18` (unknown versions fall back to `2025-06-18`).
-- **`serverInfo`**: `{ "name": "teams", "version": "0.1.0" }` (matches `CARGO_PKG_VERSION`).
-- **Startup**: `initialize` responds immediately; on an empty cache, initial conversation bootstrap runs asynchronously in the background.
+- **`serverInfo`** reports the name `teams` and the running binary's version.
+- **Startup** opens the local cache. Online tools fetch from Graph when their requests need it.
 - **Notifications**: requests without `id` or methods starting with `notifications/` (such as `notifications/initialized`) emit no response.
 - **`ping`**: returns `{}`.
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope (or oversized line > `8 MiB`), `-32601` method not found.
 - **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message (including JWT `scp`/`roles` permission diagnostics on `403`) on validation/Graph failures.
 
-## Microsoft Teams Tools (17)
+## Microsoft Teams Tools (18)
 
 `target` arguments accept a canonical `conv_key` (`chat:...` or `chan:<team_id>:<channel_id>`), raw `chat_id`, `"Team/Channel"`, or a unique case-insensitive conversation title substring.
 
@@ -93,25 +93,44 @@ args = ["mcp"]
 | --- | --- | --- |
 | `list_chats` | `refresh?` (bool), `limit?` (1..1000) | `{ "chats": [...] }` |
 | `create_chat` | `members` (`string[]`, min 1), `topic?` | `{ "ok": true, "conversation": {...} }` |
+| `update_chat` | Group chat `target`, `topic` (1–250 characters) | `{ "ok": true, "conversation": {...} }` |
 | `list_teams_channels` | `refresh?` (bool) | `{ "teams": [...] }` |
-| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?` (bool) | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null }` |
-| `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000) | `{ "conversation": {...}, "thread": {...} }` |
+| `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?`, `compact?` | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null }` |
+| `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000 replies), `offline?`, `compact?` | `{ "conversation": {...}, "thread": { "root": {...}, "replies": [...] } }` |
 | `send_message` | `target`, `markdown`, `subject?`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "message": {...} }` |
 | `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` |
 | `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?` | `{ "ok": true, "conversation": {...}, "path": "...", "message": {...} }` |
 | `download_attachment` | `target`, `msg_id`, `index?`, `out_dir?`, `thread_root_id?` | `{ "ok": true, "path": "...", "file_name": "...", "bytes_written": ... }` |
 | `react_message` | `target`, `msg_id`, `reaction`, `enable?` (default `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "...", "reaction": "...", "enable": ... }` |
-| `edit_message` | `target`, `msg_id`, `markdown`, `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
+| `edit_message` | `target`, `msg_id`, and one mode. Body modes use `markdown` or both `find` and `replace`, with optional `thread_root_id`. The title mode uses `subject`. | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `delete_message` | `target`, `msg_id`, `confirm` (must be literal `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `search_messages` | `query`, `target?`, `limit?` (1..1000) | `{ "query": "...", "hits": [...] }` |
 | `list_members` | `target` | `{ "conv_key": "...", "title": "...", "members": [...] }` |
-| `mark_read` | `target` | `{ "ok": true, "conv_key": "..." }` |
+| `mark_read` | `target` | `{ "ok": true, "conv_key": "...", "scope": "server_and_local_cache" }` for chats, `"scope": "local_cache"` for channels |
 | `get_presence` | `user_ids?` (`string[]`) | `{ "presence": {...} }` or `{ "presences": [...] }` |
 | `set_presence` | `availability` (`Available\|Busy\|DoNotDisturb\|BeRightBack\|Away\|Reset`), `activity?`, `expiration_mins?` (1..1440) | `{ "ok": true, "availability": "...", "activity": "...", "expiration_mins": ... }` |
 
 ### Mentions and importance in `send_message` and `reply_message`
 
 `mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects. Set `important: true` to mark the message with high importance.
+
+### Compact and offline reads
+
+Set `compact: true` on `get_messages` or `get_thread` to receive the conversation's `conv_key` and title, message IDs, authors, creation and available modification timestamps, full `body_plain`, and reply IDs when present. Attachments appear as `{id, name}` entries. The default response includes the full conversation and message objects.
+
+The root is included separately from the `get_thread` reply limit in both modes. Replies are returned oldest first. With `offline: true`, the last successful online thread fetch must cover the requested reply limit or have reached the end of the replies. An empty `replies` list indicates the cached thread fetch found zero replies. A root cached through the message list has unknown reply coverage until a thread fetch runs.
+
+### Edit a message you sent
+
+Use `markdown` to replace the entire body. To update one phrase and preserve existing HTML, send `find` and `replace`. The phrase must occur exactly once within a single editable text node in the current Graph body. The replacement is literal text, and an empty string removes the phrase. An ambiguous match, missing phrase, cross-tag match, or unsupported argument returns an error before PATCH. Use `thread_root_id` with a body mode to edit a channel reply.
+
+Use `subject` by itself to update the title of a channel root post you sent. The PATCH contains only the new plain-text subject. The tool reads the saved post again and updates the cache.
+
+Channel edits require delegated `ChannelMessage.ReadWrite` or legacy `Group.ReadWrite.All`. `ChannelMessage.ReadWrite` requires administrator consent. Chat edits require delegated `Chat.ReadWrite`. The author must be signed in and Teams messaging policy must allow edits. The default teams sign-in scopes cover channel reads and sends. Graph permission or policy denials are returned as tool errors. [Microsoft Graph message update](https://learn.microsoft.com/en-us/graph/api/chatmessage-update?view=graph-rest-1.0) · [Graph permissions reference](https://learn.microsoft.com/en-us/graph/permissions-reference#channelmessagereadwrite)
+
+### Change a group chat topic
+
+`update_chat` changes the topic of an existing group chat accessible to the signed-in user. It requires delegated `Chat.ReadWrite`. A topic can contain 1 to 250 characters and cannot contain a colon. Graph confirms the saved topic in the update response. [Microsoft Graph chat update](https://learn.microsoft.com/en-us/graph/api/chat-patch?view=graph-rest-1.0)
 
 ### Destructive tool guard (`confirm: true`)
 
@@ -127,6 +146,11 @@ args = ["mcp"]
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_messages","arguments":{"target":"Engineering/General","before":"2026-11-01","limit":50}}}
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Engineering/General","markdown":"Build **passed**!","subject":"CI","mentions":["u1:Alice"]}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"target":"Engineering/General","msg_id":"1700000000000","confirm":true}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_thread","arguments":{"target":"Engineering/General","root_msg_id":"1700000000001","limit":2,"offline":true,"compact":true}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","find":"STATE: STAGED","replace":"STATE: READY"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"set_presence","arguments":{"availability":"DoNotDisturb","expiration_mins":60}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"update_chat","arguments":{"target":"Release handoff","topic":"Canary war room"}}}
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","subject":"Canary rollout"}}}
 ```
 
 ## Notes and limitations

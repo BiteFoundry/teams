@@ -741,22 +741,16 @@ async fn get_thread(
             .await?
             .ok_or_else(|| ApiError::not_found(format!("thread not found in cache: {root_id}")))?
     } else {
-        let view = match state
+        let (view, complete) = match state
             .graph
-            .get_thread(team_id, channel_id, &root_id, limit)
+            .get_thread_with_coverage(team_id, channel_id, &root_id, limit)
             .await
         {
             Ok(v) => v,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
         };
-        let mut all = Vec::with_capacity(1 + view.replies.len());
-        all.push(view.root.clone());
-        all.extend(view.replies.iter().cloned());
-        with_storage(&state.storage, move |s| {
-            s.upsert_messages(&all)?;
-            Ok(())
-        })
-        .await?;
+        let cached = view.clone();
+        with_storage(&state.storage, move |s| s.save_fetched_thread(&cached, complete)).await?;
         view
     };
     cli::hydrate_thread_attachments(&mut thread);

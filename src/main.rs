@@ -23,6 +23,20 @@ where
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(windows, debug_assertions))]
+    {
+        // Unoptimized argument parsing and command futures can exceed the Windows stack.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_cli)?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+    #[cfg(not(all(windows, debug_assertions)))]
+    run_cli()
+}
+
+fn run_cli() -> Result<()> {
     if let Some(res) = teams_cli::cli::try_fast_help_or_version() {
         return res;
     }

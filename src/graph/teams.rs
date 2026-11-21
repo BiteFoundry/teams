@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Deserialize;
 
@@ -405,8 +405,21 @@ impl GraphClient {
         root_msg_id: &str,
         limit: usize,
     ) -> Result<Vec<MessageItem>> {
+        let (replies, _) = self
+            .fetch_thread_replies(team_id, channel_id, root_msg_id, limit)
+            .await?;
+        Ok(replies)
+    }
+
+    async fn fetch_thread_replies(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        root_msg_id: &str,
+        limit: usize,
+    ) -> Result<(Vec<MessageItem>, bool)> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let my_id = self.resolve_my_user_id().await;
         let conv_key = ConversationTarget::Channel {
@@ -425,7 +438,7 @@ impl GraphClient {
         let mut replies = Vec::new();
         let mut seen_ids = HashSet::new();
 
-        while let Some(url) = next_url {
+        while let Some(url) = next_url.take() {
             let page: GraphListPage<GraphChatMessage> = self.get_json(&url).await?;
             for raw in page.value {
                 let normalized = normalize_chat_message(
@@ -439,18 +452,19 @@ impl GraphClient {
                     replies.push(normalized);
                 }
             }
-            if replies.len() >= limit {
-                break;
-            }
             next_url = page
                 .next_link
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            if replies.len() >= limit {
+                break;
+            }
         }
 
+        let complete = next_url.is_none() && replies.len() <= limit;
         sort_messages_chronologically(&mut replies);
         truncate_to_newest(&mut replies, limit);
-        Ok(replies)
+        Ok((replies, complete))
     }
 
     pub async fn get_thread(
@@ -460,6 +474,20 @@ impl GraphClient {
         root_msg_id: &str,
         limit: usize,
     ) -> Result<ThreadView> {
+        let (thread, _) = self
+            .get_thread_with_coverage(team_id, channel_id, root_msg_id, limit)
+            .await?;
+        Ok(thread)
+    }
+
+    /// The flag indicates that the returned replies cover the whole thread.
+    pub(crate) async fn get_thread_with_coverage(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        root_msg_id: &str,
+        limit: usize,
+    ) -> Result<(ThreadView, bool)> {
         let my_id = self.resolve_my_user_id().await;
         let conv_key = ConversationTarget::Channel {
             team_id: team_id.to_string(),
@@ -473,19 +501,22 @@ impl GraphClient {
             urlencoding::encode(channel_id),
             urlencoding::encode(root_msg_id)
         );
-        let (root_raw, replies) = tokio::try_join!(
+        let (root_raw, (replies, complete)) = tokio::try_join!(
             self.get_json::<GraphChatMessage>(&root_path),
-            self.list_thread_replies(team_id, channel_id, root_msg_id, limit)
+            self.fetch_thread_replies(team_id, channel_id, root_msg_id, limit)
         )?;
 
         let mut root = normalize_chat_message(&conv_key, None, my_id.as_deref(), root_raw);
         root.reply_count = root.reply_count.max(replies.len());
 
-        Ok(ThreadView {
-            conv_key,
-            root,
-            replies,
-        })
+        Ok((
+            ThreadView {
+                conv_key,
+                root,
+                replies,
+            },
+            complete,
+        ))
     }
 
     /// Sends a root message to a Chat or Team Channel.
@@ -612,6 +643,120 @@ impl GraphClient {
             }
         });
         self.patch_json(&path, &body).await
+    }
+
+    /// Edits one occurrence in the current Graph body and fetches the saved message.
+    pub(crate) async fn replace_message_text(
+        &self,
+        target: &ConversationTarget,
+        msg_id: &str,
+        parent_msg_id: Option<&str>,
+        find: &str,
+        replacement: &str,
+    ) -> Result<MessageItem> {
+        use crate::parser::edit_text::{replace_html_text, unique_match};
+
+        let path = message_item_path(target, msg_id, parent_msg_id);
+        let original: GraphChatMessage = self.get_json(&path).await?;
+        if original.id != msg_id
+            || original.deleted_date_time.is_some()
+            || original.removed.is_some()
+        {
+            bail!("The requested message does not have an editable body.");
+        }
+        let body = original.body.as_ref().context("Message has no body.")?;
+        let content = body.content.as_deref().context("Message has no body content.")?;
+        let content_type = body.content_type.as_deref().unwrap_or("html");
+        let edited = if content_type.eq_ignore_ascii_case("html") {
+            replace_html_text(content, find, replacement)?
+        } else if content_type.eq_ignore_ascii_case("text") {
+            let span = unique_match(content, find)?;
+            let mut edited = content.to_owned();
+            edited.replace_range(span, replacement);
+            edited
+        } else {
+            bail!("Unsupported Graph message body content type: {content_type}");
+        };
+
+        let saved = if edited == content {
+            original
+        } else {
+            let payload = serde_json::json!({
+                "body": { "contentType": content_type, "content": edited }
+            });
+            self.patch_message_and_read(&path, &original, &payload).await?
+        };
+        let my_id = self.resolve_my_user_id().await;
+        let parent = match target {
+            ConversationTarget::Channel { .. } => parent_msg_id.map(str::to_owned),
+            ConversationTarget::Chat { .. } => None,
+        };
+        Ok(normalize_chat_message(&target.conv_key(), parent, my_id.as_deref(), saved))
+    }
+
+    pub(crate) async fn edit_channel_post_subject(
+        &self,
+        target: &ConversationTarget,
+        msg_id: &str,
+        subject: &str,
+    ) -> Result<MessageItem> {
+        if !matches!(target, ConversationTarget::Channel { .. }) {
+            bail!("Subject edits require a team channel root post.");
+        }
+        let my_id = self.require_my_user_id().await?;
+        let path = message_item_path(target, msg_id, None);
+        let original: GraphChatMessage = self.get_json(&path).await?;
+        if original.id != msg_id
+            || original.reply_to_id.is_some()
+            || original.deleted_date_time.is_some()
+            || original.removed.is_some()
+            || original.message_type.as_deref().is_some_and(|kind| kind != "message")
+        {
+            bail!("Subject edits require an existing team channel root post.");
+        }
+        let author_id = original.from.as_ref()
+            .and_then(|from| from.user.as_ref())
+            .and_then(|author| author.id.as_deref());
+        if !author_id.is_some_and(|id| id.eq_ignore_ascii_case(&my_id)) {
+            bail!("Only the author can edit the subject of this channel post.");
+        }
+
+        let payload = serde_json::json!({ "subject": subject });
+        let saved = self.patch_message_and_read(&path, &original, &payload).await?;
+        if saved.subject.as_deref() != Some(subject) {
+            bail!("Graph accepted the message edit, but the follow-up read did not confirm the requested subject.");
+        }
+        Ok(normalize_chat_message(&target.conv_key(), None, Some(&my_id), saved))
+    }
+
+    async fn patch_message_and_read(
+        &self,
+        path: &str,
+        original: &GraphChatMessage,
+        payload: &serde_json::Value,
+    ) -> Result<GraphChatMessage> {
+        let headers: Vec<_> = original
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+            .map(|etag| {
+                let quoted = if etag.starts_with('"') {
+                    etag.to_owned()
+                } else {
+                    format!("\"{etag}\"")
+                };
+                ("If-Match", quoted)
+            })
+            .into_iter()
+            .collect();
+        self.patch_json_with_headers(path, payload, &headers).await?;
+        let saved: GraphChatMessage = self.get_json(path).await.context(
+            "Graph accepted the message edit, but the follow-up read failed",
+        )?;
+        if saved.id != original.id {
+            bail!("Graph accepted the message edit, but the follow-up read returned a different message ID.");
+        }
+        Ok(saved)
     }
 
     pub async fn delete_message(
