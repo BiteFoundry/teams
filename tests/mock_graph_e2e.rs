@@ -2239,3 +2239,716 @@ async fn e2e_inline_image_preview_and_self_updater() {
 
     gh_server.abort();
 }
+
+#[tokio::test]
+async fn e2e_built_cli_hyphen_inputs_markdown_lists_and_partial_edit_mock_graph() {
+    #[derive(Default)]
+    struct CliMockState {
+        created_chats: RwLock<Vec<Value>>,
+        updated_chat_topics: RwLock<Vec<(String, Value)>>,
+        posted_chat_messages: RwLock<Vec<(String, Value)>>,
+        posted_channel_messages: RwLock<Vec<(String, String, Value)>>,
+        posted_channel_replies: RwLock<Vec<(String, String, String, Value)>>,
+        patched_chat_messages: RwLock<Vec<(String, String, Value)>>,
+        chat_messages: RwLock<HashMap<(String, String), String>>,
+        next_id: RwLock<u64>,
+    }
+
+    impl CliMockState {
+        fn next_msg_id(&self, prefix: &str) -> String {
+            let mut seq = self.next_id.write().unwrap();
+            *seq += 1;
+            format!("{prefix}-{}", *seq)
+        }
+
+        fn total_writes(&self) -> usize {
+            self.created_chats.read().unwrap().len()
+                + self.updated_chat_topics.read().unwrap().len()
+                + self.posted_chat_messages.read().unwrap().len()
+                + self.posted_channel_messages.read().unwrap().len()
+                + self.posted_channel_replies.read().unwrap().len()
+                + self.patched_chat_messages.read().unwrap().len()
+        }
+    }
+
+    let state = Arc::new(CliMockState::default());
+    {
+        let mut msgs = state.chat_messages.write().unwrap();
+        msgs.insert(
+            ("19:cli-chat@thread.v2".to_string(), "m-unique".to_string()),
+            "<p><a href=\"keep\">ref</a> <b>alpha</b> beta</p>".to_string(),
+        );
+        msgs.insert(
+            ("19:cli-chat@thread.v2".to_string(), "m-hyphen".to_string()),
+            "<p><a href=\"keep\">ref</a> <b>- 목록 항목</b> tail</p>".to_string(),
+        );
+        msgs.insert(
+            ("19:cli-chat@thread.v2".to_string(), "m-split".to_string()),
+            "<p>alpha <b>beta</b></p>".to_string(),
+        );
+        msgs.insert(
+            ("19:cli-chat@thread.v2".to_string(), "m-both".to_string()),
+            "<p>alpha beta / alpha <b>beta</b></p>".to_string(),
+        );
+        msgs.insert(
+            ("19:cli-chat@thread.v2".to_string(), "m-orig".to_string()),
+            "<p>Original message</p>".to_string(),
+        );
+    }
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async move {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async move {
+                Json(json!({
+                    "value": [{
+                        "id": "19:cli-chat@thread.v2",
+                        "chatType": "group",
+                        "topic": "CLI Test Chat",
+                        "lastUpdatedDateTime": "2026-11-21T05:00:00Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async move { Json(json!({ "value": mock_teams_payload() })) }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let reqs = payload
+                    .get("requests")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        if url.contains("/teams/team-dev/channels") {
+                            json!({
+                                "id": req_id,
+                                "status": 200,
+                                "body": { "value": mock_channels_payload() }
+                            })
+                        } else {
+                            json!({
+                                "id": req_id,
+                                "status": 404,
+                                "body": { "error": { "code": "NotFound", "message": "not found" } }
+                            })
+                        }
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/chats",
+            post(|State(st): State<Arc<CliMockState>>, Json(payload): Json<Value>| async move {
+                st.created_chats.write().unwrap().push(payload.clone());
+                let topic = payload
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let chat_type = payload
+                    .get("chatType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("group");
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "id": "19:created-chat@thread.v2",
+                        "chatType": chat_type,
+                        "topic": topic,
+                        "lastUpdatedDateTime": "2026-11-21T05:00:00Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}",
+            get(|Path(chat_id): Path<String>| async move {
+                Json(json!({
+                    "id": chat_id,
+                    "chatType": "group",
+                    "topic": "Old Topic",
+                    "members": [
+                        { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                        { "userId": "peer-kim", "displayName": "Alice" }
+                    ]
+                }))
+            })
+            .patch(
+                |State(st): State<Arc<CliMockState>>,
+                 Path(chat_id): Path<String>,
+                 Json(payload): Json<Value>| async move {
+                    st.updated_chat_topics
+                        .write()
+                        .unwrap()
+                        .push((chat_id.clone(), payload.clone()));
+                    let topic = payload["topic"].as_str().unwrap_or("");
+                    Json(json!({
+                        "id": chat_id,
+                        "chatType": "group",
+                        "topic": topic,
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }))
+                },
+            ),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            post(
+                |State(st): State<Arc<CliMockState>>,
+                 Path(chat_id): Path<String>,
+                 Json(payload): Json<Value>| async move {
+                    st.posted_chat_messages
+                        .write()
+                        .unwrap()
+                        .push((chat_id.clone(), payload.clone()));
+                    let id = st.next_msg_id("chat-msg");
+                    let content = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    st.chat_messages
+                        .write()
+                        .unwrap()
+                        .insert((chat_id, id.clone()), content.clone());
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": id,
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T05:10:00Z",
+                            "subject": payload.get("subject").cloned().unwrap_or(Value::Null),
+                            "importance": payload.get("importance").cloned().unwrap_or(json!("normal")),
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": content },
+                            "mentions": payload.get("mentions").cloned().unwrap_or(json!([])),
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/messages/{msg_id}",
+            get(
+                |State(st): State<Arc<CliMockState>>,
+                 Path((chat_id, msg_id)): Path<(String, String)>| async move {
+                    let guard = st.chat_messages.read().unwrap();
+                    let Some(content) = guard.get(&(chat_id, msg_id.clone())).cloned() else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
+                    Json(json!({
+                        "id": msg_id,
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-21T05:10:00Z",
+                        "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                        "body": { "contentType": "html", "content": content },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }))
+                    .into_response()
+                },
+            )
+            .patch(
+                |State(st): State<Arc<CliMockState>>,
+                 Path((chat_id, msg_id)): Path<(String, String)>,
+                 Json(payload): Json<Value>| async move {
+                    st.patched_chat_messages.write().unwrap().push((
+                        chat_id.clone(),
+                        msg_id.clone(),
+                        payload.clone(),
+                    ));
+                    if let Some(content) =
+                        payload.pointer("/body/content").and_then(|v| v.as_str())
+                    {
+                        st.chat_messages
+                            .write()
+                            .unwrap()
+                            .insert((chat_id, msg_id), content.to_string());
+                    }
+                    StatusCode::NO_CONTENT.into_response()
+                },
+            ),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
+            post(
+                |State(st): State<Arc<CliMockState>>,
+                 Path((team_id, channel_id)): Path<(String, String)>,
+                 Json(payload): Json<Value>| async move {
+                    st.posted_channel_messages.write().unwrap().push((
+                        team_id,
+                        channel_id,
+                        payload.clone(),
+                    ));
+                    let id = st.next_msg_id("chan-root");
+                    let content = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": id,
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T05:11:00Z",
+                            "subject": payload.get("subject").cloned().unwrap_or(Value::Null),
+                            "importance": "normal",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": content },
+                            "mentions": payload.get("mentions").cloned().unwrap_or(json!([])),
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}/replies",
+            post(
+                |State(st): State<Arc<CliMockState>>,
+                 Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
+                 Json(payload): Json<Value>| async move {
+                    st.posted_channel_replies.write().unwrap().push((
+                        team_id,
+                        channel_id,
+                        root_id.clone(),
+                        payload.clone(),
+                    ));
+                    let id = st.next_msg_id("chan-reply");
+                    let content = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": id,
+                            "replyToId": root_id,
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T05:12:00Z",
+                            "importance": "normal",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": content },
+                            "mentions": payload.get("mentions").cloned().unwrap_or(json!([])),
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind built-CLI mock Graph server");
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve built-CLI mock Graph");
+    });
+
+    let tmp = tempfile::tempdir().expect("create built-CLI test tempdir");
+    let cfg_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+
+    let run_cli = |args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .env_remove("TEAMS_AUTO_DAEMON")
+                .output()
+                .await
+                .expect("run built teams CLI")
+        }
+    };
+
+    // 1. Invalid flags / missing option values / help MUST execute 0 Graph writes
+    for bad_args in [
+        &["send", "chat:19:cli-chat@thread.v2", "--json"][..],
+        &["send", "chat:19:cli-chat@thread.v2", "--dry-run"][..],
+        &["send", "chat:19:cli-chat@thread.v2", "body", "--subject", "--json"][..],
+        &["send", "chat:19:cli-chat@thread.v2", "body", "--subject", "--dry-run"][..],
+        &["edit", "chat:19:cli-chat@thread.v2", "m-orig", "--dry-run"][..],
+        &["edit", "chat:19:cli-chat@thread.v2", "m-orig", "--find", "old", "--replace", "--json"][..],
+        &["edit", "chat:19:cli-chat@thread.v2", "m-orig", "--find", "old", "--replace", "--dry-run"][..],
+        &["update-chat", "chat:19:cli-chat@thread.v2", "--topic", "--json"][..],
+        &["new-chat", "--to", "peer@example.invalid", "--message", "--json"][..],
+    ] {
+        let out = run_cli(bad_args).await;
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected clap error exit 2 for {bad_args:?}, got {:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let help_out = run_cli(&["send", "chat:19:cli-chat@thread.v2", "- 목록 항목", "--help"]).await;
+    assert!(help_out.status.success(), "{:?}", help_out.stderr);
+    let help_stdout = String::from_utf8_lossy(&help_out.stdout);
+    assert!(
+        help_stdout.contains("Send a Markdown message") && help_stdout.contains("Usage:"),
+        "unexpected help output: {help_stdout}"
+    );
+    let short_help_out = run_cli(&["send", "chat:19:cli-chat@thread.v2", "-h"]).await;
+    assert!(short_help_out.status.success(), "{:?}", short_help_out.stderr);
+    assert!(String::from_utf8_lossy(&short_help_out.stdout).contains("Usage:"));
+    let subject_help_out = run_cli(&["send", "chat:19:cli-chat@thread.v2", "body", "--subject", "--help"]).await;
+    assert!(
+        subject_help_out.status.success() || subject_help_out.status.code() == Some(2),
+        "unexpected status for --subject --help: {:?}",
+        subject_help_out.status
+    );
+    assert_eq!(state.total_writes(), 0, "failed parses and --help must perform 0 writes");
+
+    // 2. Chat send: two-line list + mention + trailing --json
+    let out = run_cli(&[
+        "send",
+        "chat:19:cli-chat@thread.v2",
+        "- first @Alice\n- second",
+        "--mention",
+        "peer-kim:Alice",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let chat_send_payload = state.posted_chat_messages.read().unwrap().last().unwrap().1.clone();
+    assert_eq!(
+        chat_send_payload["body"]["content"],
+        "<ul><li>first <at id=\"0\">Alice</at></li><li>second</li></ul>"
+    );
+    assert_eq!(chat_send_payload["mentions"][0]["mentioned"]["user"]["id"], "peer-kim");
+
+    // 3. Chat send: blank line ends list + numbered text keeps '7.' + fenced code block preserves literal hyphens
+    let out = run_cli(&[
+        "send",
+        "chat:19:cli-chat@thread.v2",
+        "- 목록 항목\n- 둘째 항목\n\n7. keep seven\n8. keep eight\n\n```\n- code line 1\n- code line 2\n```",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let code_payload = state.posted_chat_messages.read().unwrap().last().unwrap().1.clone();
+    assert_eq!(
+        code_payload["body"]["content"],
+        "<ul><li>목록 항목</li><li>둘째 항목</li></ul><p>7. keep seven<br>8. keep eight</p><pre><code>- code line 1\n- code line 2</code></pre>"
+    );
+
+    // 4. Channel send: two-line list + hyphenated --subject + mention
+    let out = run_cli(&[
+        "send",
+        "chan:team-dev:chan-deploy",
+        "- first @Alice\n- second",
+        "--subject",
+        "- 공지 제목",
+        "--mention",
+        "peer-kim:Alice",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let chan_send_payload = state
+        .posted_channel_messages
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .clone();
+    assert_eq!(chan_send_payload["subject"], "- 공지 제목");
+    assert_eq!(
+        chan_send_payload["body"]["content"],
+        "<ul><li>first <at id=\"0\">Alice</at></li><li>second</li></ul>"
+    );
+    assert_eq!(chan_send_payload["mentions"][0]["mentioned"]["user"]["id"], "peer-kim");
+
+    // 5. Chat reply & Channel reply: one <ul>, two <li> in order, and @mention
+    let out = run_cli(&[
+        "reply",
+        "chat:19:cli-chat@thread.v2",
+        "m-orig",
+        "- first @Alice\n- second",
+        "--mention",
+        "peer-kim:Alice",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let chat_reply_payload = state.posted_chat_messages.read().unwrap().last().unwrap().1.clone();
+    let chat_reply_html = chat_reply_payload["body"]["content"].as_str().unwrap();
+    assert_eq!(chat_reply_html.matches("<ul>").count(), 1, "{chat_reply_html}");
+    assert_eq!(chat_reply_html.matches("<li>").count(), 2, "{chat_reply_html}");
+    assert!(
+        chat_reply_html.ends_with("<ul><li>first <at id=\"0\">Alice</at></li><li>second</li></ul>"),
+        "{chat_reply_html}"
+    );
+
+    let out = run_cli(&[
+        "reply",
+        "chan:team-dev:chan-deploy",
+        "chan-root-1",
+        "- first @Alice\n- second",
+        "--mention",
+        "peer-kim:Alice",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let chan_reply_payload = state
+        .posted_channel_replies
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .3
+        .clone();
+    assert_eq!(
+        chan_reply_payload["body"]["content"],
+        "<ul><li>first <at id=\"0\">Alice</at></li><li>second</li></ul>"
+    );
+    assert_eq!(chan_reply_payload["mentions"][0]["mentioned"]["user"]["id"], "peer-kim");
+
+    // 6. Explicit `--flag=value` and positional `--` send literal `--dry-run`
+    let out = run_cli(&[
+        "send",
+        "chan:team-dev:chan-deploy",
+        "--subject=--dry-run",
+        "--",
+        "--dry-run",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let literal_payload = state
+        .posted_channel_messages
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .clone();
+    assert_eq!(literal_payload["subject"], "--dry-run");
+    assert_eq!(literal_payload["body"]["content"], "<p>--dry-run</p>");
+
+    // 7. new-chat --topic & --message, and update-chat --topic
+    let out = run_cli(&[
+        "new-chat",
+        "--to",
+        "audit@example.invalid",
+        "--topic",
+        "- 새 주제",
+        "--message",
+        "- first\n- second",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let created_chat = state.created_chats.read().unwrap().last().unwrap().clone();
+    assert_eq!(created_chat["topic"], "- 새 주제");
+    let new_chat_msg = state.posted_chat_messages.read().unwrap().last().unwrap().clone();
+    assert_eq!(new_chat_msg.0, "19:created-chat@thread.v2");
+    assert_eq!(
+        new_chat_msg.1["body"]["content"],
+        "<ul><li>first</li><li>second</li></ul>"
+    );
+
+    let out = run_cli(&[
+        "update-chat",
+        "chat:19:cli-chat@thread.v2",
+        "--topic",
+        "- 목록 항목",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let updated_topic = state
+        .updated_chat_topics
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(updated_topic, json!({ "topic": "- 목록 항목" }));
+
+    // 8. Full body edit with hyphen list + partial replace control comparison (layout.json)
+    let out = run_cli(&[
+        "edit",
+        "chat:19:cli-chat@thread.v2",
+        "m-orig",
+        "- first\n- second",
+        "--json",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let full_edit_patch = state
+        .patched_chat_messages
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .clone();
+    assert_eq!(
+        full_edit_patch["body"]["content"],
+        "<ul><li>first</li><li>second</li></ul>"
+    );
+
+    // Unique partial replace preserves link and bold markup
+    let out = run_cli(&[
+        "edit",
+        "chat:19:cli-chat@thread.v2",
+        "m-unique",
+        "--find",
+        "alpha",
+        "--replace",
+        "NEW",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let unique_patch = state
+        .patched_chat_messages
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .clone();
+    assert_eq!(
+        unique_patch["body"]["content"],
+        "<p><a href=\"keep\">ref</a> <b>NEW</b> beta</p>"
+    );
+
+    // Hyphenated --find / --replace preserves surrounding link and bold markup
+    let out = run_cli(&[
+        "edit",
+        "chat:19:cli-chat@thread.v2",
+        "m-hyphen",
+        "--find",
+        "- 목록 항목",
+        "--replace",
+        "- 완료 항목",
+    ])
+    .await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let hyphen_patch = state
+        .patched_chat_messages
+        .read()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .clone();
+    assert_eq!(
+        hyphen_patch["body"]["content"],
+        "<p><a href=\"keep\">ref</a> <b>- 완료 항목</b> tail</p>"
+    );
+
+    // Split and duplicate matches MUST fail with 0 writes
+    let patches_before_reject = state.patched_chat_messages.read().unwrap().len();
+    let split_out = run_cli(&[
+        "edit",
+        "chat:19:cli-chat@thread.v2",
+        "m-split",
+        "--find",
+        "alpha beta",
+        "--replace",
+        "NEW",
+    ])
+    .await;
+    assert!(!split_out.status.success());
+    let both_out = run_cli(&[
+        "edit",
+        "chat:19:cli-chat@thread.v2",
+        "m-both",
+        "--find",
+        "alpha beta",
+        "--replace",
+        "NEW",
+    ])
+    .await;
+    assert!(!both_out.status.success());
+    assert_eq!(
+        state.patched_chat_messages.read().unwrap().len(),
+        patches_before_reject,
+        "split/duplicate partial edits must write 0 PATCH requests"
+    );
+
+    // 9. Local cache search with hyphen query finds the previously sent message
+    let search_out = run_cli(&["search", "- 목록 항목", "--json"]).await;
+    assert!(
+        search_out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&search_out.stderr)
+    );
+    let search_json: Value = serde_json::from_slice(&search_out.stdout).expect("parse search json");
+    assert_eq!(search_json["query"], "- 목록 항목");
+    assert!(
+        !search_json["hits"].as_array().unwrap().is_empty(),
+        "expected cached search hit for '- 목록 항목', got {search_json}"
+    );
+
+    server.abort();
+}

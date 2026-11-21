@@ -64,6 +64,303 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
+impl Cli {
+    pub fn parse() -> Self {
+        Self::parse_from(std::env::args_os())
+    }
+
+    pub fn try_parse() -> std::result::Result<Self, clap::Error> {
+        Self::try_parse_from(std::env::args_os())
+    }
+
+    pub fn parse_from<I, T>(itr: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        match Self::try_parse_from(itr) {
+            Ok(cli) => cli,
+            Err(err) => err.exit(),
+        }
+    }
+
+    pub fn try_parse_from<I, T>(itr: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let raw: Vec<std::ffi::OsString> = itr.into_iter().map(Into::into).collect();
+        match normalize_cli_args(&raw) {
+            Some(normalized) => <Self as Parser>::try_parse_from(normalized),
+            None => <Self as Parser>::try_parse_from(raw),
+        }
+    }
+}
+
+struct HyphenTextSpec {
+    options: &'static [&'static str],
+    positionals: &'static [usize],
+}
+
+fn canonical_hyphen_subcommand(invoked: &str) -> Option<&'static str> {
+    match invoked {
+        "new-chat" => Some("new-chat"),
+        "update-chat" => Some("update-chat"),
+        "send" | "msg" => Some("send"),
+        "reply" => Some("reply"),
+        "send-file" | "file" => Some("send-file"),
+        "edit" => Some("edit"),
+        "search" => Some("search"),
+        _ => None,
+    }
+}
+
+fn hyphen_text_spec(canonical_subcommand: &str) -> Option<HyphenTextSpec> {
+    match canonical_subcommand {
+        "new-chat" => Some(HyphenTextSpec {
+            options: &["--topic", "--message"],
+            positionals: &[],
+        }),
+        "update-chat" => Some(HyphenTextSpec {
+            options: &["--topic"],
+            positionals: &[],
+        }),
+        "send" => Some(HyphenTextSpec {
+            options: &["--subject"],
+            positionals: &[1],
+        }),
+        "reply" => Some(HyphenTextSpec {
+            options: &[],
+            positionals: &[2],
+        }),
+        "send-file" => Some(HyphenTextSpec {
+            options: &["--caption"],
+            positionals: &[],
+        }),
+        "edit" => Some(HyphenTextSpec {
+            options: &["--find", "--replace", "--subject"],
+            positionals: &[2],
+        }),
+        "search" => Some(HyphenTextSpec {
+            options: &[],
+            positionals: &[0],
+        }),
+        _ => None,
+    }
+}
+
+fn starts_with_dash(tok: &std::ffi::OsStr) -> bool {
+    tok.as_encoded_bytes().starts_with(b"-")
+}
+
+fn is_long_flag_token(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("--") else {
+        return false;
+    };
+    let flag_name = rest.split_once('=').map_or(rest, |(name, _)| name);
+    !flag_name.is_empty()
+        && flag_name.as_bytes()[0].is_ascii_alphanumeric()
+        && flag_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn is_flag_like_token(
+    tok: &std::ffi::OsStr,
+    known_short_flags: &std::collections::HashSet<char>,
+) -> bool {
+    let Some(s) = tok.to_str() else {
+        return false;
+    };
+    if s == "--" {
+        return true;
+    }
+    if is_long_flag_token(s) {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix('-') {
+        return !rest.is_empty() && rest.chars().all(|c| known_short_flags.contains(&c));
+    }
+    false
+}
+
+/// Fast check that avoids building/inspecting the clap `Command` tree for ordinary argv
+/// with no candidate hyphen-prefixed free-text value.
+fn has_candidate_hyphen_value(raw: &[std::ffi::OsString]) -> bool {
+    if raw.len() < 3 {
+        return false;
+    }
+    let Some(invoked) = raw[1].to_str() else {
+        return false;
+    };
+    if canonical_hyphen_subcommand(invoked).is_none() {
+        return false;
+    }
+    for tok in &raw[2..] {
+        if tok.to_str() == Some("--") {
+            break;
+        }
+        if !starts_with_dash(tok) {
+            continue;
+        }
+        let Some(s) = tok.to_str() else {
+            return true;
+        };
+        if !is_long_flag_token(s) && !matches!(s, "-h" | "-V") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalizes hyphen-prefixed free-text literals (such as `"- 목록 항목"` or multiline
+/// Markdown lists) for eligible subcommand arguments while preserving known/unknown flags,
+/// missing option value errors, `--flag=value`, `--`, and `-h`/`--help`.
+/// Returns `None` without building the clap command tree when argv needs no rewriting.
+fn normalize_cli_args(raw: &[std::ffi::OsString]) -> Option<Vec<std::ffi::OsString>> {
+    use std::collections::HashSet;
+    use std::ffi::OsString;
+
+    if !has_candidate_hyphen_value(raw) {
+        return None;
+    }
+    let invoked_subcmd = raw[1].to_str()?;
+    let canonical = canonical_hyphen_subcommand(invoked_subcmd)?;
+    let spec = hyphen_text_spec(canonical)?;
+
+    let mut root_cmd = <Cli as clap::CommandFactory>::command();
+    root_cmd.build();
+    let subcmd = root_cmd
+        .get_subcommands()
+        .find(|sc| sc.get_name() == canonical)?;
+
+    let mut known_long_takes_value: HashSet<String> = HashSet::new();
+    let mut known_short_flags: HashSet<char> = HashSet::from(['h', 'V']);
+    for arg in subcmd.get_arguments() {
+        if arg.is_positional() {
+            continue;
+        }
+        if let Some(short) = arg.get_short() {
+            known_short_flags.insert(short);
+        }
+        if let Some(aliases) = arg.get_all_short_aliases() {
+            known_short_flags.extend(aliases);
+        }
+        if arg.get_action().takes_values() {
+            if let Some(long) = arg.get_long() {
+                known_long_takes_value.insert(format!("--{long}"));
+            }
+            if let Some(aliases) = arg.get_all_aliases() {
+                for alias in aliases {
+                    known_long_takes_value.insert(format!("--{alias}"));
+                }
+            }
+        }
+    }
+
+    let mut in_place: Vec<OsString> = Vec::with_capacity(raw.len());
+    in_place.push(raw[0].clone());
+    in_place.push(raw[1].clone());
+
+    let mut opt_tokens: Vec<OsString> = Vec::new();
+    let mut pos_tokens: Vec<OsString> = Vec::new();
+    let mut rewrote_any_opt = false;
+    let mut needs_pos_escape = false;
+
+    let mut i = 2;
+    while i < raw.len() {
+        let tok = &raw[i];
+        if tok.to_str() == Some("--") {
+            in_place.extend_from_slice(&raw[i..]);
+            pos_tokens.extend_from_slice(&raw[i + 1..]);
+            break;
+        }
+
+        if let Some(opt_name) = tok.to_str().filter(|s| known_long_takes_value.contains(*s)) {
+            let allow_hyphen = spec.options.contains(&opt_name);
+            match raw.get(i + 1) {
+                Some(next)
+                    if allow_hyphen
+                        && starts_with_dash(next)
+                        && !is_flag_like_token(next, &known_short_flags) =>
+                {
+                    let mut joined = OsString::with_capacity(opt_name.len() + 1 + next.len());
+                    joined.push(opt_name);
+                    joined.push("=");
+                    joined.push(next);
+                    in_place.push(joined.clone());
+                    opt_tokens.push(joined);
+                    rewrote_any_opt = true;
+                    i += 2;
+                    continue;
+                }
+                Some(next) if !starts_with_dash(next) => {
+                    in_place.push(tok.clone());
+                    in_place.push(next.clone());
+                    opt_tokens.push(tok.clone());
+                    opt_tokens.push(next.clone());
+                    i += 2;
+                    continue;
+                }
+                Some(next) if !allow_hyphen && !is_flag_like_token(next, &known_short_flags) => {
+                    in_place.push(tok.clone());
+                    in_place.push(next.clone());
+                    opt_tokens.push(tok.clone());
+                    opt_tokens.push(next.clone());
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    in_place.push(tok.clone());
+                    opt_tokens.push(tok.clone());
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        if starts_with_dash(tok) {
+            if is_flag_like_token(tok, &known_short_flags) {
+                in_place.push(tok.clone());
+                opt_tokens.push(tok.clone());
+                i += 1;
+                continue;
+            }
+            let pos_idx = pos_tokens.len();
+            if spec.positionals.contains(&pos_idx) {
+                in_place.push(tok.clone());
+                pos_tokens.push(tok.clone());
+                if tok.to_str() != Some("-") {
+                    needs_pos_escape = true;
+                }
+            } else {
+                in_place.push(tok.clone());
+                opt_tokens.push(tok.clone());
+            }
+            i += 1;
+            continue;
+        }
+
+        in_place.push(tok.clone());
+        pos_tokens.push(tok.clone());
+        i += 1;
+    }
+
+    if needs_pos_escape {
+        let mut out = Vec::with_capacity(2 + opt_tokens.len() + 1 + pos_tokens.len());
+        out.push(raw[0].clone());
+        out.push(raw[1].clone());
+        out.extend(opt_tokens);
+        out.push(OsString::from("--"));
+        out.extend(pos_tokens);
+        Some(out)
+    } else if rewrote_any_opt {
+        Some(in_place)
+    } else {
+        None
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Sign in with Microsoft Entra ID (OAuth 2.0) and store tokens
@@ -4854,5 +5151,433 @@ mod tests {
         assert_eq!(std::fs::read(&downloaded.path).unwrap(), png_bytes);
 
         mock_server.abort();
+    }
+
+    #[test]
+    fn parses_hyphen_text_values_across_affected_commands() {
+        let ko = "- 목록 항목";
+        let multiline = "- first\n- second";
+
+        // 1. send chat X (+ alias `msg`, multiline, subject, trailing --json)
+        match Cli::try_parse_from(["teams", "send", "chat:c1", ko, "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Send {
+                target,
+                markdown,
+                json,
+                ..
+            } => {
+                assert_eq!(target, "chat:c1");
+                assert_eq!(markdown, ko);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "teams",
+            "msg",
+            "chat:c1",
+            multiline,
+            "--subject",
+            ko,
+            "--mention",
+            "u1:Alice",
+            "--important",
+            "--json",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Send {
+                target,
+                markdown,
+                subject,
+                mention,
+                important,
+                json,
+            } => {
+                assert_eq!(target, "chat:c1");
+                assert_eq!(markdown, multiline);
+                assert_eq!(subject.as_deref(), Some(ko));
+                assert_eq!(mention, vec!["u1:Alice"]);
+                assert!(important);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // send chat body --subject X
+        match Cli::try_parse_from(["teams", "send", "chat:c1", "body", "--subject", ko, "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Send {
+                target,
+                markdown,
+                subject,
+                json,
+                ..
+            } => {
+                assert_eq!(target, "chat:c1");
+                assert_eq!(markdown, "body");
+                assert_eq!(subject.as_deref(), Some(ko));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 2. reply chat id X
+        match Cli::try_parse_from([
+            "teams", "reply", "chat:c1", "m1", multiline, "--mention", "u1:Alice", "--json",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Reply {
+                target,
+                msg_id,
+                markdown,
+                mention,
+                json,
+                ..
+            } => {
+                assert_eq!(target, "chat:c1");
+                assert_eq!(msg_id, "m1");
+                assert_eq!(markdown, multiline);
+                assert_eq!(mention, vec!["u1:Alice"]);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 3. edit chat id X, edit --find/--replace, edit --subject
+        match Cli::try_parse_from(["teams", "edit", "chat:c1", "m1", ko, "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Edit {
+                target,
+                msg_id,
+                new_markdown,
+                json,
+                ..
+            } => {
+                assert_eq!(target, "chat:c1");
+                assert_eq!(msg_id, "m1");
+                assert_eq!(new_markdown.as_deref(), Some(ko));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "teams", "edit", "chat:c1", "m1", "--find", "word", "--replace", ko, "--json",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Edit {
+                find,
+                replace,
+                json,
+                ..
+            } => {
+                assert_eq!(find.as_deref(), Some("word"));
+                assert_eq!(replace.as_deref(), Some(ko));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "teams", "edit", "chat:c1", "m1", "--find", ko, "--replace", "word", "--json",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Edit {
+                find,
+                replace,
+                json,
+                ..
+            } => {
+                assert_eq!(find.as_deref(), Some(ko));
+                assert_eq!(replace.as_deref(), Some("word"));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "teams", "edit", "chan:t1:c1", "m1", "--subject", ko, "--json",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Edit { subject, json, .. } => {
+                assert_eq!(subject.as_deref(), Some(ko));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 4. new-chat --message and --topic
+        match Cli::try_parse_from([
+            "teams",
+            "new-chat",
+            "--to",
+            "audit@example.invalid",
+            "--topic",
+            ko,
+            "--message",
+            multiline,
+            "--json",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::NewChat {
+                to,
+                topic,
+                message,
+                json,
+            } => {
+                assert_eq!(to, vec!["audit@example.invalid"]);
+                assert_eq!(topic.as_deref(), Some(ko));
+                assert_eq!(message.as_deref(), Some(multiline));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 5. update-chat --topic
+        match Cli::try_parse_from(["teams", "update-chat", "chat:c1", "--topic", ko, "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::UpdateChat {
+                target,
+                topic,
+                json,
+            } => {
+                assert_eq!(target, "chat:c1");
+                assert_eq!(topic, ko);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 6. search X (with trailing options including --top alias)
+        match Cli::try_parse_from(["teams", "search", ko, "--top", "15", "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Search {
+                query, limit, json, ..
+            } => {
+                assert_eq!(query, ko);
+                assert_eq!(limit, 15);
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 7. send-file --caption (and alias `file`)
+        match Cli::try_parse_from(["teams", "file", "chat:c1", "shot.png", "--caption", ko, "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::SendFile { caption, json, .. } => {
+                assert_eq!(caption.as_deref(), Some(ko));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_flags_missing_values_equals_separator_and_help() {
+        // Explicit `--flag=value` and positional `--` still allow flag-looking text
+        match Cli::try_parse_from([
+            "teams",
+            "send",
+            "chat:c1",
+            "--subject=--dry-run",
+            "--",
+            "--dry-run",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Send {
+                markdown, subject, ..
+            } => {
+                assert_eq!(markdown, "--dry-run");
+                assert_eq!(subject.as_deref(), Some("--dry-run"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from([
+            "teams",
+            "edit",
+            "chat:c1",
+            "m1",
+            "--find=--json",
+            "--replace=--help",
+        ])
+        .unwrap()
+        .command
+        .unwrap()
+        {
+            Command::Edit { find, replace, .. } => {
+                assert_eq!(find.as_deref(), Some("--json"));
+                assert_eq!(replace.as_deref(), Some("--help"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from(["teams", "search", "--", "--json"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Search { query, json, .. } => {
+                assert_eq!(query, "--json");
+                assert!(!json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match Cli::try_parse_from(["teams", "send", "chat:c1", "---\nbody"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Command::Send { markdown, .. } => assert_eq!(markdown, "---\nbody"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Known and unknown flags must NOT be swallowed as values or positionals
+        for invalid in [
+            vec!["teams", "send", "chat:c1", "--json"],
+            vec!["teams", "send", "chat:c1", "--dry-run"],
+            vec!["teams", "send", "chat:c1", "body", "--subject", "--json"],
+            vec!["teams", "send", "chat:c1", "body", "--subject", "--dry-run"],
+            vec!["teams", "send", "chat:c1", "- 목록 항목", "--subject"],
+            vec!["teams", "reply", "chat:c1", "m1", "--json"],
+            vec!["teams", "reply", "chat:c1", "m1", "--dry-run"],
+            vec!["teams", "edit", "chat:c1", "m1", "--json"],
+            vec!["teams", "edit", "chat:c1", "m1", "--dry-run"],
+            vec!["teams", "edit", "chat:c1", "m1", "--find", "--replace", "new"],
+            vec!["teams", "edit", "chat:c1", "m1", "--find", "old", "--replace", "--json"],
+            vec!["teams", "edit", "chat:c1", "m1", "--find", "old", "--replace", "--dry-run"],
+            vec!["teams", "edit", "chat:c1", "m1", "--find", "- old", "--replace"],
+            vec!["teams", "edit", "chat:c1", "m1", "--subject", "--json"],
+            vec!["teams", "update-chat", "chat:c1", "--topic", "--json"],
+            vec!["teams", "new-chat", "--to", "a@b", "--message", "--json"],
+            vec!["teams", "new-chat", "--to", "a@b", "--topic", "--message", "hi"],
+            vec!["teams", "search", "--json"],
+            vec!["teams", "search", "--dry-run"],
+            // Non-text fields (IDs/targets/numbers) keep their existing parsers
+            vec!["teams", "send", "-bad-target", "body"],
+            vec!["teams", "search", "- 목록 항목", "--limit", "-5"],
+        ] {
+            let err = Cli::try_parse_from(invalid.clone()).expect_err(&format!(
+                "expected parse error for {invalid:?}"
+            ));
+            assert!(
+                !matches!(
+                    err.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ),
+                "unexpected help/version for {invalid:?}: {err}"
+            );
+        }
+
+        // Actual help invocations must return DisplayHelp (never swallowed as text)
+        for help_argv in [
+            vec!["teams", "send", "--help"],
+            vec!["teams", "send", "chat:c1", "--help"],
+            vec!["teams", "send", "chat:c1", "-h"],
+            vec!["teams", "send", "chat:c1", "- 목록 항목", "--help"],
+            vec!["teams", "edit", "chat:c1", "m1", "--help"],
+            vec!["teams", "search", "--help"],
+            vec!["teams", "search", "-h"],
+            vec!["teams", "search", "- 목록 항목", "--help"],
+        ] {
+            let err = Cli::try_parse_from(help_argv.clone()).expect_err(&format!(
+                "expected DisplayHelp for {help_argv:?}"
+            ));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "expected DisplayHelp for {help_argv:?}, got {err}"
+            );
+            assert!(
+                try_fast_help_or_version_from(help_argv.clone(), Persona::Teams).is_some(),
+                "expected fast help for {help_argv:?}"
+            );
+        }
+
+        // `--subject=--help` and `-- --help` are NOT help invocations
+        assert!(
+            try_fast_help_or_version_from(
+                ["teams", "send", "chat:c1", "body", "--subject=--help"],
+                Persona::Teams,
+            )
+            .is_none()
+        );
+        assert!(
+            try_fast_help_or_version_from(
+                ["teams", "send", "chat:c1", "--", "--help"],
+                Persona::Teams,
+            )
+            .is_none()
+        );
+
+        // Ordinary argv with no candidate hyphen value must skip clap command inspection
+        let to_os = |slice: &[&str]| -> Vec<std::ffi::OsString> {
+            slice.iter().map(std::ffi::OsString::from).collect()
+        };
+        for ordinary in [
+            &["teams"][..],
+            &["teams", "--help"][..],
+            &["teams", "chats", "--limit", "50", "--json"][..],
+            &["teams", "read", "chat:c1", "--json", "--compact"][..],
+            &["teams", "send", "chat:c1", "hello", "--subject", "notice", "--json"][..],
+            &["teams", "send", "chat:c1", "--help"][..],
+            &["teams", "send", "chat:c1", "-h"][..],
+            &["teams", "send", "chat:c1", "--dry-run"][..],
+            &["teams", "send", "chat:c1", "body", "--subject=--dry-run"][..],
+            &["teams", "send", "chat:c1", "--", "- 목록 항목"][..],
+            &["teams", "edit", "chat:c1", "m1", "--find=--json", "--replace=--help"][..],
+            &["teams", "search", "normal query", "--top", "10", "--json"][..],
+        ] {
+            assert!(
+                !has_candidate_hyphen_value(&to_os(ordinary)),
+                "expected fast-path skip for {ordinary:?}"
+            );
+        }
+        for candidate in [
+            &["teams", "send", "chat:c1", "- 목록 항목"][..],
+            &["teams", "msg", "chat:c1", "- first\n- second", "--json"][..],
+            &["teams", "edit", "chat:c1", "m1", "--find", "- old", "--replace", "new"][..],
+            &["teams", "update-chat", "chat:c1", "--topic", "- 목록 항목"][..],
+            &["teams", "search", "- 목록 항목"][..],
+        ] {
+            assert!(
+                has_candidate_hyphen_value(&to_os(candidate)),
+                "expected candidate detection for {candidate:?}"
+            );
+        }
     }
 }

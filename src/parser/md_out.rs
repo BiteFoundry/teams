@@ -113,7 +113,25 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
             continue;
         }
 
-        // Paragraph until blank line, fence, or blockquote
+        // Unordered list (- item or * item)
+        if parse_unordered_list_item(line).is_some() {
+            let mut items = Vec::new();
+            while i < lines.len() {
+                if let Some(item_text) = parse_unordered_list_item(lines[i]) {
+                    items.push(format!(
+                        "<li>{}</li>",
+                        render_inline(item_text, &sorted_mentions)
+                    ));
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(format!("<ul>{}</ul>", items.join("")));
+            continue;
+        }
+
+        // Paragraph until blank line, fence, blockquote, or unordered list
         let mut para_lines = Vec::new();
         while i < lines.len() {
             let cur = lines[i];
@@ -121,6 +139,7 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
                 || cur.trim_start().starts_with("```")
                 || cur.starts_with("> ")
                 || cur == ">"
+                || parse_unordered_list_item(cur).is_some()
             {
                 break;
             }
@@ -133,6 +152,14 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
     }
 
     blocks.join("")
+}
+
+fn parse_unordered_list_item(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .map(str::trim)
 }
 
 fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
@@ -367,5 +394,45 @@ mod tests {
         let html = render_markdown_to_html(&payload, &[]);
         assert!(html.contains("<a href=\"https://example.com\">ok</a>"));
         assert!(!html.contains("<a href=\"javascript:"));
+    }
+
+    #[test]
+    fn test_render_markdown_lists_mentions_blank_line_and_code_block() {
+        let mentions = vec![MentionInfo {
+            id: 0,
+            user_id: "u1".to_string(),
+            display_name: "Alice".to_string(),
+        }];
+
+        let html = render_markdown_to_html("- first\n- second", &[]);
+        assert_eq!(html, "<ul><li>first</li><li>second</li></ul>");
+
+        let with_inline = render_markdown_to_html(
+            "- **first** @Alice\n- second [docs](https://example.com) `v1`\n\nAfter list\n\n```\n- code item 1\n- code item 2\n```",
+            &mentions,
+        );
+        assert_eq!(
+            with_inline,
+            "<ul><li><strong>first</strong> <at id=\"0\">Alice</at></li><li>second <a href=\"https://example.com\">docs</a> <code>v1</code></li></ul><p>After list</p><pre><code>- code item 1\n- code item 2</code></pre>"
+        );
+
+        let numbered_preserved = render_markdown_to_html("7. keep seven\n8. keep eight", &[]);
+        assert_eq!(numbered_preserved, "<p>7. keep seven<br>8. keep eight</p>");
+        assert!(!numbered_preserved.contains("<ol>"));
+
+        let split_lists = render_markdown_to_html("- alpha\n- beta\n\n- gamma", &[]);
+        assert_eq!(
+            split_lists,
+            "<ul><li>alpha</li><li>beta</li></ul><ul><li>gamma</li></ul>"
+        );
+
+        let intro_then_list = render_markdown_to_html("Summary:\n* one\n* two", &[]);
+        assert_eq!(
+            intro_then_list,
+            "<p>Summary:</p><ul><li>one</li><li>two</li></ul>"
+        );
+
+        let non_list_hyphens = render_markdown_to_html("---\n-item\n--dry-run", &[]);
+        assert_eq!(non_list_hyphens, "<p>---<br>-item<br>--dry-run</p>");
     }
 }
