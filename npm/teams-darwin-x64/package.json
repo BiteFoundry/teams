@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/teams-darwin-x64",
-  "version": "0.7.10",
+  "version": "0.7.11",
   "description": "Prebuilt teams binary for macOS x64",
   "repository": {
     "type": "git",

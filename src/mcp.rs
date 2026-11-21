@@ -247,20 +247,29 @@ async fn call_tool(
                 1_000,
             )?;
 
-            let cached: Vec<ConversationSummary> = with_storage(storage, |s| {
-                Ok(s.list_conversations()?
-                    .into_iter()
-                    .filter(|c| !c.kind.is_channel())
-                    .collect())
-            })
-            .await
-            .map_err(format_error)?;
+            let (cached, cache_sufficient): (Vec<ConversationSummary>, bool) =
+                with_storage(storage, move |s| {
+                    let chats: Vec<ConversationSummary> = s
+                        .list_conversations()?
+                        .into_iter()
+                        .filter(|c| !c.kind.is_channel())
+                        .collect();
+                    let sufficient = cli::chats_cache_satisfies_limit(s, chats.len(), limit);
+                    Ok((chats, sufficient))
+                })
+                .await
+                .map_err(format_error)?;
 
-            let mut chats = if refresh || cached.is_empty() {
-                let fetched = map_graph_result(graph, graph.list_chats(limit).await).await?;
-                let fetched_clone = fetched.clone();
+            let mut chats = if refresh || !cache_sufficient {
+                let fetched =
+                    map_graph_result(graph, graph.list_chats_with_cursor(limit).await).await?;
+                let fetched_chats = fetched.chats.clone();
+                let null_topic_keys = fetched.explicit_null_topic_keys;
+                let next_link = fetched.next_link;
+                let eof = fetched.eof;
                 let stored: Vec<ConversationSummary> = with_storage(storage, move |s| {
-                    s.upsert_conversations(&fetched_clone)?;
+                    s.upsert_conversations_with_null_topics(&fetched_chats, &null_topic_keys)?;
+                    cli::record_chats_list_cursor(s, next_link, eof);
                     Ok(s.list_conversations()?
                         .into_iter()
                         .filter(|c| !c.kind.is_channel())
@@ -269,7 +278,7 @@ async fn call_tool(
                 .await
                 .map_err(format_error)?;
                 if stored.is_empty() {
-                    fetched
+                    fetched.chats
                 } else {
                     stored
                 }
@@ -760,20 +769,9 @@ async fn call_tool(
             )
             .await?;
 
-            let my_uid = match graph.my_user_id().map(str::to_string) {
-                Some(id) if !id.is_empty() => Some(id),
-                _ => graph
-                    .auth()
-                    .current_tokens()
-                    .await
-                    .and_then(|t| t.user_id),
-            };
-            if let Some(uid) = my_uid.filter(|id| !id.is_empty()) {
-                let status = crate::models::PresenceStatus {
-                    user_id: uid,
-                    availability: availability.clone(),
-                    activity: activity.clone(),
-                };
+            let (latest, to_cache) =
+                cli::fetch_presence_after_set(graph, &availability, &activity).await;
+            if let Some(status) = to_cache {
                 let _ = with_storage(storage, move |s| {
                     s.upsert_presences(std::slice::from_ref(&status))
                 })
@@ -785,6 +783,7 @@ async fn call_tool(
                 "availability": availability,
                 "activity": activity,
                 "expiration_mins": expiration_mins,
+                "presence": latest,
             }))
         }
 
@@ -1204,7 +1203,46 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
 // Argument validation
 // ---------------------------------------------------------------------------
 
+fn validate_schema_additional_properties(name: &str, arguments: &Value) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::OnceLock;
+
+    static SCHEMA_PROPERTIES: OnceLock<HashMap<String, (HashSet<String>, bool)>> = OnceLock::new();
+    let map = SCHEMA_PROPERTIES.get_or_init(|| {
+        let mut out = HashMap::new();
+        for tool in tool_catalog() {
+            let Some(tool_name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let schema = &tool["inputSchema"];
+            let disallow_additional = schema
+                .get("additionalProperties")
+                .and_then(Value::as_bool)
+                == Some(false);
+            let props: HashSet<String> = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|obj| obj.keys().cloned().collect())
+                .unwrap_or_default();
+            out.insert(tool_name.to_string(), (props, disallow_additional));
+        }
+        out
+    });
+
+    let Some((allowed_props, disallow_additional)) = map.get(name) else {
+        return Err(format!("unknown tool: {name}"));
+    };
+    let obj = Args::new(arguments).object()?;
+    if *disallow_additional {
+        if let Some(key) = obj.keys().find(|k| !allowed_props.contains(k.as_str())) {
+            return Err(format!("unsupported argument: {key}"));
+        }
+    }
+    Ok(())
+}
+
 fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
+    validate_schema_additional_properties(name, arguments)?;
     let args = Args::new(arguments);
 
     match name {

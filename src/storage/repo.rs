@@ -13,6 +13,14 @@ use crate::models::{
 };
 
 pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]) -> Result<()> {
+    upsert_conversations_with_null_topics(conn, items, &HashSet::new())
+}
+
+pub(crate) fn upsert_conversations_with_null_topics(
+    conn: &mut Connection,
+    items: &[ConversationSummary],
+    clear_null_topic_keys: &HashSet<String>,
+) -> Result<()> {
     if items.is_empty() {
         return Ok(());
     }
@@ -35,7 +43,10 @@ pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]
                 team_id = COALESCE(excluded.team_id, conversations.team_id),
                 team_name = COALESCE(excluded.team_name, conversations.team_name),
                 title = excluded.title,
-                topic = COALESCE(excluded.topic, conversations.topic),
+                topic = CASE
+                    WHEN ?17 = 1 THEN NULL
+                    ELSE COALESCE(excluded.topic, conversations.topic)
+                END,
                 unread_count = excluded.unread_count,
                 last_read_at = COALESCE(excluded.last_read_at, conversations.last_read_at),
                 last_msg_id = COALESCE(excluded.last_msg_id, conversations.last_msg_id),
@@ -61,6 +72,9 @@ pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]
 
         for item in items {
             let target_json = serde_json::to_string(&item.target)?;
+            let clear_topic = i32::from(
+                item.topic.is_none() && clear_null_topic_keys.contains(&item.conv_key),
+            );
             stmt.execute(params![
                 item.conv_key,
                 target_json,
@@ -78,6 +92,7 @@ pub fn upsert_conversations(conn: &mut Connection, items: &[ConversationSummary]
                 if item.pinned { 1i32 } else { 0i32 },
                 item.peer_user_id,
                 item.web_url,
+                clear_topic,
             ])?;
         }
     }
@@ -363,14 +378,14 @@ fn upsert_messages_in_transaction(
             "
             INSERT INTO messages (
                 msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
-                subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+                subject, author_id, author_name, is_me, created_at, created_at_sort, last_modified_at, deleted,
                 importance, message_type, body_html, body_plain, attachments_json, mentions_json,
                 reactions_json, reply_count, web_url, has_mentions
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24
+                ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                ?16, ?17, ?18, ?19, ?20, ?21,
+                ?22, ?23, ?24, ?25
             )
             ON CONFLICT(msg_key) DO UPDATE SET
                 parent_msg_id = COALESCE(excluded.parent_msg_id, messages.parent_msg_id),
@@ -390,6 +405,10 @@ fn upsert_messages_in_transaction(
                 created_at = CASE
                     WHEN excluded.created_at = '' THEN messages.created_at
                     ELSE excluded.created_at
+                END,
+                created_at_sort = CASE
+                    WHEN excluded.created_at = '' THEN messages.created_at_sort
+                    ELSE excluded.created_at_sort
                 END,
                 last_modified_at = COALESCE(excluded.last_modified_at, messages.last_modified_at),
                 deleted = excluded.deleted,
@@ -520,6 +539,7 @@ fn upsert_messages_in_transaction(
                 None => serialize_json_slice(&msg.mentions)?,
             };
             let has_mentions_int = i32::from(!msg.mentions.is_empty());
+            let created_at_sort = crate::storage::db::normalize_timestamp_sort_key(&msg.created_at);
 
             msg_stmt.execute(params![
                 msg_key.as_ref(),
@@ -534,6 +554,7 @@ fn upsert_messages_in_transaction(
                 msg.author_name,
                 if msg.is_me { 1i32 } else { 0i32 },
                 msg.created_at,
+                created_at_sort,
                 msg.last_modified_at,
                 deleted_int,
                 msg.importance,
@@ -578,8 +599,11 @@ fn upsert_messages_in_transaction(
                 newest_by_conv
                     .entry(msg.conv_key.clone())
                     .and_modify(|existing_newest| {
-                        if msg.created_at > existing_newest.created_at
-                            || (msg.created_at == existing_newest.created_at
+                        let existing_sort = crate::storage::db::normalize_timestamp_sort_key(
+                            &existing_newest.created_at,
+                        );
+                        if created_at_sort > existing_sort
+                            || (created_at_sort == existing_sort
                                 && msg.msg_id > existing_newest.msg_id)
                         {
                             *existing_newest = msg;
@@ -719,7 +743,7 @@ pub fn list_root_messages(
             reactions_json, reply_count, web_url
         FROM messages
         WHERE conv_key = ?1 AND parent_msg_id IS NULL
-        ORDER BY created_at DESC, msg_id DESC
+        ORDER BY created_at_sort DESC, msg_id DESC
         LIMIT ?2
         ",
     )?;
@@ -740,6 +764,7 @@ pub fn list_older_root_messages(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let before_sort = crate::storage::db::normalize_timestamp_sort_key(before_created_at);
     let mut out = if let Some(b_id) = before_msg_id {
         let mut stmt = conn.prepare_cached(
             "
@@ -751,13 +776,13 @@ pub fn list_older_root_messages(
             FROM messages
             WHERE parent_msg_id IS NULL
               AND conv_key = ?1
-              AND (created_at, msg_id) < (?2, ?3)
-            ORDER BY created_at DESC, msg_id DESC
+              AND (created_at_sort, msg_id) < (?2, ?3)
+            ORDER BY created_at_sort DESC, msg_id DESC
             LIMIT ?4
             ",
         )?;
         let rows = stmt.query_map(
-            params![conv_key, before_created_at, b_id, limit as i64],
+            params![conv_key, before_sort, b_id, limit as i64],
             map_message_row,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -772,13 +797,13 @@ pub fn list_older_root_messages(
             FROM messages
             WHERE parent_msg_id IS NULL
               AND conv_key = ?1
-              AND created_at < ?2
-            ORDER BY created_at DESC, msg_id DESC
+              AND created_at_sort < ?2
+            ORDER BY created_at_sort DESC, msg_id DESC
             LIMIT ?3
             ",
         )?;
         let rows = stmt.query_map(
-            params![conv_key, before_created_at, limit as i64],
+            params![conv_key, before_sort, limit as i64],
             map_message_row,
         )?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -806,7 +831,7 @@ pub fn list_thread_replies(
             reactions_json, reply_count, web_url
         FROM messages
         WHERE conv_key = ?1 AND parent_msg_id = ?2
-        ORDER BY created_at DESC, msg_id DESC
+        ORDER BY created_at_sort DESC, msg_id DESC
         LIMIT ?3
         ",
     )?;
@@ -959,7 +984,7 @@ pub fn list_mentions_for_user(
         WHERE deleted = 0
           AND has_mentions = 1
           AND mentions_json LIKE ?1 ESCAPE '\\'
-        ORDER BY created_at DESC, msg_id DESC
+        ORDER BY created_at_sort DESC, msg_id DESC
         LIMIT ?2
         ",
     )?;

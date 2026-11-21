@@ -4,8 +4,23 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 const FIRST_PURE_TEAMS_SCHEMA_VERSION: i32 = 52;
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 54;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 55;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 56;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 57;
+
+/// Normalizes an RFC3339 timestamp to a fixed-width UTC comparison key with 9 fractional digits
+/// (`YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ`). Empty or non-RFC3339 values are returned trimmed as-is.
+pub fn normalize_timestamp_sort_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match chrono::DateTime::parse_from_rfc3339(trimmed) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        Err(_) => trimmed.to_string(),
+    }
+}
 
 /// Initializes SQLite PRAGMAs, tables, indexes, and FTS5 virtual table.
 /// Returns `true` if `messages_fts` uses the `trigram` tokenizer, `false` if using `unicode61`.
@@ -41,6 +56,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_reply_windows')
+                     AND EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='created_at_sort')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_conv_root_created_id')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_messages_has_mentions')
                      AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_conversations_sort_v2')",
@@ -120,6 +136,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             author_name TEXT NOT NULL,
             is_me INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
+            created_at_sort TEXT NOT NULL DEFAULT '',
             last_modified_at TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
             importance TEXT NOT NULL,
@@ -136,14 +153,8 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
 
         DROP INDEX IF EXISTS idx_messages_conv_parent_created;
 
-        CREATE INDEX IF NOT EXISTS idx_messages_conv_root_created_id
-            ON messages(conv_key, parent_msg_id, created_at DESC, msg_id DESC);
-
         CREATE INDEX IF NOT EXISTS idx_messages_conv_msg
             ON messages(conv_key, msg_id);
-
-        CREATE INDEX IF NOT EXISTS idx_messages_created
-            ON messages(created_at DESC);
 
         CREATE TABLE IF NOT EXISTS members (
             conv_key TEXT NOT NULL,
@@ -196,14 +207,96 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         )
         .context("Failed to migrate messages.has_mentions column")?;
     }
-    conn.execute_batch(
-        "
-        CREATE INDEX IF NOT EXISTS idx_messages_has_mentions
-            ON messages(created_at DESC, msg_id DESC)
-            WHERE deleted = 0 AND has_mentions = 1;
-        ",
-    )
-    .context("Failed to create idx_messages_has_mentions index")?;
+
+    let has_created_at_sort_col: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = 'created_at_sort')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    let root_idx_uses_sort: bool = conn
+        .query_row(
+            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_conv_root_created_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|sql| sql.contains("created_at_sort"))
+        .unwrap_or(false);
+    let needs_backfill = if has_created_at_sort_col {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE created_at_sort = '' AND created_at != '')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    } else {
+        true
+    };
+
+    if !has_created_at_sort_col || needs_backfill || !root_idx_uses_sort {
+        let tx = conn
+            .unchecked_transaction()
+            .context("Failed to begin messages.created_at_sort migration transaction")?;
+        if !has_created_at_sort_col {
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN created_at_sort TEXT NOT NULL DEFAULT '';",
+            )
+            .context("Failed to add messages.created_at_sort column")?;
+        }
+        let rows_to_fill: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT msg_key, created_at FROM messages WHERE created_at_sort = '' AND created_at != ''",
+            )?;
+            let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !rows_to_fill.is_empty() {
+            let mut upd =
+                tx.prepare("UPDATE messages SET created_at_sort = ?1 WHERE msg_key = ?2")?;
+            for (msg_key, created_at) in rows_to_fill {
+                let sort_key = normalize_timestamp_sort_key(&created_at);
+                upd.execute(rusqlite::params![sort_key, msg_key])?;
+            }
+        }
+        if !root_idx_uses_sort {
+            tx.execute_batch(
+                "
+                DROP INDEX IF EXISTS idx_messages_conv_root_created_id;
+                DROP INDEX IF EXISTS idx_messages_created;
+                DROP INDEX IF EXISTS idx_messages_has_mentions;
+                ",
+            )
+            .context("Failed to drop legacy created_at indexes")?;
+        }
+        tx.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_messages_conv_root_created_id
+                ON messages(conv_key, parent_msg_id, created_at_sort DESC, msg_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_created
+                ON messages(created_at_sort DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_has_mentions
+                ON messages(created_at_sort DESC, msg_id DESC)
+                WHERE deleted = 0 AND has_mentions = 1;
+            ",
+        )
+        .context("Failed to create created_at_sort indexes")?;
+        tx.commit()
+            .context("Failed to commit messages.created_at_sort migration transaction")?;
+    } else {
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_messages_conv_root_created_id
+                ON messages(conv_key, parent_msg_id, created_at_sort DESC, msg_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_created
+                ON messages(created_at_sort DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_has_mentions
+                ON messages(created_at_sort DESC, msg_id DESC)
+                WHERE deleted = 0 AND has_mentions = 1;
+            ",
+        )
+        .context("Failed to ensure created_at_sort indexes")?;
+    }
 
     let messages_trigram = ensure_fts5_table(
         conn,

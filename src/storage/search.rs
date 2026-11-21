@@ -45,17 +45,14 @@ pub fn search_messages(
 
     let query_ctx = SearchQueryContext::new(trimmed);
     let all_tokens_at_least_3 = tokens.iter().all(|t| t.chars().count() >= 3);
-    let char_count = trimmed.chars().count();
-    if char_count >= 3 {
+    if all_tokens_at_least_3 {
         if let Some(fts_query) =
             build_fts_query_from_tokens(trimmed, &tokens, all_tokens_at_least_3)
         {
             if let Ok(hits) =
                 run_fts_search(conn, &fts_query, &query_ctx, conv_key_filter, limit)
             {
-                if all_tokens_at_least_3 || !hits.is_empty() {
-                    return Ok(hits);
-                }
+                return Ok(hits);
             }
         }
     }
@@ -110,7 +107,7 @@ fn run_fts_search(
             WHERE messages_fts MATCH ?1
               AND m.deleted = 0
               AND m.conv_key = ?2
-            ORDER BY m.created_at DESC, m.msg_id DESC
+            ORDER BY m.created_at_sort DESC, m.msg_id DESC
             LIMIT ?3
             ",
         )?;
@@ -136,7 +133,7 @@ fn run_fts_search(
             LEFT JOIN conversations c ON c.conv_key = m.conv_key
             WHERE messages_fts MATCH ?1
               AND m.deleted = 0
-            ORDER BY m.created_at DESC, m.msg_id DESC
+            ORDER BY m.created_at_sort DESC, m.msg_id DESC
             LIMIT ?2
             ",
         )?;
@@ -155,68 +152,49 @@ fn run_like_search(
     conv_key_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    let pattern = format!("%{}%", escape_like(&query_ctx.query_lower));
-    let hits = if let Some(conv_key) = conv_key_filter {
-        let mut stmt = conn.prepare_cached(
-            "
-            SELECT
-                m.conv_key,
-                COALESCE(c.title, m.conv_key) AS conv_title,
-                c.kind,
-                m.msg_id,
-                m.parent_msg_id,
-                m.author_name,
-                m.created_at,
-                m.body_plain,
-                m.subject
-            FROM messages m
-            LEFT JOIN conversations c ON c.conv_key = m.conv_key
-            WHERE m.deleted = 0
-              AND m.conv_key = ?1
-              AND (
-                  LOWER(m.body_plain) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(COALESCE(m.subject, '')) LIKE ?2 ESCAPE '\\'
-                  OR LOWER(m.author_name) LIKE ?2 ESCAPE '\\'
-              )
-            ORDER BY m.created_at DESC, m.msg_id DESC
-            LIMIT ?3
-            ",
-        )?;
-        let rows = stmt.query_map(params![conv_key, pattern, limit as i64], |row| {
-            map_search_hit_row(row, query_ctx)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        let mut stmt = conn.prepare_cached(
-            "
-            SELECT
-                m.conv_key,
-                COALESCE(c.title, m.conv_key) AS conv_title,
-                c.kind,
-                m.msg_id,
-                m.parent_msg_id,
-                m.author_name,
-                m.created_at,
-                m.body_plain,
-                m.subject
-            FROM messages m
-            LEFT JOIN conversations c ON c.conv_key = m.conv_key
-            WHERE m.deleted = 0
-              AND (
-                  LOWER(m.body_plain) LIKE ?1 ESCAPE '\\'
-                  OR LOWER(COALESCE(m.subject, '')) LIKE ?1 ESCAPE '\\'
-                  OR LOWER(m.author_name) LIKE ?1 ESCAPE '\\'
-              )
-            ORDER BY m.created_at DESC, m.msg_id DESC
-            LIMIT ?2
-            ",
-        )?;
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-            map_search_hit_row(row, query_ctx)
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
+    let mut sql = String::from(
+        "SELECT
+            m.conv_key,
+            COALESCE(c.title, m.conv_key) AS conv_title,
+            c.kind,
+            m.msg_id,
+            m.parent_msg_id,
+            m.author_name,
+            m.created_at,
+            m.body_plain,
+            m.subject
+        FROM messages m
+        LEFT JOIN conversations c ON c.conv_key = m.conv_key
+        WHERE m.deleted = 0",
+    );
+    let mut bind_values: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(conv_key) = conv_key_filter {
+        bind_values.push(rusqlite::types::Value::Text(conv_key.to_string()));
+        sql.push_str(&format!(" AND m.conv_key = ?{}", bind_values.len()));
+    }
+    for token in &query_ctx.tokens_lower {
+        let pattern = format!("%{}%", escape_like(token));
+        bind_values.push(rusqlite::types::Value::Text(pattern));
+        let p = bind_values.len();
+        sql.push_str(&format!(
+            " AND (
+                LOWER(m.body_plain) LIKE ?{p} ESCAPE '\\'
+                OR LOWER(COALESCE(m.subject, '')) LIKE ?{p} ESCAPE '\\'
+                OR LOWER(m.author_name) LIKE ?{p} ESCAPE '\\'
+            )"
+        ));
+    }
+    bind_values.push(rusqlite::types::Value::Integer(limit as i64));
+    sql.push_str(&format!(
+        " ORDER BY m.created_at_sort DESC, m.msg_id DESC LIMIT ?{}",
+        bind_values.len()
+    ));
 
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(bind_values), |row| {
+        map_search_hit_row(row, query_ctx)
+    })?;
+    let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(hits)
 }
 

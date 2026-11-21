@@ -92,7 +92,8 @@ impl GraphClient {
             .collect();
 
         let responses = self.batch(&requests).await?;
-        let mut channels_by_idx: HashMap<usize, Vec<GraphChannel>> = HashMap::new();
+        let mut channels_by_idx: HashMap<usize, (Vec<GraphChannel>, Option<String>)> =
+            HashMap::new();
         for resp in responses {
             let Ok(idx) = resp.id.parse::<usize>() else {
                 continue;
@@ -101,33 +102,70 @@ impl GraphClient {
                 continue;
             }
             if let Ok(page) = serde_json::from_value::<GraphListPage<GraphChannel>>(resp.body) {
-                channels_by_idx.insert(idx, page.value);
+                let next_link = page
+                    .next_link
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                channels_by_idx.insert(idx, (page.value, next_link));
             }
         }
 
-        let summaries = teams
-            .into_iter()
-            .enumerate()
-            .map(|(idx, team)| {
-                let team_name = team
-                    .display_name
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| team.id.clone());
-                let raw_channels = channels_by_idx.remove(&idx).unwrap_or_default();
-                let channels = raw_channels
-                    .into_iter()
-                    .map(|ch| ch.into_summary(&team.id, &team_name))
-                    .collect();
-                TeamSummary {
-                    id: team.id,
-                    display_name: team_name,
-                    description: team.description.filter(|s| !s.trim().is_empty()),
-                    channels,
+        let mut summaries = Vec::with_capacity(teams.len());
+        for (idx, team) in teams.into_iter().enumerate() {
+            let team_name = team
+                .display_name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| team.id.clone());
+            let channels = match channels_by_idx.remove(&idx) {
+                Some((raw_channels, next_link)) => {
+                    self.collect_team_channels_from_page(
+                        &team.id,
+                        &team_name,
+                        raw_channels,
+                        next_link,
+                    )
+                    .await?
                 }
-            })
-            .collect();
+                None => Vec::new(),
+            };
+            summaries.push(TeamSummary {
+                id: team.id,
+                display_name: team_name,
+                description: team.description.filter(|s| !s.trim().is_empty()),
+                channels,
+            });
+        }
 
         Ok(summaries)
+    }
+
+    async fn collect_team_channels_from_page(
+        &self,
+        team_id: &str,
+        team_name: &str,
+        initial: Vec<GraphChannel>,
+        mut next_url: Option<String>,
+    ) -> Result<Vec<ChannelSummary>> {
+        let mut channels = Vec::with_capacity(initial.len());
+        let mut seen_ids = HashSet::new();
+        for ch in initial {
+            if seen_ids.insert(ch.id.clone()) {
+                channels.push(ch.into_summary(team_id, team_name));
+            }
+        }
+        while let Some(url) = next_url {
+            let page: GraphListPage<GraphChannel> = self.get_json(&url).await?;
+            for ch in page.value {
+                if seen_ids.insert(ch.id.clone()) {
+                    channels.push(ch.into_summary(team_id, team_name));
+                }
+            }
+            next_url = page
+                .next_link
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        Ok(channels)
     }
 
     pub async fn list_team_channels(
@@ -135,21 +173,12 @@ impl GraphClient {
         team_id: &str,
         team_name: &str,
     ) -> Result<Vec<ChannelSummary>> {
-        let mut next_url = Some(format!(
+        let initial_url = format!(
             "/teams/{}/channels?$select=id,displayName,description,membershipType,webUrl",
             urlencoding::encode(team_id)
-        ));
-        let mut channels = Vec::new();
-        while let Some(url) = next_url {
-            let page: GraphListPage<GraphChannel> = self.get_json(&url).await?;
-            channels.extend(
-                page.value
-                    .into_iter()
-                    .map(|ch| ch.into_summary(team_id, team_name)),
-            );
-            next_url = page.next_link;
-        }
-        Ok(channels)
+        );
+        self.collect_team_channels_from_page(team_id, team_name, Vec::new(), Some(initial_url))
+            .await
     }
 
     pub async fn list_channel_members(
@@ -516,6 +545,33 @@ impl GraphClient {
                 replies,
             },
             complete,
+        ))
+    }
+
+    /// Fetches a single message by ID from Graph:
+    /// - Chat: `/chats/{chat_id}/messages/{msg_id}`
+    /// - Channel root: `/teams/{team_id}/channels/{channel_id}/messages/{msg_id}`
+    /// - Channel reply: `/teams/{team_id}/channels/{channel_id}/messages/{parent_msg_id}/replies/{msg_id}`
+    pub async fn get_message(
+        &self,
+        target: &ConversationTarget,
+        msg_id: &str,
+        parent_msg_id: Option<&str>,
+    ) -> Result<MessageItem> {
+        let my_id = self.resolve_my_user_id().await;
+        let parent_for_path = match target {
+            ConversationTarget::Channel { .. } => {
+                parent_msg_id.map(str::trim).filter(|s| !s.is_empty())
+            }
+            ConversationTarget::Chat { .. } => None,
+        };
+        let path = message_item_path(target, msg_id, parent_for_path);
+        let raw: GraphChatMessage = self.get_json(&path).await?;
+        Ok(normalize_chat_message(
+            &target.conv_key(),
+            parent_for_path.map(str::to_string),
+            my_id.as_deref(),
+            raw,
         ))
     }
 

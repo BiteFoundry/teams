@@ -180,6 +180,15 @@ impl Storage {
         repo::upsert_conversations(&mut conn, items)
     }
 
+    pub(crate) fn upsert_conversations_with_null_topics(
+        &self,
+        items: &[ConversationSummary],
+        clear_null_topic_keys: &HashSet<String>,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        repo::upsert_conversations_with_null_topics(&mut conn, items, clear_null_topic_keys)
+    }
+
     pub(crate) fn save_updated_chat_topic(
         &self,
         chat: &ConversationSummary,
@@ -279,8 +288,14 @@ impl Storage {
             return Ok(None);
         };
         msg.deleted = true;
+        msg.subject = None;
         msg.body_html.clear();
         msg.body_plain = "(deleted message)".to_string();
+        msg.attachments.clear();
+        msg.mentions.clear();
+        msg.reactions.clear();
+        msg.reply_to_author = None;
+        msg.reply_to_preview = None;
         msg.last_modified_at = Some(deleted_at.to_string());
         let outcome = repo::upsert_messages_detailed(&mut conn, std::slice::from_ref(&msg))?;
         Ok(Some((msg, outcome)))

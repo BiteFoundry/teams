@@ -517,7 +517,7 @@ async fn list_conversations(
     if query.refresh {
         if let Some(chat_limit) = limit {
             let (chats_res, teams_res) = tokio::join!(
-                state.graph.list_chats(chat_limit),
+                state.graph.list_chats_with_cursor(chat_limit),
                 state.graph.list_joined_teams_with_channels(),
             );
             let chats = match chats_res {
@@ -525,7 +525,11 @@ async fn list_conversations(
                 Err(err) => return Err(map_graph_error(&state.graph, err).await),
             };
             with_storage(&state.storage, move |s| {
-                s.upsert_conversations(&chats)?;
+                s.upsert_conversations_with_null_topics(
+                    &chats.chats,
+                    &chats.explicit_null_topic_keys,
+                )?;
+                cli::record_chats_list_cursor(s, chats.next_link, chats.eof);
                 if let Ok(teams) = teams_res {
                     s.upsert_teams(&teams)?;
                 }
@@ -1171,21 +1175,9 @@ async fn set_presence(
         return Err(map_graph_error(&state.graph, err).await);
     }
 
-    let my_uid = match state.graph.my_user_id().map(str::to_string) {
-        Some(id) if !id.is_empty() => Some(id),
-        _ => state
-            .graph
-            .auth()
-            .current_tokens()
-            .await
-            .and_then(|t| t.user_id),
-    };
-    if let Some(uid) = my_uid.filter(|id| !id.is_empty()) {
-        let status = crate::models::PresenceStatus {
-            user_id: uid,
-            availability: availability.clone(),
-            activity: activity.to_string(),
-        };
+    let (latest, to_cache) =
+        cli::fetch_presence_after_set(&state.graph, &availability, activity).await;
+    if let Some(status) = to_cache {
         let _ = with_storage(&state.storage, move |s| {
             s.upsert_presences(std::slice::from_ref(&status))
         })
@@ -1197,6 +1189,7 @@ async fn set_presence(
         "availability": availability,
         "activity": activity,
         "expiration_mins": body.expiration_mins,
+        "presence": latest,
     })))
 }
 

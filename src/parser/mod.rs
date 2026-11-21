@@ -372,9 +372,19 @@ mod tests {
             quote,
         );
 
-        assert!(out
-            .body_html
-            .starts_with("<blockquote itemtype=\"http://schema.skype.com/Reply\" itemid=\"m99\"><strong>Bob &lt;Admin&gt;</strong><br>original &amp; content</blockquote>"));
+        assert_eq!(
+            out.quote_reply_to,
+            Some(QuotedReply {
+                msg_id: "m99".to_string(),
+                author_name: "Bob <Admin>".to_string(),
+                preview_plain: "original & content".to_string(),
+            })
+        );
+        assert!(
+            !out.body_html.contains("http://schema.skype.com/Reply"),
+            "quote reply HTML must be rendered only when building Graph send/reply payload: {}",
+            out.body_html
+        );
         assert!(out.body_html.contains("<at id=\"0\">Alice</at>"));
         assert!(out
             .body_html

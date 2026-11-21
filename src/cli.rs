@@ -458,18 +458,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Read recent messages from a chat or channel
-    #[command(visible_alias = "cat")]
+    /// Read recent messages from a chat or channel, or a specific channel thread with `--thread`
+    #[command(
+        visible_alias = "cat",
+        after_help = "Query modes:\n  Conversation history: teams read <TARGET> [--limit N] [--before TIMESTAMP_OR_MSG_ID]\n  Channel thread view:  teams read <TARGET> --thread <ROOT_MSG_ID> [--limit N]\nNote: --thread and --before are mutually exclusive (thread views do not support --before)."
+    )]
     Read {
         target: String,
         /// Maximum number of messages, or replies when --thread includes the root separately
         #[arg(long, visible_alias = "top", default_value_t = 30)]
         limit: usize,
-        /// Fetch messages older than this timestamp (ISO-8601 / YYYY-MM-DD) or message ID
-        #[arg(long, value_name = "TIMESTAMP_OR_MSG_ID")]
+        /// Fetch messages older than this timestamp (ISO-8601 / YYYY-MM-DD) or message ID (conflicts with --thread)
+        #[arg(long, value_name = "TIMESTAMP_OR_MSG_ID", conflicts_with = "thread")]
         before: Option<String>,
-        /// Read a specific channel thread by root message ID
-        #[arg(long)]
+        /// Read a specific channel thread by root message ID (conflicts with --before)
+        #[arg(long, conflicts_with = "before")]
         thread: Option<String>,
         #[arg(long)]
         offline: bool,
@@ -1465,6 +1468,37 @@ fn record_cli_sync_cursor(storage: &Storage, scope_key: &str) {
     let _ = storage.save_sync_cursor(&cursor);
 }
 
+pub(crate) fn record_chats_list_cursor(
+    storage: &Storage,
+    next_link: Option<String>,
+    eof: bool,
+) {
+    let cursor = SyncCursor {
+        scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
+        delta_link: if eof { None } else { next_link },
+        oldest_msg_ts: Some(if eof {
+            SyncCursor::HISTORY_EOF.to_string()
+        } else {
+            String::new()
+        }),
+        synced_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = storage.save_sync_cursor(&cursor);
+}
+
+pub(crate) fn chats_cache_satisfies_limit(
+    storage: &Storage,
+    cached_len: usize,
+    limit: usize,
+) -> bool {
+    cached_len >= limit
+        || storage
+            .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.is_history_eof())
+}
+
 async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     let auth = AuthManager::new(cfg.clone())?;
     if auth.current_tokens().await.is_none() {
@@ -2037,13 +2071,16 @@ async fn cmd_chats(
     let daemon_warm = resolve_daemon_warm(cfg, refresh, cached).await;
     if !refresh && (cached || daemon_warm || ttl > 0) {
         if let Ok(storage) = open_storage_only(cfg) {
-            if cached || daemon_warm || is_cursor_fresh(&storage, &["cli:chats"], ttl) {
+            if cached
+                || daemon_warm
+                || is_cursor_fresh(&storage, &["cli:chats", SyncCursor::CHATS_LIST_SCOPE], ttl)
+            {
                 let mut chats: Vec<ConversationSummary> = storage
                     .list_conversations()?
                     .into_iter()
                     .filter(|c| !c.kind.is_channel())
                     .collect();
-                if !chats.is_empty() && (cached || chats.len() >= limit) {
+                if chats_cache_satisfies_limit(&storage, chats.len(), limit) {
                     chats.truncate(limit);
                     return print_chats_output(&chats, json_out);
                 }
@@ -2060,27 +2097,35 @@ async fn cmd_chats(
         .collect();
 
     let cache_usable = !refresh
-        && (cached || daemon_warm || (ttl > 0 && is_cursor_fresh(&storage, &["cli:chats"], ttl)));
-    let mut chats = if !cache_usable || (!cached && cached_chats.len() < limit) || cached_chats.is_empty() {
-        let fetched = match graph.list_chats(limit).await {
-            Ok(items) => items,
-            Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
-        };
-        storage.upsert_conversations(&fetched)?;
-        record_cli_sync_cursor(&storage, "cli:chats");
-        let stored: Vec<ConversationSummary> = storage
-            .list_conversations()?
-            .into_iter()
-            .filter(|c| !c.kind.is_channel())
-            .collect();
-        if stored.is_empty() {
-            fetched
+        && (cached
+            || daemon_warm
+            || (ttl > 0
+                && is_cursor_fresh(&storage, &["cli:chats", SyncCursor::CHATS_LIST_SCOPE], ttl)));
+    let mut chats =
+        if !cache_usable || !chats_cache_satisfies_limit(&storage, cached_chats.len(), limit) {
+            let fetched = match graph.list_chats_with_cursor(limit).await {
+                Ok(items) => items,
+                Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+            };
+            storage.upsert_conversations_with_null_topics(
+                &fetched.chats,
+                &fetched.explicit_null_topic_keys,
+            )?;
+            record_chats_list_cursor(&storage, fetched.next_link, fetched.eof);
+            record_cli_sync_cursor(&storage, "cli:chats");
+            let stored: Vec<ConversationSummary> = storage
+                .list_conversations()?
+                .into_iter()
+                .filter(|c| !c.kind.is_channel())
+                .collect();
+            if stored.is_empty() {
+                fetched.chats
+            } else {
+                stored
+            }
         } else {
-            stored
-        }
-    } else {
-        cached_chats
-    };
+            cached_chats
+        };
 
     chats.truncate(limit);
     print_chats_output(&chats, json_out)
@@ -2237,10 +2282,15 @@ async fn cmd_channels(
             && !daemon_warm
             && !(ttl > 0 && is_cursor_fresh(&storage, &["cli:teams"], ttl)));
     let teams = load_teams_with_refresh(&graph, &storage, force_fetch).await?;
-    let team = resolve_team_from_slice(&teams, team_query)?;
+    let mut team = resolve_team_from_slice(&teams, team_query)?;
 
     let channels = if refresh && team.channels.is_empty() {
-        graph.list_team_channels(&team.id, &team.display_name).await?
+        let fetched = graph.list_team_channels(&team.id, &team.display_name).await?;
+        if !fetched.is_empty() {
+            team.channels = fetched.clone();
+            let _ = storage.upsert_teams(std::slice::from_ref(&team));
+        }
+        fetched
     } else {
         team.channels.clone()
     };
@@ -2389,7 +2439,12 @@ async fn cmd_read(
                             )
                         {
                             let res = read_conversation_messages_offline(&storage, &conv, limit, None)?;
-                            if !res.messages.is_empty() && (cached || res.messages.len() >= limit) {
+                            let is_eof = storage
+                                .get_sync_cursor(&SyncCursor::history_scope(&conv.conv_key))
+                                .ok()
+                                .flatten()
+                                .is_some_and(|c| c.is_history_eof());
+                            if res.messages.len() >= limit || is_eof {
                                 return print_read_output(&conv, &res, output);
                             }
                         }
@@ -2472,6 +2527,18 @@ fn print_thread_output(
 }
 
 fn format_message_line(msg: &MessageItem, indent: &str) -> String {
+    if msg.deleted {
+        let tag_str = if msg.reply_count > 0 {
+            format!(" [💬 {}]", msg.reply_count)
+        } else {
+            String::new()
+        };
+        return format!(
+            "{indent}[{}] {} ({}){tag_str}: (deleted message)",
+            msg.created_at, msg.author_name, msg.msg_id
+        );
+    }
+
     let attachments = msg.effective_attachments();
     let mut tags = Vec::new();
     if let Some(ref subj) = msg.subject {
@@ -3061,20 +3128,31 @@ async fn cmd_sync(
     let chats_limit = clamp_limit(chats);
     let depth = clamp_limit(depth);
 
+    let mut errors = Vec::new();
     let targets: Vec<ConversationSummary> = match target {
         Some(t) => vec![resolve_target(&storage, &graph, t, false).await?],
         None => {
             let (chats_res, teams_res) = tokio::join!(
-                graph.list_chats(chats_limit),
+                graph.list_chats_with_cursor(chats_limit),
                 graph.list_joined_teams_with_channels(),
             );
             let fetched_chats = match chats_res {
                 Ok(c) => c,
                 Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
             };
-            storage.upsert_conversations(&fetched_chats)?;
-            if let Ok(teams) = teams_res {
-                storage.upsert_teams(&teams)?;
+            storage.upsert_conversations_with_null_topics(
+                &fetched_chats.chats,
+                &fetched_chats.explicit_null_topic_keys,
+            )?;
+            record_chats_list_cursor(&storage, fetched_chats.next_link, fetched_chats.eof);
+            match teams_res {
+                Ok(teams) => {
+                    storage.upsert_teams(&teams)?;
+                }
+                Err(err) => {
+                    let wrapped = wrap_graph_permission_error(&graph, err).await;
+                    errors.push(format!("teams/channels: {wrapped:#}"));
+                }
             }
             let all_convs = storage.list_conversations()?;
             let mut chat_count = 0usize;
@@ -3099,7 +3177,6 @@ async fn cmd_sync(
 
     let mut total_messages = 0usize;
     let mut synced_convs = 0usize;
-    let mut errors = Vec::new();
 
     let results: Vec<(String, Result<usize>)> = stream::iter(targets.iter())
         .map(|conv| {
@@ -3265,7 +3342,9 @@ async fn cmd_export(
         "txt" => {
             let mut out_str = format!("# {} ({})\n\n", conv.title, conv.conv_key);
             for m in &messages {
-                let plain = if !m.body_plain.trim().is_empty() {
+                let plain = if m.deleted {
+                    "(deleted message)".to_string()
+                } else if !m.body_plain.trim().is_empty() {
                     m.body_plain.trim().to_string()
                 } else {
                     parser::html_and_cards_to_plain(&m.body_html, &m.attachments)
@@ -3273,7 +3352,9 @@ async fn cmd_export(
                 out_str.push_str(&format!("[{}] {}: {}\n", m.created_at, m.author_name, plain));
                 if let Some(replies) = threads_by_root.get(&m.msg_id) {
                     for r in replies {
-                        let rplain = if !r.body_plain.trim().is_empty() {
+                        let rplain = if r.deleted {
+                            "(deleted message)".to_string()
+                        } else if !r.body_plain.trim().is_empty() {
                             r.body_plain.trim().to_string()
                         } else {
                             parser::html_and_cards_to_plain(&r.body_html, &r.attachments)
@@ -3290,30 +3371,41 @@ async fn cmd_export(
         _ => {
             let mut out_str = format!("# {}\n\n", conv.title);
             for m in &messages {
-                if let Some(ref subj) = m.subject {
-                    if !subj.trim().is_empty() {
-                        out_str.push_str(&format!("## {}\n\n", subj.trim()));
-                    }
-                }
-                let md = parser::html_and_cards_to_markdown(&m.body_html, &m.attachments);
-                let text = if md.trim().is_empty() {
-                    m.body_plain.trim().to_string()
+                if m.deleted {
+                    out_str.push_str(&format!(
+                        "- **{}** `{}`\n\n  (deleted message)\n\n",
+                        m.author_name, m.created_at
+                    ));
                 } else {
-                    md.trim().to_string()
-                };
-                out_str.push_str(&format!(
-                    "- **{}** `{}`\n\n  {}\n\n",
-                    m.author_name,
-                    m.created_at,
-                    text.replace('\n', "\n  ")
-                ));
+                    if let Some(ref subj) = m.subject {
+                        if !subj.trim().is_empty() {
+                            out_str.push_str(&format!("## {}\n\n", subj.trim()));
+                        }
+                    }
+                    let md = parser::html_and_cards_to_markdown(&m.body_html, &m.attachments);
+                    let text = if md.trim().is_empty() {
+                        m.body_plain.trim().to_string()
+                    } else {
+                        md.trim().to_string()
+                    };
+                    out_str.push_str(&format!(
+                        "- **{}** `{}`\n\n  {}\n\n",
+                        m.author_name,
+                        m.created_at,
+                        text.replace('\n', "\n  ")
+                    ));
+                }
                 if let Some(replies) = threads_by_root.get(&m.msg_id) {
                     for r in replies {
-                        let rmd = parser::html_and_cards_to_markdown(&r.body_html, &r.attachments);
-                        let rtext = if rmd.trim().is_empty() {
-                            r.body_plain.trim().to_string()
+                        let rtext = if r.deleted {
+                            "(deleted message)".to_string()
                         } else {
-                            rmd.trim().to_string()
+                            let rmd = parser::html_and_cards_to_markdown(&r.body_html, &r.attachments);
+                            if rmd.trim().is_empty() {
+                                r.body_plain.trim().to_string()
+                            } else {
+                                rmd.trim().to_string()
+                            }
                         };
                         out_str.push_str(&format!(
                             "  - ↳ **{}** `{}`: {}\n",
@@ -3339,6 +3431,43 @@ async fn cmd_export(
     Ok(())
 }
 
+pub(crate) async fn fetch_presence_after_set(
+    graph: &GraphClient,
+    availability: &str,
+    activity: &str,
+) -> (
+    Option<crate::models::PresenceStatus>,
+    Option<crate::models::PresenceStatus>,
+) {
+    let latest = graph.get_my_presence().await.ok();
+    let my_uid = latest
+        .as_ref()
+        .map(|p| p.user_id.clone())
+        .filter(|id| !id.is_empty())
+        .or_else(|| graph.my_user_id().map(str::to_string));
+    let my_uid = match my_uid {
+        Some(id) if !id.is_empty() => Some(id),
+        _ => graph
+            .auth()
+            .current_tokens()
+            .await
+            .and_then(|t| t.user_id)
+            .filter(|id| !id.is_empty()),
+    };
+    let to_cache = if availability.eq_ignore_ascii_case("Reset") {
+        latest.clone().filter(|p| !p.user_id.is_empty())
+    } else {
+        my_uid.map(|uid| {
+            latest.clone().unwrap_or(crate::models::PresenceStatus {
+                user_id: uid,
+                availability: availability.to_string(),
+                activity: activity.to_string(),
+            })
+        })
+    };
+    (latest, to_cache)
+}
+
 async fn cmd_presence(
     cfg: &AppConfig,
     set: Option<&str>,
@@ -3346,7 +3475,7 @@ async fn cmd_presence(
     expiration_mins: Option<u32>,
     json_out: bool,
 ) -> Result<()> {
-    let (auth, graph, storage) = open_runtime(cfg, true).await?;
+    let (_auth, graph, storage) = open_runtime(cfg, true).await?;
 
     if let Some(raw_avail) = set {
         let availability = normalize_presence_availability(raw_avail)?;
@@ -3358,22 +3487,8 @@ async fn cmd_presence(
             .set_my_presence(&availability, act, expiration_mins)
             .await?;
 
-        let latest = graph.get_my_presence().await.ok();
-        let my_uid = latest
-            .as_ref()
-            .map(|p| p.user_id.clone())
-            .filter(|id| !id.is_empty())
-            .or_else(|| graph.my_user_id().map(str::to_string));
-        let my_uid = match my_uid {
-            Some(id) => Some(id),
-            None => auth.current_tokens().await.and_then(|t| t.user_id),
-        };
-        if let Some(uid) = my_uid.filter(|id| !id.is_empty()) {
-            let status = latest.clone().unwrap_or(crate::models::PresenceStatus {
-                user_id: uid,
-                availability: availability.clone(),
-                activity: act.to_string(),
-            });
+        let (latest, to_cache) = fetch_presence_after_set(&graph, &availability, act).await;
+        if let Some(status) = to_cache {
             let _ = storage.upsert_presences(std::slice::from_ref(&status));
         }
         if json_out {
@@ -3670,7 +3785,10 @@ pub(crate) fn resolve_before_cursor(
     }
 
     if let Some(msg) = storage.get_message(conv_key, trimmed)? {
-        return Ok((msg.created_at, Some(msg.msg_id)));
+        return Ok((
+            crate::storage::db::normalize_timestamp_sort_key(&msg.created_at),
+            Some(msg.msg_id),
+        ));
     }
 
     let ts = normalize_before_timestamp(trimmed)?;
@@ -3682,10 +3800,14 @@ fn normalize_before_timestamp(raw: &str) -> Result<String> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
         return Ok(dt
             .with_timezone(&Utc)
-            .to_rfc3339_opts(SecondsFormat::AutoSi, true));
+            .to_rfc3339_opts(SecondsFormat::Nanos, true));
     }
-    if NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_ok() {
-        return Ok(format!("{trimmed}T00:00:00Z"));
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .context("Failed to construct midnight UTC timestamp")?
+            .and_utc();
+        return Ok(dt.to_rfc3339_opts(SecondsFormat::Nanos, true));
     }
     for fmt in [
         "%Y-%m-%dT%H:%M:%S",
@@ -3703,7 +3825,7 @@ fn normalize_before_timestamp(raw: &str) -> Result<String> {
                 .context("Failed to convert local timestamp")?;
             return Ok(local_dt
                 .with_timezone(&Utc)
-                .to_rfc3339_opts(SecondsFormat::Secs, true));
+                .to_rfc3339_opts(SecondsFormat::Nanos, true));
         }
     }
     bail!(
@@ -3722,6 +3844,9 @@ fn trim_older_window(mut rows: Vec<MessageItem>, limit: usize) -> (Vec<MessageIt
 }
 
 pub(crate) fn hydrate_message_attachments(msg: &mut MessageItem) {
+    if msg.deleted {
+        return;
+    }
     if let std::borrow::Cow::Owned(effective) = msg.effective_attachments() {
         msg.attachments = effective;
     }
@@ -3793,16 +3918,17 @@ pub(crate) async fn read_conversation_messages(
                 Err(err) => return Err(wrap_graph_permission_error(graph, err).await),
             };
             storage.upsert_messages(&fetched)?;
-            if storage.get_sync_cursor(&scope_key)?.is_none() || limit > 50 {
-                let oldest_ts = if next_link.is_none() {
-                    Some(SyncCursor::HISTORY_EOF.to_string())
-                } else {
-                    fetched
-                        .iter()
-                        .filter(|m| m.parent_msg_id.is_none())
-                        .map(|m| m.created_at.clone())
-                        .min()
-                };
+            let oldest_ts = if next_link.is_none() {
+                Some(SyncCursor::HISTORY_EOF.to_string())
+            } else {
+                fetched
+                    .iter()
+                    .filter(|m| m.parent_msg_id.is_none())
+                    .map(|m| crate::storage::db::normalize_timestamp_sort_key(&m.created_at))
+                    .filter(|s| !s.is_empty())
+                    .min()
+            };
+            if oldest_ts.is_some() {
                 let _ = storage.save_sync_cursor(&SyncCursor {
                     scope_key: scope_key.clone(),
                     delta_link: next_link.clone(),
@@ -3837,7 +3963,7 @@ pub(crate) async fn read_conversation_messages(
             if fetch_older {
                 let cursor = storage.get_sync_cursor(&scope_key)?;
                 let cursor_is_eof = cursor.as_ref().is_some_and(SyncCursor::is_history_eof);
-                let mut local = storage.list_older_root_messages(
+                let local = storage.list_older_root_messages(
                     &conv.conv_key,
                     limit,
                     &before_ts,
@@ -3863,7 +3989,8 @@ pub(crate) async fn read_conversation_messages(
                             fetched
                                 .iter()
                                 .filter(|m| m.parent_msg_id.is_none())
-                                .map(|m| m.created_at.clone())
+                                .map(|m| crate::storage::db::normalize_timestamp_sort_key(&m.created_at))
+                                .filter(|s| !s.is_empty())
                                 .min()
                                 .or_else(|| cursor.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
                         };
@@ -3875,18 +4002,31 @@ pub(crate) async fn read_conversation_messages(
                         });
                     }
                 } else {
-                    while local.len() < limit {
-                        let cur = storage.get_sync_cursor(&scope_key)?;
-                        if cur.as_ref().is_some_and(SyncCursor::is_history_eof) {
-                            break;
-                        }
-                        let saved_link = cur.as_ref().and_then(|c| c.delta_link.clone());
+                    let cursor_connected = cursor.as_ref().is_some_and(|c| {
+                        !c.is_history_eof()
+                            && c.delta_link.is_some()
+                            && c.oldest_msg_ts.as_deref().is_some_and(|ots| {
+                                let norm_ots =
+                                    crate::storage::db::normalize_timestamp_sort_key(ots);
+                                !norm_ots.is_empty() && norm_ots >= before_ts
+                            })
+                    });
+                    let mut next_cursor_link = if cursor_connected {
+                        cursor.as_ref().and_then(|c| c.delta_link.clone())
+                    } else {
+                        None
+                    };
+                    let mut fetched_older_ids = std::collections::HashSet::new();
+
+                    loop {
+                        let prev_link = next_cursor_link.clone();
+                        let remaining = limit.saturating_sub(fetched_older_ids.len()).max(1);
                         let (fetched, new_next_link) = match graph
                             .fetch_older_messages(
                                 &conv.target,
-                                saved_link.as_deref(),
+                                prev_link.as_deref(),
                                 Some(&before_ts),
-                                limit - local.len(),
+                                remaining,
                             )
                             .await
                         {
@@ -3895,31 +4035,50 @@ pub(crate) async fn read_conversation_messages(
                         };
 
                         if !fetched.is_empty() {
+                            for m in &fetched {
+                                if m.parent_msg_id.is_none() {
+                                    let m_sort = crate::storage::db::normalize_timestamp_sort_key(
+                                        &m.created_at,
+                                    );
+                                    let is_older = match before_id.as_deref() {
+                                        Some(bid) => {
+                                            (m_sort.as_str(), m.msg_id.as_str())
+                                                < (before_ts.as_str(), bid)
+                                        }
+                                        None => m_sort.as_str() < before_ts.as_str(),
+                                    };
+                                    if is_older {
+                                        fetched_older_ids.insert(m.msg_id.clone());
+                                    }
+                                }
+                            }
                             storage.upsert_messages(&fetched)?;
                         }
                         let oldest_ts = if new_next_link.is_none() {
                             Some(SyncCursor::HISTORY_EOF.to_string())
                         } else {
                             fetched
-                                .first()
-                                .map(|m| m.created_at.clone())
-                                .or_else(|| cur.as_ref().and_then(|c| c.oldest_msg_ts.clone()))
+                                .iter()
+                                .filter(|m| m.parent_msg_id.is_none())
+                                .map(|m| {
+                                    crate::storage::db::normalize_timestamp_sort_key(&m.created_at)
+                                })
+                                .filter(|s| !s.is_empty())
+                                .min()
                         };
-                        let _ = storage.save_sync_cursor(&SyncCursor {
-                            scope_key: scope_key.clone(),
-                            delta_link: new_next_link.clone(),
-                            oldest_msg_ts: oldest_ts,
-                            synced_at: Utc::now().to_rfc3339(),
-                        });
+                        if oldest_ts.is_some() {
+                            let _ = storage.save_sync_cursor(&SyncCursor {
+                                scope_key: scope_key.clone(),
+                                delta_link: new_next_link.clone(),
+                                oldest_msg_ts: oldest_ts,
+                                synced_at: Utc::now().to_rfc3339(),
+                            });
+                        }
 
-                        local = storage.list_older_root_messages(
-                            &conv.conv_key,
-                            limit,
-                            &before_ts,
-                            before_id.as_deref(),
-                        )?;
-                        if new_next_link.is_none()
-                            || (fetched.is_empty() && new_next_link == saved_link)
+                        next_cursor_link = new_next_link;
+                        if fetched_older_ids.len() >= limit
+                            || next_cursor_link.is_none()
+                            || (fetched.is_empty() && next_cursor_link == prev_link)
                         {
                             break;
                         }
@@ -4139,31 +4298,15 @@ pub(crate) async fn find_message_with_fallback(
         return Ok(msg);
     }
 
-    if let (
-        Some(root_id),
-        ConversationTarget::Channel {
-            team_id,
-            channel_id,
-        },
-    ) = (thread_root_id, &conv.target)
-    {
-        let thread = graph
-            .get_thread(team_id, channel_id, root_id, 50)
-            .await?;
-        let mut all = Vec::with_capacity(1 + thread.replies.len());
-        all.push(thread.root);
-        all.extend(thread.replies);
-        let _ = storage.upsert_messages(&all);
-        if let Some(found) = all.into_iter().find(|m| m.msg_id == msg_id) {
-            return Ok(found);
+    let parent_id = match &conv.target {
+        ConversationTarget::Channel { .. } => {
+            thread_root_id.map(str::trim).filter(|s| !s.is_empty())
         }
-    }
-
-    let msgs = graph.list_messages(&conv.target, 50).await?;
-    let _ = storage.upsert_messages(&msgs);
-    msgs.into_iter()
-        .find(|m| m.msg_id == msg_id)
-        .with_context(|| format!("Message not found: {msg_id}"))
+        ConversationTarget::Chat { .. } => None,
+    };
+    let msg = graph.get_message(&conv.target, msg_id, parent_id).await?;
+    let _ = storage.upsert_messages(std::slice::from_ref(&msg));
+    Ok(msg)
 }
 
 pub(crate) async fn download_message_attachment(
@@ -4419,8 +4562,6 @@ mod tests {
             "2026-11-01",
             "--limit",
             "100",
-            "--thread",
-            "root-1",
             "--json",
         ])
         .unwrap();
@@ -4435,10 +4576,49 @@ mod tests {
                 assert_eq!(target, "chat:1");
                 assert_eq!(limit, 100);
                 assert_eq!(before.as_deref(), Some("2026-11-01"));
+                assert!(thread.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "teams",
+            "read",
+            "chat:1",
+            "--thread",
+            "root-1",
+            "--limit",
+            "100",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Read {
+                target,
+                limit,
+                before,
+                thread,
+                ..
+            } => {
+                assert_eq!(target, "chat:1");
+                assert_eq!(limit, 100);
+                assert!(before.is_none());
                 assert_eq!(thread.as_deref(), Some("root-1"));
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let conflict = Cli::try_parse_from([
+            "teams",
+            "read",
+            "chat:1",
+            "--before",
+            "2026-11-01",
+            "--thread",
+            "root-1",
+        ])
+        .unwrap_err();
+        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
 
         // `teams sync --chats --depth --target`
         let cli = Cli::try_parse_from(["teams", "sync"]).unwrap();
@@ -4811,14 +4991,14 @@ mod tests {
             ])
             .unwrap();
 
-        // Date-only `YYYY-MM-DD` normalizes to `YYYY-MM-DDT00:00:00Z`
+        // Date-only `YYYY-MM-DD` normalizes to fixed-width UTC 9-digit comparison key
         let (ts, id) = resolve_before_cursor(&storage, &conv.conv_key, "2026-11-01").unwrap();
-        assert_eq!(ts, "2026-11-01T00:00:00Z");
+        assert_eq!(ts, "2026-11-01T00:00:00.000000000Z");
         assert!(id.is_none());
 
-        // Cached msg_id resolves to its timestamp and msg_id
+        // Cached msg_id resolves to its normalized timestamp key and msg_id
         let (ts, id) = resolve_before_cursor(&storage, &conv.conv_key, "m3").unwrap();
-        assert_eq!(ts, "2026-11-01T09:00:00Z");
+        assert_eq!(ts, "2026-11-01T09:00:00.000000000Z");
         assert_eq!(id.as_deref(), Some("m3"));
 
         // Invalid input returns an error

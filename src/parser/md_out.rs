@@ -14,16 +14,7 @@ pub fn compile_outgoing_markdown(
 ) -> OutgoingMessage {
     let mut html = String::new();
 
-    if let Some(q) = &quote_reply_to {
-        html.push_str(&format!(
-            "<blockquote itemtype=\"http://schema.skype.com/Reply\" itemid=\"{}\"><strong>{}</strong><br>{}</blockquote>",
-            escape_html_attr(&q.msg_id),
-            escape_html(&q.author_name),
-            escape_html(&q.preview_plain)
-        ));
-    }
-
-    let body = render_markdown_to_html(markdown, &mentions);
+    let (body, used_mentions) = render_markdown_with_mentions(markdown, &mentions);
     html.push_str(&body);
 
     for img in &inline_images {
@@ -43,7 +34,7 @@ pub fn compile_outgoing_markdown(
     OutgoingMessage {
         subject,
         body_html: html,
-        mentions,
+        mentions: used_mentions,
         attachments,
         inline_images,
         importance: None,
@@ -51,7 +42,132 @@ pub fn compile_outgoing_markdown(
     }
 }
 
+#[cfg(test)]
 fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
+    render_markdown_with_mentions(markdown, mentions).0
+}
+
+struct MentionCandidate {
+    orig_idx: usize,
+    user_id: String,
+    display_name: String,
+    assigned_id: Option<i32>,
+}
+
+struct MentionTracker {
+    candidates: Vec<MentionCandidate>,
+    match_order: Vec<usize>,
+    emitted: Vec<MentionInfo>,
+}
+
+impl MentionTracker {
+    fn new(mentions: &[MentionInfo]) -> Self {
+        let candidates: Vec<MentionCandidate> = mentions
+            .iter()
+            .enumerate()
+            .map(|(orig_idx, m)| MentionCandidate {
+                orig_idx,
+                user_id: m.user_id.clone(),
+                display_name: m.display_name.clone(),
+                assigned_id: None,
+            })
+            .collect();
+        let mut match_order: Vec<usize> = (0..candidates.len()).collect();
+        match_order.sort_by(|&a, &b| {
+            candidates[b]
+                .display_name
+                .chars()
+                .count()
+                .cmp(&candidates[a].display_name.chars().count())
+                .then_with(|| candidates[a].orig_idx.cmp(&candidates[b].orig_idx))
+        });
+        Self {
+            candidates,
+            match_order,
+            emitted: Vec::new(),
+        }
+    }
+
+    fn try_match(&mut self, after_at: &str) -> Option<(i32, String, usize)> {
+        let mut best_len: Option<usize> = None;
+        let mut chosen_unused: Option<usize> = None;
+        let mut chosen_reused: Option<usize> = None;
+
+        for &idx in &self.match_order {
+            let cand = &self.candidates[idx];
+            if cand.display_name.is_empty() {
+                continue;
+            }
+            let Some(matched_len) = match_prefix_case_insensitive(after_at, &cand.display_name)
+            else {
+                continue;
+            };
+            if !is_mention_end_boundary(&after_at[matched_len..]) {
+                continue;
+            }
+            match best_len {
+                None => {
+                    best_len = Some(matched_len);
+                }
+                Some(best) if matched_len < best => {
+                    // match_order is sorted by display_name char length descending.
+                    break;
+                }
+                Some(best) if matched_len > best => {
+                    best_len = Some(matched_len);
+                    chosen_unused = None;
+                    chosen_reused = None;
+                }
+                Some(_) => {}
+            }
+            if cand.assigned_id.is_none() {
+                if chosen_unused.is_none() {
+                    chosen_unused = Some(idx);
+                }
+            } else if chosen_reused.is_none() {
+                chosen_reused = Some(idx);
+            }
+        }
+
+        let matched_len = best_len?;
+        if let Some(idx) = chosen_unused {
+            let id = self.emitted.len() as i32;
+            let cand = &mut self.candidates[idx];
+            cand.assigned_id = Some(id);
+            let display_name = cand.display_name.clone();
+            self.emitted.push(MentionInfo {
+                id,
+                user_id: cand.user_id.clone(),
+                display_name: display_name.clone(),
+            });
+            return Some((id, display_name, matched_len));
+        }
+        if let Some(idx) = chosen_reused {
+            let cand = &self.candidates[idx];
+            let id = cand.assigned_id?;
+            return Some((id, cand.display_name.clone(), matched_len));
+        }
+        None
+    }
+}
+
+fn match_prefix_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let mut h_chars = haystack.char_indices();
+    let mut matched_end = 0usize;
+    for nc in needle.chars() {
+        let (idx, hc) = h_chars.next()?;
+        if !hc.to_lowercase().eq(nc.to_lowercase()) {
+            return None;
+        }
+        matched_end = idx + hc.len_utf8();
+    }
+    Some(matched_end)
+}
+
+fn render_markdown_with_mentions(
+    markdown: &str,
+    mentions: &[MentionInfo],
+) -> (String, Vec<MentionInfo>) {
     let normalized: std::borrow::Cow<'_, str> = if markdown.contains('\r') {
         std::borrow::Cow::Owned(markdown.replace("\r\n", "\n"))
     } else {
@@ -60,9 +176,7 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
     let lines: Vec<&str> = normalized.split('\n').collect();
     let mut blocks: Vec<String> = Vec::new();
     let mut i = 0;
-
-    let mut sorted_mentions: Vec<&MentionInfo> = mentions.iter().collect();
-    sorted_mentions.sort_by(|a, b| b.display_name.len().cmp(&a.display_name.len()));
+    let mut tracker = MentionTracker::new(mentions);
 
     while i < lines.len() {
         let line = lines[i];
@@ -106,7 +220,7 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
                     .strip_prefix("> ")
                     .or_else(|| lines[i].strip_prefix('>'))
                     .unwrap_or("");
-                quote_lines.push(render_inline(content, &sorted_mentions));
+                quote_lines.push(render_inline(content, &mut tracker));
                 i += 1;
             }
             blocks.push(format!("<blockquote>{}</blockquote>", quote_lines.join("<br>")));
@@ -120,7 +234,7 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
                 if let Some(item_text) = parse_unordered_list_item(lines[i]) {
                     items.push(format!(
                         "<li>{}</li>",
-                        render_inline(item_text, &sorted_mentions)
+                        render_inline(item_text, &mut tracker)
                     ));
                     i += 1;
                 } else {
@@ -143,7 +257,7 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
             {
                 break;
             }
-            para_lines.push(render_inline(cur, &sorted_mentions));
+            para_lines.push(render_inline(cur, &mut tracker));
             i += 1;
         }
         if !para_lines.is_empty() {
@@ -151,7 +265,7 @@ fn render_markdown_to_html(markdown: &str, mentions: &[MentionInfo]) -> String {
         }
     }
 
-    blocks.join("")
+    (blocks.join(""), tracker.emitted)
 }
 
 fn parse_unordered_list_item(line: &str) -> Option<&str> {
@@ -162,7 +276,7 @@ fn parse_unordered_list_item(line: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
+fn render_inline(input: &str, mentions: &mut MentionTracker) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let mut no_closing_backtick = false;
@@ -190,19 +304,15 @@ fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
             }
         }
 
-        // Mention: @DisplayName
+        // Mention: @DisplayName (case-insensitive, supports Korean "님" outside tag)
         if rest.starts_with('@') && is_mention_boundary(input, i) {
-            if let Some(m) = mentions.iter().find(|m| {
-                !m.display_name.is_empty()
-                    && rest[1..].starts_with(&m.display_name)
-                    && is_mention_end_boundary(&rest[1 + m.display_name.len()..])
-            }) {
+            if let Some((id, display_name, matched_len)) = mentions.try_match(&rest[1..]) {
                 out.push_str(&format!(
                     "<at id=\"{}\">{}</at>",
-                    m.id,
-                    escape_html(&m.display_name)
+                    id,
+                    escape_html(&display_name)
                 ));
-                i += 1 + m.display_name.len();
+                i += 1 + matched_len;
                 continue;
             }
         }
@@ -210,7 +320,11 @@ fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
         // Markdown link: [label](url)
         if !no_closing_bracket && rest.starts_with('[') {
             match parse_markdown_link(rest) {
-                Some((label, url, consumed)) => {
+                LinkParse::Found {
+                    label,
+                    url,
+                    consumed,
+                } => {
                     if is_safe_url(url) {
                         out.push_str(&format!(
                             "<a href=\"{}\">{}</a>",
@@ -221,7 +335,8 @@ fn render_inline(input: &str, mentions: &[&MentionInfo]) -> String {
                         continue;
                     }
                 }
-                None => {
+                LinkParse::NotALink => {}
+                LinkParse::NoMoreLinks => {
                     no_closing_bracket = true;
                 }
             }
@@ -311,22 +426,82 @@ fn is_mention_boundary(full: &str, at_byte_idx: usize) -> bool {
 fn is_mention_end_boundary(after: &str) -> bool {
     match after.chars().next() {
         None => true,
-        Some(c) => !c.is_alphanumeric() && c != '_',
+        Some(c) if !c.is_alphanumeric() && c != '_' => true,
+        Some('님') => {
+            let rest_after_nim = &after['님'.len_utf8()..];
+            match rest_after_nim.chars().next() {
+                None => true,
+                Some(c) => !c.is_ascii_alphanumeric() && c != '_',
+            }
+        }
+        Some(_) => false,
     }
 }
 
-fn parse_markdown_link(rest: &str) -> Option<(&str, &str, usize)> {
-    let after_open = rest.strip_prefix('[')?;
-    let close_bracket = after_open.find("](")?;
+enum LinkParse<'a> {
+    Found {
+        label: &'a str,
+        url: &'a str,
+        consumed: usize,
+    },
+    NotALink,
+    NoMoreLinks,
+}
+
+fn parse_markdown_link(rest: &str) -> LinkParse<'_> {
+    let Some(after_open) = rest.strip_prefix('[') else {
+        return LinkParse::NotALink;
+    };
+    let mut close_bracket = None;
+    for (idx, &b) in after_open.as_bytes().iter().enumerate() {
+        if b == b'[' {
+            return LinkParse::NotALink;
+        }
+        if b == b']' {
+            close_bracket = Some(idx);
+            break;
+        }
+    }
+    let Some(close_bracket) = close_bracket else {
+        return LinkParse::NoMoreLinks;
+    };
     let label = &after_open[..close_bracket];
-    let after_mid = &after_open[close_bracket + 2..];
-    let close_paren = after_mid.find(')')?;
+    if label.is_empty() {
+        return LinkParse::NotALink;
+    }
+    let after_close = &after_open[close_bracket + 1..];
+    let Some(after_mid) = after_close.strip_prefix('(') else {
+        return LinkParse::NotALink;
+    };
+
+    let mut paren_depth = 0usize;
+    let mut close_paren = None;
+    for (idx, ch) in after_mid.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => {
+                if paren_depth == 0 {
+                    close_paren = Some(idx);
+                    break;
+                }
+                paren_depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let Some(close_paren) = close_paren else {
+        return LinkParse::NotALink;
+    };
     let url = after_mid[..close_paren].trim();
     if url.is_empty() {
-        return None;
+        return LinkParse::NotALink;
     }
     let consumed = 1 + close_bracket + 2 + close_paren + 1;
-    Some((label, url, consumed))
+    LinkParse::Found {
+        label,
+        url,
+        consumed,
+    }
 }
 
 fn is_safe_url(url: &str) -> bool {

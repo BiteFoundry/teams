@@ -100,13 +100,22 @@ struct GraphChatViewpoint {
     last_message_read_date_time: Option<String>,
 }
 
+fn deserialize_explicit_opt_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct GraphChat {
     id: String,
     #[serde(rename = "chatType", default)]
     chat_type: Option<String>,
-    #[serde(default)]
-    topic: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_explicit_opt_string")]
+    topic: Option<Option<String>>,
     #[serde(rename = "lastUpdatedDateTime", default)]
     last_updated_date_time: Option<String>,
     #[serde(rename = "webUrl", default)]
@@ -117,6 +126,14 @@ struct GraphChat {
     members: Vec<GraphConversationMember>,
     #[serde(default)]
     viewpoint: Option<GraphChatViewpoint>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ChatsListResult {
+    pub chats: Vec<ConversationSummary>,
+    pub next_link: Option<String>,
+    pub eof: bool,
+    pub explicit_null_topic_keys: HashSet<String>,
 }
 
 impl GraphClient {
@@ -189,6 +206,15 @@ impl GraphClient {
         top: usize,
         next_link: Option<&str>,
     ) -> Result<(Vec<ConversationSummary>, Option<String>)> {
+        let res = self.list_chats_page_detailed(top, next_link).await?;
+        Ok((res.chats, res.next_link))
+    }
+
+    pub(crate) async fn list_chats_page_detailed(
+        &self,
+        top: usize,
+        next_link: Option<&str>,
+    ) -> Result<ChatsListResult> {
         let my_id = self.resolve_my_user_id().await;
         let page: GraphListPage<GraphChat> = match next_link.map(str::trim).filter(|s| !s.is_empty())
         {
@@ -220,51 +246,77 @@ impl GraphClient {
             }
         };
 
-        let summaries = page
-            .value
-            .into_iter()
-            .map(|chat| map_graph_chat(chat, my_id.as_deref()))
-            .collect();
+        let mut chats = Vec::with_capacity(page.value.len());
+        let mut explicit_null_topic_keys = HashSet::new();
+        for chat in page.value {
+            let (summary, topic_present) = map_graph_chat_detailed(chat, my_id.as_deref());
+            if topic_present && summary.topic.is_none() {
+                explicit_null_topic_keys.insert(summary.conv_key.clone());
+            }
+            chats.push(summary);
+        }
         let next = page
             .next_link
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        Ok((summaries, next))
+        let eof = next.is_none();
+        Ok(ChatsListResult {
+            chats,
+            next_link: next,
+            eof,
+            explicit_null_topic_keys,
+        })
     }
 
     pub async fn list_chats(&self, limit: usize) -> Result<Vec<ConversationSummary>> {
+        Ok(self.list_chats_with_cursor(limit).await?.chats)
+    }
+
+    pub(crate) async fn list_chats_with_cursor(&self, limit: usize) -> Result<ChatsListResult> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ChatsListResult::default());
         }
 
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        let mut explicit_null_topic_keys = HashSet::new();
         let mut next_link: Option<String> = None;
+        let mut truncated_page = false;
 
         loop {
             let remaining = limit.saturating_sub(out.len());
             if remaining == 0 {
                 break;
             }
-            let (page_chats, next) = self
-                .list_chats_page(remaining.min(50), next_link.as_deref())
+            let page = self
+                .list_chats_page_detailed(remaining.min(50), next_link.as_deref())
                 .await?;
-            for chat in page_chats {
+            for chat in page.chats {
                 if seen.insert(chat.conv_key.clone()) {
-                    out.push(chat);
                     if out.len() >= limit {
+                        truncated_page = true;
                         break;
                     }
+                    if page.explicit_null_topic_keys.contains(&chat.conv_key) {
+                        explicit_null_topic_keys.insert(chat.conv_key.clone());
+                    }
+                    out.push(chat);
                 }
             }
-            if out.len() >= limit || next.is_none() {
+            next_link = page.next_link;
+            if out.len() >= limit || next_link.is_none() {
                 break;
             }
-            next_link = next;
         }
 
         out.truncate(limit);
-        Ok(out)
+        let eof = next_link.is_none() && !truncated_page;
+        Ok(ChatsListResult {
+            chats: out,
+            next_link,
+            eof,
+            explicit_null_topic_keys,
+        })
     }
 
     /// Creates a `oneOnOne` (1 peer user ID/email) or `group` (2+ peers, optional topic) chat.
@@ -334,7 +386,7 @@ impl GraphClient {
             .json()
             .await
             .context("Graph accepted the topic update, but its response could not be read")?;
-        if updated.id != chat_id || updated.topic.as_deref() != Some(topic) {
+        if updated.id != chat_id || updated.topic.as_ref().and_then(|o| o.as_deref()) != Some(topic) {
             bail!("Graph accepted the topic update, but its response did not confirm the requested chat ID and topic.");
         }
         Ok(map_graph_chat(updated, self.my_user_id()))
@@ -532,6 +584,11 @@ fn is_chats_orderby_unsupported(err: &anyhow::Error) -> bool {
 }
 
 fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSummary {
+    map_graph_chat_detailed(chat, my_user_id).0
+}
+
+fn map_graph_chat_detailed(chat: GraphChat, my_user_id: Option<&str>) -> (ConversationSummary, bool) {
+    let topic_present = chat.topic.is_some();
     let kind = match chat.chat_type.as_deref() {
         Some("oneOnOne") => ConversationKind::OneOnOne,
         Some("meeting") => ConversationKind::Meeting,
@@ -569,6 +626,7 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
 
     let topic = chat
         .topic
+        .flatten()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
 
@@ -681,24 +739,27 @@ fn map_graph_chat(chat: GraphChat, my_user_id: Option<&str>) -> ConversationSumm
         (None, None) => None,
     };
 
-    ConversationSummary {
-        conv_key,
-        target,
-        kind,
-        team_id: None,
-        team_name: None,
-        title,
-        topic,
-        unread_count,
-        last_read_at,
-        last_msg_id,
-        last_msg_author,
-        last_msg_preview,
-        last_updated_at,
-        pinned: false,
-        peer_user_id,
-        web_url: chat.web_url,
-    }
+    (
+        ConversationSummary {
+            conv_key,
+            target,
+            kind,
+            team_id: None,
+            team_name: None,
+            title,
+            topic,
+            unread_count,
+            last_read_at,
+            last_msg_id,
+            last_msg_author,
+            last_msg_preview,
+            last_updated_at,
+            pinned: false,
+            peer_user_id,
+            web_url: chat.web_url,
+        },
+        topic_present,
+    )
 }
 
 #[cfg(test)]

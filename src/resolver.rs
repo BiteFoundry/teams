@@ -13,8 +13,9 @@ use crate::{
 /// Supported query forms:
 /// 1. Exact `conv_key` (`chat:...` or `chan:<team_id>:<channel_id>`)
 /// 2. Raw `chat_id` (`19:...@thread.v2` or `19:...@unq.gbl.spaces`) or `channel_id`
-/// 3. `"<team substring>/<channel substring>"` for Team Channels
-/// 4. Case-insensitive exact match on `title`
+/// 3. Case-insensitive exact match on chat `title` or channel `"team_name/title"` (handling `/` in team names),
+///    then exact case-insensitive channel `title`
+/// 4. Slash notation `"<team substring>/<channel substring>"` (and chat title substring when query has `/`)
 /// 5. Case-insensitive unique substring match on `title` (or `"team_name/title"`)
 pub fn resolve_from_slice(
     conversations: &[ConversationSummary],
@@ -47,73 +48,73 @@ pub fn resolve_from_slice(
         );
     }
 
-    // Priority 3: Slash notation "<team_part>/<channel_part>" for Team Channels
-    if let Some((team_raw, chan_raw)) = q.split_once('/') {
-        let team_part = team_raw.trim().to_lowercase();
-        let chan_part = chan_raw.trim().to_lowercase();
-
-        if !team_part.is_empty() || !chan_part.is_empty() {
-            let channels: Vec<&ConversationSummary> = conversations
-                .iter()
-                .filter(|c| c.kind == ConversationKind::Channel)
-                .collect();
-
-            let exact_matches: Vec<&ConversationSummary> = channels
-                .iter()
-                .copied()
-                .filter(|c| {
-                    let tname = c.team_name.as_deref().unwrap_or("").to_lowercase();
-                    let cname = c.title.to_lowercase();
-                    (team_part.is_empty() || tname == team_part)
-                        && (chan_part.is_empty() || cname == chan_part)
-                })
-                .collect();
-
-            if exact_matches.len() == 1 {
-                return Ok(exact_matches[0].clone());
-            } else if exact_matches.len() > 1 {
-                bail!(
-                    "Multiple channels match '{q}' exactly:\n{}",
-                    format_candidates(&exact_matches)
-                );
-            }
-
-            let sub_matches: Vec<&ConversationSummary> = channels
-                .iter()
-                .copied()
-                .filter(|c| {
-                    let tname = c.team_name.as_deref().unwrap_or("").to_lowercase();
-                    let cname = c.title.to_lowercase();
-                    (team_part.is_empty() || tname.contains(&team_part))
-                        && (chan_part.is_empty() || cname.contains(&chan_part))
-                })
-                .collect();
-
-            if sub_matches.len() == 1 {
-                return Ok(sub_matches[0].clone());
-            } else if sub_matches.len() > 1 {
-                bail!(
-                    "Multiple channels match '{q}'. Please specify a more specific target:\n{}",
-                    format_candidates(&sub_matches)
-                );
-            }
-        }
-    }
-
     let q_lower = q.to_lowercase();
 
-    // Priority 4: Exact case-insensitive title match across all conversations
-    let exact_title_matches: Vec<&ConversationSummary> = conversations
+    // Priority 3: Case-insensitive exact match across full chat title and full "TeamName/ChannelName"
+    let exact_full_matches: Vec<&ConversationSummary> = conversations
         .iter()
-        .filter(|c| c.title.trim().to_lowercase() == q_lower)
+        .filter(|c| {
+            if c.kind == ConversationKind::Channel {
+                c.team_name
+                    .as_deref()
+                    .is_some_and(|team| matches_exact_team_channel(&q_lower, team, &c.title))
+            } else {
+                c.title.trim().to_lowercase() == q_lower
+            }
+        })
         .collect();
-    if exact_title_matches.len() == 1 {
-        return Ok(exact_title_matches[0].clone());
-    } else if exact_title_matches.len() > 1 {
+    if exact_full_matches.len() == 1 {
+        return Ok(exact_full_matches[0].clone());
+    } else if exact_full_matches.len() > 1 {
+        bail!(
+            "Multiple targets match '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
+            format_candidates(&exact_full_matches)
+        );
+    }
+
+    // Priority 3b: Case-insensitive exact channel title match (e.g. "General" without team prefix)
+    let exact_channel_title_matches: Vec<&ConversationSummary> = conversations
+        .iter()
+        .filter(|c| c.kind == ConversationKind::Channel && c.title.trim().to_lowercase() == q_lower)
+        .collect();
+    if exact_channel_title_matches.len() == 1 {
+        return Ok(exact_channel_title_matches[0].clone());
+    } else if exact_channel_title_matches.len() > 1 {
         bail!(
             "Multiple targets match title '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
-            format_candidates(&exact_title_matches)
+            format_candidates(&exact_channel_title_matches)
         );
+    }
+
+    // Priority 4: Slash notation partial match "<team_part>/<channel_part>" (supports '/' inside team names)
+    if q.contains('/') {
+        let slash_matches: Vec<&ConversationSummary> = conversations
+            .iter()
+            .filter(|c| {
+                if c.kind == ConversationKind::Channel {
+                    let tname = c.team_name.as_deref().unwrap_or("").to_lowercase();
+                    let cname = c.title.to_lowercase();
+                    q.match_indices('/').any(|(idx, _)| {
+                        let team_part = q[..idx].trim().to_lowercase();
+                        let chan_part = q[idx + 1..].trim().to_lowercase();
+                        (!team_part.is_empty() || !chan_part.is_empty())
+                            && (team_part.is_empty() || tname.contains(&team_part))
+                            && (chan_part.is_empty() || cname.contains(&chan_part))
+                    })
+                } else {
+                    c.title.to_lowercase().contains(&q_lower)
+                }
+            })
+            .collect();
+
+        if slash_matches.len() == 1 {
+            return Ok(slash_matches[0].clone());
+        } else if slash_matches.len() > 1 {
+            bail!(
+                "Multiple targets match '{q}'. Please specify a more specific target:\n{}",
+                format_candidates(&slash_matches)
+            );
+        }
     }
 
     // Priority 5: Unique case-insensitive substring match on title or "team_name/title"
@@ -144,6 +145,20 @@ pub fn resolve_from_slice(
     }
 }
 
+fn matches_exact_team_channel(q_lower: &str, team_name: &str, channel_title: &str) -> bool {
+    let team_lower = team_name.trim().to_lowercase();
+    let chan_lower = channel_title.trim().to_lowercase();
+    if team_lower.is_empty() || chan_lower.is_empty() {
+        return false;
+    }
+    if let Some(rest) = q_lower.strip_prefix(&team_lower) {
+        if let Some(after_slash) = rest.trim_start().strip_prefix('/') {
+            return after_slash.trim() == chan_lower;
+        }
+    }
+    false
+}
+
 /// Resolves against local SQLite cache first, refreshing from Graph once if not found.
 pub async fn resolve_conversation(
     storage: &Storage,
@@ -161,8 +176,11 @@ pub async fn resolve_conversation(
     }
 
     if q.starts_with("chat:") {
-        let chats = graph.list_chats(150).await?;
-        storage.upsert_conversations(&chats)?;
+        let fetched = graph.list_chats_with_cursor(150).await?;
+        storage.upsert_conversations_with_null_topics(
+            &fetched.chats,
+            &fetched.explicit_null_topic_keys,
+        )?;
         let refreshed = storage.list_conversations()?;
         if let Ok(found) = resolve_from_slice(&refreshed, q) {
             return Ok(found);
@@ -187,42 +205,45 @@ pub async fn resolve_conversation(
     }
 
     let (chats_res, teams_res) = tokio::join!(
-        graph.list_chats(150),
+        graph.list_chats_with_cursor(150),
         graph.list_joined_teams_with_channels(),
     );
 
-    let mut first_err: Option<anyhow::Error> = None;
-    let chats = match chats_res {
+    let mut chats_err: Option<anyhow::Error> = None;
+    let mut teams_err: Option<anyhow::Error> = None;
+    match chats_res {
         Ok(c) => {
-            storage.upsert_conversations(&c)?;
-            c
+            storage.upsert_conversations_with_null_topics(&c.chats, &c.explicit_null_topic_keys)?;
         }
         Err(err) => {
-            first_err = Some(err);
-            Vec::new()
+            chats_err = Some(err);
         }
-    };
-    let teams = match teams_res {
+    }
+    match teams_res {
         Ok(t) => {
             storage.upsert_teams(&t)?;
-            t
         }
         Err(err) => {
-            if first_err.is_none() {
-                first_err = Some(err);
-            }
-            Vec::new()
-        }
-    };
-
-    let refreshed = storage.list_conversations()?;
-    if (refreshed.is_empty() || chats.is_empty()) && teams.is_empty() {
-        if let Some(err) = first_err {
-            return Err(err);
+            teams_err = Some(err);
         }
     }
 
-    resolve_from_slice(&refreshed, q)
+    let refreshed = storage.list_conversations()?;
+    match resolve_from_slice(&refreshed, q) {
+        Ok(found) => Ok(found),
+        Err(resolve_err) => match (chats_err, teams_err) {
+            (Some(ce), Some(te)) => Err(anyhow::anyhow!(
+                "{resolve_err} (chats lookup failed: {ce:#}; teams/channels lookup failed: {te:#})"
+            )),
+            (Some(ce), None) => Err(anyhow::anyhow!(
+                "{resolve_err} (chats lookup failed: {ce:#})"
+            )),
+            (None, Some(te)) => Err(anyhow::anyhow!(
+                "{resolve_err} (teams/channels lookup failed: {te:#})"
+            )),
+            (None, None) => Err(resolve_err),
+        },
+    }
 }
 
 fn summary_from_target(target: ConversationTarget) -> ConversationSummary {

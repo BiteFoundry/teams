@@ -2952,3 +2952,3386 @@ async fn e2e_built_cli_hyphen_inputs_markdown_lists_and_partial_edit_mock_graph(
 
     server.abort();
 }
+
+#[tokio::test]
+async fn regression_teams_bug_11_slash_resolution_and_joined_teams_403() {
+    #[derive(Default)]
+    struct Bug11State {
+        include_exact_ui_ux_channel: RwLock<bool>,
+        joined_teams_403: RwLock<bool>,
+        posted_chats: RwLock<Vec<(String, Value)>>,
+        posted_channels: RwLock<Vec<(String, String, Value)>>,
+    }
+
+    let state = Arc::new(Bug11State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:uiux@thread.v2",
+                        "chatType": "group",
+                        "topic": "UI/UX",
+                        "lastUpdatedDateTime": "2026-11-21T05:00:00Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(|Path(_chat_id): Path<String>| async {
+                Json(json!({
+                    "value": [{
+                        "id": "chat-seed-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-21T05:00:00Z",
+                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                        "body": { "contentType": "html", "content": "<p>chat seed</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }]
+                }))
+            })
+            .post(
+                |State(st): State<Arc<Bug11State>>,
+                 Path(chat_id): Path<String>,
+                 Json(payload): Json<Value>| async move {
+                    st.posted_chats
+                        .write()
+                        .unwrap()
+                        .push((chat_id.clone(), payload.clone()));
+                    let content = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "chat-sent-1",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T05:10:00Z",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": content },
+                            "mentions": [],
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|State(st): State<Arc<Bug11State>>| async move {
+                if *st.joined_teams_403.read().unwrap() {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": {
+                                "code": "Authorization_RequestDenied",
+                                "message": "Insufficient privileges to complete the operation."
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                let mut teams = vec![
+                    json!({ "id": "t-ui", "displayName": "UI Team" }),
+                    json!({ "id": "t-org", "displayName": "Org/Platform" }),
+                ];
+                if *st.include_exact_ui_ux_channel.read().unwrap() {
+                    teams.push(json!({ "id": "t-exact", "displayName": "UI" }));
+                }
+                Json(json!({ "value": teams })).into_response()
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(
+                |State(st): State<Arc<Bug11State>>, Json(payload): Json<Value>| async move {
+                    let reqs = payload
+                        .get("requests")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    let responses: Vec<Value> = reqs
+                        .into_iter()
+                        .map(|req| {
+                            let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                            let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            if url.contains("/teams/t-ui/channels") {
+                                json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": { "value": [{ "id": "ch-ux", "displayName": "UX Review", "membershipType": "standard" }] }
+                                })
+                            } else if url.contains("/teams/t-org/channels") {
+                                json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [
+                                            { "id": "ch-g", "displayName": "General", "membershipType": "standard" },
+                                            { "id": "ch-g2", "displayName": "General 2", "membershipType": "standard" }
+                                        ]
+                                    }
+                                })
+                            } else if url.contains("/teams/t-exact/channels")
+                                && *st.include_exact_ui_ux_channel.read().unwrap()
+                            {
+                                json!({
+                                    "id": req_id,
+                                    "status": 200,
+                                    "body": { "value": [{ "id": "ch-exact-ux", "displayName": "UX", "membershipType": "standard" }] }
+                                })
+                            } else {
+                                json!({
+                                    "id": req_id,
+                                    "status": 404,
+                                    "body": { "error": { "code": "NotFound", "message": "not found" } }
+                                })
+                            }
+                        })
+                        .collect();
+                    Json(json!({ "responses": responses }))
+                },
+            ),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
+            get(|| async { Json(json!({ "value": [] })) }).post(
+                |State(st): State<Arc<Bug11State>>,
+                 Path((team_id, channel_id)): Path<(String, String)>,
+                 Json(payload): Json<Value>| async move {
+                    st.posted_channels.write().unwrap().push((
+                        team_id,
+                        channel_id,
+                        payload.clone(),
+                    ));
+                    let content = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "chan-sent-1",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T05:11:00Z",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": content },
+                            "mentions": [],
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    // Case 1: Chat "UI/UX" coexists with Channel "UI Team/UX Review" -> send "UI/UX" posts to chat (1) and channel (0)
+    let tmp1 = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp1, &["chats", "--refresh", "--json"]).await.status.success());
+    assert!(run_cli(&tmp1, &["teams", "--refresh", "--json"]).await.status.success());
+
+    let out = run_cli(&tmp1, &["send", "UI/UX", "hello uiux", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "send UI/UX failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(state.posted_chats.read().unwrap().len(), 1);
+    assert_eq!(state.posted_chats.read().unwrap()[0].0, "19:uiux@thread.v2");
+    assert_eq!(state.posted_channels.read().unwrap().len(), 0);
+
+    // Case 2: Team name with slash "Org/Platform" + channel "General" -> routes to chan:t-org:ch-g
+    let out = run_cli(&tmp1, &["send", "Org/Platform/General", "hello org", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "send Org/Platform/General failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(state.posted_channels.read().unwrap().len(), 1);
+    assert_eq!(state.posted_channels.read().unwrap()[0].0, "t-org");
+    assert_eq!(state.posted_channels.read().unwrap()[0].1, "ch-g");
+
+    // Control: explicit conv_key still sends directly to the specified target
+    let out = run_cli(&tmp1, &["send", "chan:t-ui:ch-ux", "explicit chan", "--json"]).await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(state.posted_channels.read().unwrap().len(), 2);
+    assert_eq!(state.posted_channels.read().unwrap()[1].0, "t-ui");
+    assert_eq!(state.posted_channels.read().unwrap()[1].1, "ch-ux");
+
+    // Case 3: Two exact matches (chat "UI/UX" + channel "UI"/"UX") -> fails with candidate keys and 0 POSTs
+    *state.include_exact_ui_ux_channel.write().unwrap() = true;
+    state.posted_chats.write().unwrap().clear();
+    state.posted_channels.write().unwrap().clear();
+    let tmp2 = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp2, &["chats", "--refresh", "--json"]).await.status.success());
+    assert!(run_cli(&tmp2, &["teams", "--refresh", "--json"]).await.status.success());
+    let out = run_cli(&tmp2, &["send", "UI/UX", "ambiguous", "--json"]).await;
+    assert!(
+        !out.status.success(),
+        "expected ambiguity failure for two exact matches, got stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("chat:19:uiux@thread.v2") && stderr.contains("chan:t-exact:ch-exact-ux"),
+        "expected candidate conv_keys in stderr, got: {stderr}"
+    );
+    assert_eq!(state.posted_chats.read().unwrap().len(), 0);
+    assert_eq!(state.posted_channels.read().unwrap().len(), 0);
+
+    // Case 4: joinedTeams returns 403 -> channel lookup error and sync summary both expose 403 while chat sync still succeeds
+    *state.joined_teams_403.write().unwrap() = true;
+    let tmp3 = tempfile::tempdir().unwrap();
+    let read_out = run_cli(&tmp3, &["read", "UI Team/UX Review", "--json"]).await;
+    assert!(!read_out.status.success());
+    let read_err = String::from_utf8_lossy(&read_out.stderr);
+    assert!(
+        read_err.contains("403"),
+        "expected 403 in channel lookup error, got: {read_err}"
+    );
+
+    let sync_out = run_cli(&tmp3, &["sync", "--json"]).await;
+    assert!(
+        sync_out.status.success(),
+        "sync should still finish partial chat sync: stderr={}",
+        String::from_utf8_lossy(&sync_out.stderr)
+    );
+    let sync_json: Value = serde_json::from_slice(&sync_out.stdout).expect("parse sync json");
+    assert_eq!(sync_json["ok"], false, "sync ok must be false on joinedTeams 403: {sync_json}");
+    let sync_errors = sync_json["errors"].as_array().unwrap();
+    assert!(
+        sync_errors
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("403")),
+        "expected 403 in sync errors, got: {sync_json}"
+    );
+    assert!(
+        sync_json["conversations_synced"].as_u64().unwrap_or(0) >= 1
+            && sync_json["messages_synced"].as_u64().unwrap_or(0) >= 1,
+        "expected successful chat sync results alongside teams error: {sync_json}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_06_soft_delete_cache_and_export() {
+    #[derive(Default)]
+    struct Bug06State {
+        fail_delete: RwLock<bool>,
+        deleted_ids: RwLock<Vec<String>>,
+    }
+
+    let state = Arc::new(Bug06State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route("/v1.0/me/chats", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({
+                    "value": [{ "id": "t1", "displayName": "CoreEng" }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        json!({
+                            "id": req["id"].as_str().unwrap_or("0"),
+                            "status": 200,
+                            "body": { "value": [{ "id": "ch1", "displayName": "General", "membershipType": "standard" }] }
+                        })
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        {
+                            "id": "m-normal",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T09:00:01.000Z",
+                            "subject": "Normal Notice",
+                            "importance": "normal",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": "<p>Keep this normal body</p><attachment id=\"att-n\"></attachment>" },
+                            "attachments": [{
+                                "id": "att-n",
+                                "contentType": "reference",
+                                "contentUrl": "https://contoso.sharepoint.com/normal-doc.pdf",
+                                "name": "normal-doc.pdf"
+                            }],
+                            "mentions": [],
+                            "reactions": [],
+                            "replies": []
+                        },
+                        {
+                            "id": "m-del",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T09:00:02.000Z",
+                            "subject": "Confidential Subject",
+                            "importance": "high",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": "<p>Budget attached secret-token-06 <at id=\"0\">Alice Kim</at></p><attachment id=\"att9\"></attachment>" },
+                            "attachments": [{
+                                "id": "att9",
+                                "contentType": "reference",
+                                "contentUrl": "https://contoso.sharepoint.com/secret-budget.pdf",
+                                "name": "secret-budget.pdf"
+                            }],
+                            "mentions": [{
+                                "id": 0,
+                                "mentionText": "Alice Kim",
+                                "mentioned": { "user": { "id": "u-alice", "displayName": "Alice Kim" } }
+                            }],
+                            "reactions": [{
+                                "reactionType": "like",
+                                "createdDateTime": "2026-11-21T09:00:03.000Z",
+                                "user": { "user": { "id": "u-alice", "displayName": "Alice Kim" } }
+                            }],
+                            "replies": []
+                        }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages/{msg_id}/softDelete",
+            post(
+                |State(st): State<Arc<Bug06State>>, Path(msg_id): Path<String>| async move {
+                    if *st.fail_delete.read().unwrap() {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": { "code": "InternalServerError", "message": "server boom" } })),
+                        )
+                            .into_response();
+                    }
+                    st.deleted_ids.write().unwrap().push(msg_id);
+                    StatusCode::NO_CONTENT.into_response()
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+
+    let run_cli = |args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    // Populate cache via read
+    let out = run_cli(&["read", "CoreEng/General", "--json"]).await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+
+    // Control 1: server error on delete keeps original message and search hit intact
+    *state.fail_delete.write().unwrap() = true;
+    let failed_del = run_cli(&["delete", "CoreEng/General", "m-del", "--yes", "--json"]).await;
+    assert!(!failed_del.status.success());
+    let search_before = run_cli(&["search", "secret-token-06", "--json"]).await;
+    assert!(search_before.status.success());
+    let sb_json: Value = serde_json::from_slice(&search_before.stdout).unwrap();
+    assert_eq!(sb_json["hits"].as_array().unwrap().len(), 1);
+
+    // Now succeed delete
+    *state.fail_delete.write().unwrap() = false;
+    let del_out = run_cli(&["delete", "CoreEng/General", "m-del", "--yes", "--json"]).await;
+    assert!(del_out.status.success(), "stderr={}", String::from_utf8_lossy(&del_out.stderr));
+
+    // Offline read (JSON): deleted=true, IDs & created_at preserved, metadata cleared
+    let read_json_out = run_cli(&["read", "CoreEng/General", "--offline", "--json"]).await;
+    assert!(read_json_out.status.success());
+    let rj: Value = serde_json::from_slice(&read_json_out.stdout).unwrap();
+    let del_msg = rj["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["msg_id"] == "m-del")
+        .expect("deleted row preserved");
+    assert_eq!(del_msg["deleted"], true);
+    assert_eq!(del_msg["created_at"], "2026-11-21T09:00:02.000Z");
+    assert_eq!(del_msg["body_plain"], "(deleted message)");
+    assert!(del_msg["subject"].is_null(), "subject must be cleared: {del_msg}");
+    assert!(del_msg["attachments"].as_array().unwrap().is_empty(), "attachments must be cleared: {del_msg}");
+    assert!(del_msg["mentions"].as_array().unwrap().is_empty(), "mentions must be cleared: {del_msg}");
+    assert!(del_msg["reactions"].as_array().unwrap().is_empty(), "reactions must be cleared: {del_msg}");
+
+    // Offline read (text): has "(deleted message)" and no old subject/file/reaction
+    let read_txt_out = run_cli(&["read", "CoreEng/General", "--offline"]).await;
+    assert!(read_txt_out.status.success());
+    let read_txt = String::from_utf8_lossy(&read_txt_out.stdout);
+    let del_line = read_txt
+        .lines()
+        .find(|l| l.contains("m-del"))
+        .expect("deleted message line present");
+    assert!(del_line.contains("(deleted message)"), "{del_line}");
+    assert!(!del_line.contains("Confidential Subject"), "{del_line}");
+    assert!(!del_line.contains("secret-budget.pdf"), "{del_line}");
+    assert!(!del_line.contains("👍"), "{del_line}");
+
+    // Offline export md: deleted marker present, old metadata absent, normal message intact
+    let md_path = tmp.path().join("off.md");
+    let exp_out = run_cli(&[
+        "export",
+        "CoreEng/General",
+        "--offline",
+        "--format",
+        "md",
+        "--out",
+        md_path.to_str().unwrap(),
+    ])
+    .await;
+    assert!(exp_out.status.success(), "stderr={}", String::from_utf8_lossy(&exp_out.stderr));
+    let md_text = std::fs::read_to_string(&md_path).unwrap();
+    assert!(md_text.contains("(deleted message)"), "{md_text}");
+    assert!(!md_text.contains("Confidential Subject"), "{md_text}");
+    assert!(!md_text.contains("secret-budget.pdf"), "{md_text}");
+    // Regression control: normal message keeps subject & attachment
+    assert!(md_text.contains("## Normal Notice"), "{md_text}");
+    assert!(md_text.contains("normal-doc.pdf"), "{md_text}");
+
+    // Search must not match deleted body or old subject
+    for q in ["secret-token-06", "Confidential Subject"] {
+        let s_out = run_cli(&["search", q, "--json"]).await;
+        assert!(s_out.status.success());
+        let sj: Value = serde_json::from_slice(&s_out.stdout).unwrap();
+        assert!(
+            sj["hits"].as_array().unwrap().is_empty(),
+            "deleted message must not appear in search for '{q}': {sj}"
+        );
+    }
+
+    // Legacy pre-upgrade deleted row in SQLite (deleted=1 with stale subject/attachments/reactions)
+    let db_path = data_dir.join("me-user-1").join("cache.db");
+    assert!(db_path.exists(), "expected user cache db at {}", db_path.display());
+    let storage = Storage::open(&db_path).unwrap();
+    {
+        let conn = storage.conn().lock().unwrap();
+        conn.execute(
+            "INSERT INTO messages (
+                msg_key, conv_key, msg_id, parent_msg_id, subject, author_id, author_name,
+                is_me, created_at, deleted, importance, message_type, body_html, body_plain,
+                attachments_json, mentions_json, reactions_json, reply_count, has_mentions
+            ) VALUES (
+                'chan:t1:ch1|m-legacy-del', 'chan:t1:ch1', 'm-legacy-del', NULL,
+                'Legacy Stale Subject', 'me-user-1', 'Me (Tester)',
+                1, '2026-11-21T09:00:03.000Z', 1, 'high', 'message', '', '(deleted message)',
+                '[{\"id\":\"att-leg\",\"content_type\":\"reference\",\"name\":\"legacy-file.pdf\"}]',
+                '[]',
+                '[{\"reaction_type\":\"like\",\"count\":2,\"me_reacted\":true,\"users\":[\"Alice\"]}]',
+                0, 0
+            )",
+            [],
+        )
+        .unwrap();
+    }
+    drop(storage);
+
+    let legacy_read = run_cli(&["read", "CoreEng/General", "--offline"]).await;
+    assert!(legacy_read.status.success());
+    let legacy_read_txt = String::from_utf8_lossy(&legacy_read.stdout);
+    let legacy_line = legacy_read_txt
+        .lines()
+        .find(|l| l.contains("m-legacy-del"))
+        .expect("legacy deleted line present");
+    assert!(legacy_line.contains("(deleted message)"), "{legacy_line}");
+    assert!(!legacy_line.contains("Legacy Stale Subject"), "{legacy_line}");
+    assert!(!legacy_line.contains("legacy-file.pdf"), "{legacy_line}");
+    assert!(!legacy_line.contains("👍"), "{legacy_line}");
+
+    let legacy_md_path = tmp.path().join("legacy.md");
+    let legacy_exp = run_cli(&[
+        "export",
+        "CoreEng/General",
+        "--offline",
+        "--format",
+        "md",
+        "--out",
+        legacy_md_path.to_str().unwrap(),
+    ])
+    .await;
+    assert!(legacy_exp.status.success());
+    let legacy_md = std::fs::read_to_string(&legacy_md_path).unwrap();
+    assert!(!legacy_md.contains("Legacy Stale Subject"), "{legacy_md}");
+    assert!(!legacy_md.contains("legacy-file.pdf"), "{legacy_md}");
+    assert_eq!(legacy_md.matches("(deleted message)").count(), 2, "{legacy_md}");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_04_timestamp_order_and_before_boundary() {
+    let fixture_msgs = vec![
+        ("a-before", "2026-11-20T23:59:59.900Z", "msg before midnight"),
+        ("b-exact", "2026-11-21T00:00:00Z", "msg exact midnight z"),
+        ("b-kst", "2026-11-21T09:00:00+09:00", "msg exact midnight kst"),
+        ("c-001", "2026-11-21T00:00:00.001Z", "msg 1ms after"),
+        ("d-500", "2026-11-21T00:00:00.500Z", "msg 500ms after"),
+    ];
+    let graph_msgs: Vec<Value> = fixture_msgs
+        .iter()
+        .rev()
+        .map(|(id, ts, body)| {
+            json!({
+                "id": id,
+                "messageType": "message",
+                "createdDateTime": ts,
+                "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                "body": { "contentType": "html", "content": format!("<p>{body}</p>") },
+                "mentions": [],
+                "attachments": [],
+                "reactions": []
+            })
+        })
+        .collect();
+    let graph_msgs_arc = Arc::new(graph_msgs);
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:ts@thread.v2",
+                        "chatType": "group",
+                        "topic": "TsChat",
+                        "lastUpdatedDateTime": "2026-11-21T00:00:00.500Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route("/v1.0/me/joinedTeams", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get({
+                let msgs = graph_msgs_arc.clone();
+                move |Path(_chat_id): Path<String>| {
+                    let msgs = msgs.clone();
+                    async move { Json(json!({ "value": *msgs })) }
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+
+    let run_cli = |args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let expected_all = vec!["a-before", "b-exact", "b-kst", "c-001", "d-500"];
+
+    // Online read order (with exact tie-break b-exact < b-kst) and preserved raw created_at strings
+    let out = run_cli(&["read", "TsChat", "--json"]).await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let j_online: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let online_ids: Vec<&str> = j_online["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["msg_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(online_ids, expected_all, "online read order mismatch");
+    let online_ts: HashMap<&str, &str> = j_online["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["msg_id"].as_str().unwrap(), m["created_at"].as_str().unwrap()))
+        .collect();
+    assert_eq!(online_ts["b-exact"], "2026-11-21T00:00:00Z");
+    assert_eq!(online_ts["b-kst"], "2026-11-21T09:00:00+09:00");
+
+    // Offline read order matches online
+    let out_off = run_cli(&["read", "TsChat", "--offline", "--json"]).await;
+    assert!(out_off.status.success());
+    let j_off: Value = serde_json::from_slice(&out_off.stdout).unwrap();
+    let off_ids: Vec<&str> = j_off["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["msg_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(off_ids, expected_all, "offline read order mismatch");
+
+    // --before 2026-11-21 (date boundary = 00:00:00Z) returns ONLY a-before (online and offline)
+    for extra in [&[][..], &["--offline"][..]] {
+        let mut args = vec!["read", "TsChat", "--before", "2026-11-21", "--json"];
+        args.extend_from_slice(extra);
+        let r = run_cli(&args).await;
+        assert!(r.status.success(), "stderr={}", String::from_utf8_lossy(&r.stderr));
+        let j: Value = serde_json::from_slice(&r.stdout).unwrap();
+        let got: Vec<&str> = j["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["msg_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["a-before"], "args={args:?}");
+    }
+
+    // --before 2026-11-21T00:00:00.500Z returns a-before, b-exact, b-kst, c-001 (online and offline)
+    for extra in [&[][..], &["--offline"][..]] {
+        let mut args = vec![
+            "read",
+            "TsChat",
+            "--before",
+            "2026-11-21T00:00:00.500Z",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let r = run_cli(&args).await;
+        assert!(r.status.success(), "stderr={}", String::from_utf8_lossy(&r.stderr));
+        let j: Value = serde_json::from_slice(&r.stdout).unwrap();
+        let got: Vec<&str> = j["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["msg_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(got, vec!["a-before", "b-exact", "b-kst", "c-001"], "args={args:?}");
+    }
+
+    // Regression control: re-running read does not duplicate DB rows or search hits
+    let out2 = run_cli(&["read", "TsChat", "--json"]).await;
+    assert!(out2.status.success());
+    let search_out = run_cli(&["search", "midnight", "--json"]).await;
+    assert!(search_out.status.success());
+    let sj: Value = serde_json::from_slice(&search_out.stdout).unwrap();
+    assert_eq!(sj["hits"].as_array().unwrap().len(), 3, "no duplicate search hits: {sj}");
+
+    // Pre-upgrade v55 DB without created_at_sort column: opening via Storage::open migrates in one transaction
+    let legacy_tmp = tempfile::tempdir().unwrap();
+    let legacy_data = legacy_tmp.path().join("data");
+    std::fs::create_dir_all(&legacy_data).unwrap();
+    let legacy_db = legacy_data.join("cache.db");
+    {
+        let conn = rusqlite::Connection::open(&legacy_db).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE conversations (
+                conv_key TEXT PRIMARY KEY,
+                target_json TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                team_id TEXT,
+                team_name TEXT,
+                title TEXT NOT NULL,
+                topic TEXT,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                last_read_at TEXT,
+                last_msg_id TEXT,
+                last_msg_author TEXT,
+                last_msg_preview TEXT,
+                last_updated_at TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                peer_user_id TEXT,
+                web_url TEXT
+            );
+            CREATE INDEX idx_conversations_sort_v2 ON conversations(pinned DESC, COALESCE(last_updated_at, '') DESC, title ASC);
+            CREATE TABLE teams (team_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, description TEXT, channels_json TEXT NOT NULL);
+            CREATE TABLE messages (
+                msg_key TEXT PRIMARY KEY,
+                conv_key TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                parent_msg_id TEXT,
+                reply_to_id TEXT,
+                reply_to_author TEXT,
+                reply_to_preview TEXT,
+                subject TEXT,
+                author_id TEXT,
+                author_name TEXT NOT NULL,
+                is_me INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                last_modified_at TEXT,
+                deleted INTEGER NOT NULL DEFAULT 0,
+                importance TEXT NOT NULL,
+                message_type TEXT NOT NULL,
+                body_html TEXT NOT NULL,
+                body_plain TEXT NOT NULL,
+                attachments_json TEXT NOT NULL,
+                mentions_json TEXT NOT NULL,
+                reactions_json TEXT NOT NULL,
+                reply_count INTEGER NOT NULL DEFAULT 0,
+                web_url TEXT,
+                has_mentions INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_messages_conv_root_created_id ON messages(conv_key, parent_msg_id, created_at DESC, msg_id DESC);
+            CREATE INDEX idx_messages_conv_msg ON messages(conv_key, msg_id);
+            CREATE INDEX idx_messages_created ON messages(created_at DESC);
+            CREATE INDEX idx_messages_has_mentions ON messages(created_at DESC, msg_id DESC) WHERE deleted = 0 AND has_mentions = 1;
+            CREATE TABLE members (conv_key TEXT NOT NULL, user_id TEXT NOT NULL, member_id TEXT, display_name TEXT NOT NULL, email TEXT, roles_json TEXT NOT NULL, PRIMARY KEY (conv_key, user_id));
+            CREATE TABLE presences (user_id TEXT PRIMARY KEY, availability TEXT NOT NULL, activity TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE sync_cursors (scope_key TEXT PRIMARY KEY, delta_link TEXT, oldest_msg_ts TEXT, synced_at TEXT NOT NULL);
+            CREATE TABLE thread_reply_windows (conv_key TEXT NOT NULL, root_msg_id TEXT NOT NULL, reply_ids_json TEXT NOT NULL, complete INTEGER NOT NULL, PRIMARY KEY (conv_key, root_msg_id));
+            CREATE VIRTUAL TABLE messages_fts USING fts5(msg_key UNINDEXED, conv_key UNINDEXED, author_name, body_plain, subject, tokenize='trigram');
+            INSERT INTO conversations (conv_key, target_json, kind, title)
+            VALUES ('chat:19:ts@thread.v2', '{\"target_type\":\"chat\",\"chat_id\":\"19:ts@thread.v2\"}', 'group', 'TsChat');
+            PRAGMA user_version = 55;
+            ",
+        )
+        .unwrap();
+        for (id, ts, body) in &fixture_msgs {
+            let mk = format!("chat:19:ts@thread.v2|{id}");
+            conn.execute(
+                "INSERT INTO messages (
+                    msg_key, conv_key, msg_id, author_name, created_at, importance,
+                    message_type, body_html, body_plain, attachments_json, mentions_json, reactions_json
+                ) VALUES (?1, 'chat:19:ts@thread.v2', ?2, 'Alice', ?3, 'normal', 'message', ?4, ?5, '[]', '[]', '[]')",
+                rusqlite::params![mk, id, ts, format!("<p>{body}</p>"), body],
+            )
+            .unwrap();
+        }
+    }
+
+    let upgraded = Storage::open(&legacy_db).unwrap();
+    let up_all: Vec<String> = upgraded
+        .list_root_messages("chat:19:ts@thread.v2", 10, None)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.msg_id)
+        .collect();
+    assert_eq!(up_all, expected_all, "pre-upgrade DB order mismatch");
+    let up_before_midnight: Vec<String> = upgraded
+        .list_older_root_messages("chat:19:ts@thread.v2", 10, "2026-11-21T00:00:00Z", None)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.msg_id)
+        .collect();
+    assert_eq!(up_before_midnight, vec!["a-before"]);
+    let up_before_500: Vec<String> = upgraded
+        .list_older_root_messages("chat:19:ts@thread.v2", 10, "2026-11-21T00:00:00.500Z", None)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.msg_id)
+        .collect();
+    assert_eq!(up_before_500, vec!["a-before", "b-exact", "b-kst", "c-001"]);
+    // Re-opening upgraded DB keeps exact same row count (5)
+    drop(upgraded);
+    let reopened = Storage::open(&legacy_db).unwrap();
+    assert_eq!(
+        reopened.list_root_messages("chat:19:ts@thread.v2", 20, None).unwrap().len(),
+        5
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_03_history_cursor_no_gap() {
+    #[derive(Default)]
+    struct Bug03State {
+        /// Stored oldest-first (m01, m02, ...); Graph endpoint serves newest-first.
+        messages: RwLock<Vec<(String, String)>>,
+        fail_latest: RwLock<bool>,
+        requests: RwLock<Vec<String>>,
+        base_url: RwLock<String>,
+    }
+
+    let state = Arc::new(Bug03State::default());
+    let mk_ts = |i: usize| format!("2026-11-21T09:00:{i:02}.000Z");
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:pag@thread.v2",
+                        "chatType": "group",
+                        "topic": "PagChat",
+                        "lastUpdatedDateTime": "2026-11-21T09:00:15.000Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route("/v1.0/me/joinedTeams", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(
+                |State(st): State<Arc<Bug03State>>,
+                 Path(chat_id): Path<String>,
+                 RawQuery(query): RawQuery| async move {
+                    let q = query.unwrap_or_default();
+                    st.requests.write().unwrap().push(q.clone());
+
+                    let mut top: usize = 5;
+                    let mut after_id: Option<String> = None;
+                    for pair in q.split('&').filter(|s| !s.is_empty()) {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            if k == "$top" {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    top = n.min(5);
+                                }
+                            } else if k == "$skiptoken" {
+                                if let Some(id) = v.strip_prefix("after:") {
+                                    after_id = Some(id.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if after_id.is_none() && *st.fail_latest.read().unwrap() {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": { "code": "InternalServerError", "message": "transient error" } })),
+                        )
+                            .into_response();
+                    }
+
+                    // Newest-first view
+                    let all_desc: Vec<(String, String)> =
+                        st.messages.read().unwrap().iter().rev().cloned().collect();
+                    let start_idx = match after_id.as_deref() {
+                        None => 0,
+                        Some(anchor) => all_desc
+                            .iter()
+                            .position(|(id, _)| id == anchor)
+                            .map(|pos| pos + 1)
+                            .unwrap_or(all_desc.len()),
+                    };
+                    let slice: Vec<(String, String)> =
+                        all_desc.iter().skip(start_idx).take(top).cloned().collect();
+                    let has_more = start_idx + slice.len() < all_desc.len();
+                    let base = st.base_url.read().unwrap().clone();
+                    let next_link = if has_more {
+                        slice.last().map(|(last_id, _)| {
+                            format!(
+                                "{base}/chats/{}/messages?$top={top}&$skiptoken=after:{last_id}",
+                                urlencoding::encode(&chat_id)
+                            )
+                        })
+                    } else {
+                        None
+                    };
+
+                    let values: Vec<Value> = slice
+                        .into_iter()
+                        .map(|(id, ts)| {
+                            json!({
+                                "id": id,
+                                "messageType": "message",
+                                "createdDateTime": ts,
+                                "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": format!("<p>body {id}</p>") },
+                                "mentions": [],
+                                "attachments": [],
+                                "reactions": []
+                            })
+                        })
+                        .collect();
+
+                    let mut body = json!({ "value": values });
+                    if let Some(nl) = next_link {
+                        body["@odata.nextLink"] = Value::String(nl);
+                    }
+                    Json(body).into_response()
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    *state.base_url.write().unwrap() = graph_base.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let parse_ids = |out: &std::process::Output| -> Vec<String> {
+        assert!(
+            out.status.success(),
+            "cmd failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let j: Value = serde_json::from_slice(&out.stdout).expect("parse read json");
+        j["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["msg_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // Case 1 (e03_gap): m01..m10 -> read limit 3 -> m11..m15 arrive -> read limit 3 -> first --before m13 --limit 5
+    *state.messages.write().unwrap() = (1..=10).map(|i| (format!("m{i:02}"), mk_ts(i))).collect();
+    let tmp1 = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp1, &["chats", "--json"]).await.status.success());
+    assert_eq!(
+        parse_ids(&run_cli(&tmp1, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m08", "m09", "m10"]
+    );
+
+    // Regression control 1: if latest page fetch fails, previous cursor is preserved intact
+    let db1_path = tmp1.path().join("data").join("me-user-1").join("cache.db");
+    let cursor_before_fail = {
+        let st = Storage::open(&db1_path).unwrap();
+        st.get_sync_cursor("history:chat:19:pag@thread.v2").unwrap().unwrap()
+    };
+    *state.fail_latest.write().unwrap() = true;
+    let fail_res = run_cli(&tmp1, &["read", "PagChat", "--limit", "3", "--json"]).await;
+    assert!(!fail_res.status.success());
+    let cursor_after_fail = {
+        let st = Storage::open(&db1_path).unwrap();
+        st.get_sync_cursor("history:chat:19:pag@thread.v2").unwrap().unwrap()
+    };
+    assert_eq!(cursor_after_fail.delta_link, cursor_before_fail.delta_link);
+    assert_eq!(cursor_after_fail.oldest_msg_ts, cursor_before_fail.oldest_msg_ts);
+    *state.fail_latest.write().unwrap() = false;
+
+    // Now m11..m15 arrive and user reads small latest window (limit 3)
+    {
+        let mut msgs = state.messages.write().unwrap();
+        for i in 11..=15 {
+            msgs.push((format!("m{i:02}"), mk_ts(i)));
+        }
+    }
+    assert_eq!(
+        parse_ids(&run_cli(&tmp1, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m13", "m14", "m15"]
+    );
+
+    // First --before m13 --limit 5 MUST return m08..m12 with m11 and m12 each included once
+    let first_before =
+        parse_ids(&run_cli(&tmp1, &["read", "PagChat", "--before", "m13", "--limit", "5", "--json"]).await);
+    assert_eq!(
+        first_before,
+        vec!["m08", "m09", "m10", "m11", "m12"],
+        "first --before m13 must not skip m11..m12"
+    );
+    // Second call returns the exact same window
+    let second_before =
+        parse_ids(&run_cli(&tmp1, &["read", "PagChat", "--before", "m13", "--limit", "5", "--json"]).await);
+    assert_eq!(second_before, vec!["m08", "m09", "m10", "m11", "m12"]);
+
+    // Case 2: Disconnected cursor (cursor stuck at m08 while DB has m08..m10 + m13..m15) -> recovers m08..m12 on first call
+    let tmp_disc = tempfile::tempdir().unwrap();
+    *state.messages.write().unwrap() = (1..=10).map(|i| (format!("m{i:02}"), mk_ts(i))).collect();
+    assert!(run_cli(&tmp_disc, &["chats", "--json"]).await.status.success());
+    assert_eq!(
+        parse_ids(&run_cli(&tmp_disc, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m08", "m09", "m10"]
+    );
+    let saved_stale_cursor = {
+        let st = Storage::open(&tmp_disc.path().join("data").join("me-user-1").join("cache.db")).unwrap();
+        st.get_sync_cursor("history:chat:19:pag@thread.v2").unwrap().unwrap()
+    };
+    {
+        let mut msgs = state.messages.write().unwrap();
+        for i in 11..=15 {
+            msgs.push((format!("m{i:02}"), mk_ts(i)));
+        }
+    }
+    assert_eq!(
+        parse_ids(&run_cli(&tmp_disc, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m13", "m14", "m15"]
+    );
+    // Force stale cursor back to after:m08 to test disconnected cursor recovery directly
+    {
+        let st = Storage::open(&tmp_disc.path().join("data").join("me-user-1").join("cache.db")).unwrap();
+        st.save_sync_cursor(&saved_stale_cursor).unwrap();
+    }
+    let recovered =
+        parse_ids(&run_cli(&tmp_disc, &["read", "PagChat", "--before", "m13", "--limit", "5", "--json"]).await);
+    assert_eq!(
+        recovered,
+        vec!["m08", "m09", "m10", "m11", "m12"],
+        "disconnected cursor must restart from latest page and cover m11..m12"
+    );
+
+    // Regression control 2: No intermediate arrivals -> continues via saved nextLink without repeating page 1
+    let tmp2 = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp2, &["chats", "--json"]).await.status.success());
+    assert_eq!(
+        parse_ids(&run_cli(&tmp2, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m13", "m14", "m15"]
+    );
+    state.requests.write().unwrap().clear();
+    let ctl_before =
+        parse_ids(&run_cli(&tmp2, &["read", "PagChat", "--before", "m13", "--limit", "5", "--json"]).await);
+    assert_eq!(ctl_before, vec!["m08", "m09", "m10", "m11", "m12"]);
+    let reqs = state.requests.read().unwrap().clone();
+    assert!(
+        reqs.iter().any(|q| q.contains("$skiptoken=after:m13")),
+        "expected continuation via saved nextLink, got requests: {reqs:?}"
+    );
+    assert!(
+        reqs.iter().all(|q| q.contains("$skiptoken=")),
+        "must not repeat latest page without skiptoken when cursor connects: {reqs:?}"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_12_cache_sufficiency_and_null_topic() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TopicMode {
+        Present,
+        ExplicitNull,
+        OmittedPartial,
+    }
+
+    struct Bug12State {
+        chats_count: RwLock<usize>,
+        small_msgs_count: RwLock<usize>,
+        topic_mode: RwLock<TopicMode>,
+        requests: RwLock<Vec<String>>,
+        base_url: RwLock<String>,
+    }
+
+    let state = Arc::new(Bug12State {
+        chats_count: RwLock::new(2),
+        small_msgs_count: RwLock::new(5),
+        topic_mode: RwLock::new(TopicMode::Present),
+        requests: RwLock::new(Vec::new()),
+        base_url: RwLock::new(String::new()),
+    });
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(
+                |State(st): State<Arc<Bug12State>>, RawQuery(query): RawQuery| async move {
+                    let q = query.unwrap_or_default();
+                    st.requests.write().unwrap().push(format!("/me/chats?{q}"));
+                    let total = *st.chats_count.read().unwrap();
+                    let mode = *st.topic_mode.read().unwrap();
+                    let mut top = 50usize;
+                    let mut skip = 0usize;
+                    for pair in q.split('&').filter(|s| !s.is_empty()) {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            if k == "$top" {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    top = n;
+                                }
+                            } else if k == "$skiptoken" {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    skip = n;
+                                }
+                            }
+                        }
+                    }
+
+                    let mut all_chats = Vec::new();
+                    for i in 1..=total {
+                        if i == 1 {
+                            let mut obj = json!({
+                                "id": "19:small@thread.v2",
+                                "chatType": "group",
+                                "lastUpdatedDateTime": "2026-11-21T09:00:10Z",
+                                "members": [
+                                    { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                                    { "userId": "peer-kim", "displayName": "Alice" },
+                                    { "userId": "peer-lee", "displayName": "Bob" }
+                                ]
+                            });
+                            match mode {
+                                TopicMode::Present => {
+                                    obj["topic"] = json!("InitialTopic");
+                                }
+                                TopicMode::ExplicitNull => {
+                                    obj["topic"] = Value::Null;
+                                }
+                                TopicMode::OmittedPartial => {
+                                    // topic key intentionally omitted (partial chat payload)
+                                }
+                            }
+                            all_chats.push(obj);
+                        } else {
+                            all_chats.push(json!({
+                                "id": format!("19:c{i}@thread.v2"),
+                                "chatType": "group",
+                                "topic": format!("Chat {i}"),
+                                "lastUpdatedDateTime": format!("2026-11-21T09:00:{i:02}Z"),
+                                "members": [
+                                    { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                                    { "userId": "peer-kim", "displayName": "Alice" }
+                                ]
+                            }));
+                        }
+                    }
+
+                    let page: Vec<Value> = all_chats.into_iter().skip(skip).take(top).collect();
+                    let next_skip = skip + page.len();
+                    let mut body = json!({ "value": page });
+                    if next_skip < total {
+                        let base = st.base_url.read().unwrap().clone();
+                        body["@odata.nextLink"] = Value::String(format!(
+                            "{base}/me/chats?$top={top}&$skiptoken={next_skip}"
+                        ));
+                    }
+                    Json(body)
+                },
+            ),
+        )
+        .route("/v1.0/me/joinedTeams", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(
+                |State(st): State<Arc<Bug12State>>,
+                 Path(chat_id): Path<String>,
+                 RawQuery(query): RawQuery| async move {
+                    let q = query.unwrap_or_default();
+                    st.requests
+                        .write()
+                        .unwrap()
+                        .push(format!("/chats/{chat_id}/messages?{q}"));
+                    let total = *st.small_msgs_count.read().unwrap();
+                    let mut top = 50usize;
+                    let mut skip = 0usize;
+                    for pair in q.split('&').filter(|s| !s.is_empty()) {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            if k == "$top" {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    top = n;
+                                }
+                            } else if k == "$skiptoken" {
+                                if let Ok(n) = v.parse::<usize>() {
+                                    skip = n;
+                                }
+                            }
+                        }
+                    }
+                    // Serve newest-first
+                    let all_desc: Vec<Value> = (1..=total)
+                        .rev()
+                        .map(|i| {
+                            json!({
+                                "id": format!("k{i}"),
+                                "messageType": "message",
+                                "createdDateTime": format!("2026-11-21T09:00:{i:02}.000Z"),
+                                "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": format!("<p>msg {i}</p>") },
+                                "mentions": [],
+                                "attachments": [],
+                                "reactions": []
+                            })
+                        })
+                        .collect();
+                    let page: Vec<Value> = all_desc.into_iter().skip(skip).take(top).collect();
+                    let next_skip = skip + page.len();
+                    let mut body = json!({ "value": page });
+                    if next_skip < total {
+                        let base = st.base_url.read().unwrap().clone();
+                        body["@odata.nextLink"] = Value::String(format!(
+                            "{base}/chats/{}/messages?$top={top}&$skiptoken={next_skip}",
+                            urlencoding::encode(&chat_id)
+                        ));
+                    }
+                    Json(body)
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    *state.base_url.write().unwrap() = graph_base.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str], cache_secs: Option<&str>| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        let cache_secs = cache_secs.map(str::to_string);
+        async move {
+            let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"));
+            cmd.args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD");
+            if let Some(secs) = cache_secs {
+                cmd.env("TEAMS_CLI_CACHE_SECS", secs);
+            } else {
+                cmd.env_remove("TEAMS_CLI_CACHE_SECS");
+            }
+            cmd.output().await.expect("run teams CLI")
+        }
+    };
+
+    // Case A: 2 cached messages, 5 on server, --cached --limit 5 -> hits Graph and returns 5
+    let tmp_a = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp_a, &["chats", "--json"], None).await.status.success());
+    let r2 = run_cli(&tmp_a, &["read", "InitialTopic", "--limit", "2", "--json"], None).await;
+    assert!(r2.status.success());
+    let j2: Value = serde_json::from_slice(&r2.stdout).unwrap();
+    assert_eq!(j2["messages"].as_array().unwrap().len(), 2);
+
+    // Control: --offline with insufficient cache makes 0 Graph requests
+    state.requests.write().unwrap().clear();
+    let r_off = run_cli(&tmp_a, &["read", "InitialTopic", "--offline", "--limit", "5", "--json"], None).await;
+    assert!(r_off.status.success());
+    let j_off: Value = serde_json::from_slice(&r_off.stdout).unwrap();
+    assert_eq!(j_off["messages"].as_array().unwrap().len(), 2);
+    assert!(state.requests.read().unwrap().is_empty(), "--offline must make 0 Graph requests");
+
+    // Now --cached --limit 5 must fall back to Graph and return 5
+    state.requests.write().unwrap().clear();
+    let r5 = run_cli(&tmp_a, &["read", "InitialTopic", "--cached", "--limit", "5", "--json"], None).await;
+    assert!(r5.status.success(), "stderr={}", String::from_utf8_lossy(&r5.stderr));
+    let j5: Value = serde_json::from_slice(&r5.stdout).unwrap();
+    assert_eq!(
+        j5["messages"].as_array().unwrap().len(),
+        5,
+        "--cached --limit 5 must fetch missing messages from Graph: {j5}"
+    );
+    assert!(!state.requests.read().unwrap().is_empty());
+
+    // Case B: Server has only 2 messages & 2 chats (EOF reached) -> 2nd read/chats within TTL makes 0 requests
+    *state.small_msgs_count.write().unwrap() = 2;
+    *state.chats_count.write().unwrap() = 2;
+    let tmp_b = tempfile::tempdir().unwrap();
+    let c1 = run_cli(&tmp_b, &["chats", "--limit", "50", "--json"], Some("60")).await;
+    assert!(c1.status.success());
+    state.requests.write().unwrap().clear();
+    let c2 = run_cli(&tmp_b, &["chats", "--limit", "50", "--json"], Some("60")).await;
+    assert!(c2.status.success());
+    assert!(
+        state.requests.read().unwrap().is_empty(),
+        "2nd chats within TTL after EOF must make 0 Graph requests, got: {:?}",
+        *state.requests.read().unwrap()
+    );
+    let m1 = run_cli(&tmp_b, &["read", "InitialTopic", "--limit", "30", "--json"], Some("60")).await;
+    assert!(m1.status.success());
+    state.requests.write().unwrap().clear();
+    let m2 = run_cli(&tmp_b, &["read", "InitialTopic", "--limit", "30", "--json"], Some("60")).await;
+    assert!(m2.status.success());
+    assert!(
+        state.requests.read().unwrap().is_empty(),
+        "2nd read within TTL after EOF must make 0 Graph requests, got: {:?}",
+        *state.requests.read().unwrap()
+    );
+    // Also --cached after EOF makes 0 requests
+    let m3 = run_cli(&tmp_b, &["read", "InitialTopic", "--cached", "--limit", "30", "--json"], None).await;
+    assert!(m3.status.success());
+    assert!(
+        state.requests.read().unwrap().is_empty(),
+        "--cached after EOF must make 0 Graph requests"
+    );
+
+    // Case C: Partial chat response omitting `topic` preserves stored topic; explicit `topic: null` clears it
+    let tmp_c = tempfile::tempdir().unwrap();
+    *state.topic_mode.write().unwrap() = TopicMode::Present;
+    assert!(run_cli(&tmp_c, &["chats", "--refresh", "--json"], None).await.status.success());
+
+    // Partial response omitting `topic` must NOT clear existing topic
+    *state.topic_mode.write().unwrap() = TopicMode::OmittedPartial;
+    assert!(run_cli(&tmp_c, &["chats", "--refresh", "--json"], None).await.status.success());
+    let after_partial = run_cli(&tmp_c, &["chats", "--cached", "--json"], None).await;
+    assert!(after_partial.status.success());
+    let jp: Value = serde_json::from_slice(&after_partial.stdout).unwrap();
+    let small_partial = jp["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["conv_key"] == "chat:19:small@thread.v2")
+        .unwrap();
+    assert_eq!(
+        small_partial["topic"], "InitialTopic",
+        "partial response omitting topic must preserve stored topic: {small_partial}"
+    );
+
+    // Full response with explicit `topic: null` MUST clear SQLite topic to NULL
+    *state.topic_mode.write().unwrap() = TopicMode::ExplicitNull;
+    assert!(run_cli(&tmp_c, &["chats", "--refresh", "--json"], None).await.status.success());
+    let after_null = run_cli(&tmp_c, &["chats", "--cached", "--json"], None).await;
+    assert!(after_null.status.success());
+    let jn: Value = serde_json::from_slice(&after_null.stdout).unwrap();
+    let small_null = jn["chats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["conv_key"] == "chat:19:small@thread.v2")
+        .unwrap();
+    assert!(
+        small_null["topic"].is_null(),
+        "explicit topic=null must clear SQLite topic: {small_null}"
+    );
+    assert_eq!(small_null["title"], "Alice, Bob");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_01_single_quote_reply_blockquote() {
+    #[derive(Default)]
+    struct Bug01State {
+        posted_chat_bodies: RwLock<Vec<String>>,
+        posted_channel_reply_bodies: RwLock<Vec<(String, String)>>,
+    }
+
+    let state = Arc::new(Bug01State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:q@thread.v2",
+                        "chatType": "group",
+                        "topic": "QuoteChat",
+                        "lastUpdatedDateTime": "2026-11-21T09:00:05Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({ "value": [{ "id": "t1", "displayName": "Eng" }] }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        json!({
+                            "id": req["id"].as_str().unwrap_or("0"),
+                            "status": 200,
+                            "body": { "value": [{ "id": "ch1", "displayName": "General", "membershipType": "standard" }] }
+                        })
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "m-orig",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-21T09:00:01Z",
+                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                        "body": { "contentType": "html", "content": "<p>Original message text</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }]
+                }))
+            })
+            .post(
+                |State(st): State<Arc<Bug01State>>, Json(payload): Json<Value>| async move {
+                    let html = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    st.posted_chat_bodies.write().unwrap().push(html.clone());
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "m-reply-new",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T09:01:00Z",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": html },
+                            "mentions": [],
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1.0/chats/{chat_id}/messages/{msg_id}",
+            get(|Path((_chat_id, msg_id)): Path<(String, String)>| async move {
+                Json(json!({
+                    "id": msg_id,
+                    "messageType": "message",
+                    "createdDateTime": "2026-11-21T08:00:00Z",
+                    "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                    "body": { "contentType": "html", "content": "<p>Older single-fetch message</p>" },
+                    "mentions": [],
+                    "attachments": [],
+                    "reactions": []
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages/{root_id}/replies",
+            post(
+                |State(st): State<Arc<Bug01State>>,
+                 Path(root_id): Path<String>,
+                 Json(payload): Json<Value>| async move {
+                    let html = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    st.posted_channel_reply_bodies
+                        .write()
+                        .unwrap()
+                        .push((root_id.clone(), html.clone()));
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "ch-rep-1",
+                            "replyToId": root_id,
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T09:02:00Z",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": html },
+                            "mentions": [],
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    let assert_single_reply_bq = |html: &str, expected_id: &str, expected_body: &str, ctx: &str| {
+        assert_eq!(
+            html.matches("itemtype=\"http://schema.skype.com/Reply\"").count(),
+            1,
+            "{ctx}: expected exactly 1 Skype Reply blockquote, got: {html}"
+        );
+        assert!(
+            html.contains(&format!("itemid=\"{expected_id}\"")),
+            "{ctx}: missing itemid={expected_id} in {html}"
+        );
+        assert_eq!(
+            html.matches(expected_body).count(),
+            1,
+            "{ctx}: expected body once in {html}"
+        );
+    };
+
+    // 1. CLI cached & uncached (both in-window and single-message fallback outside window)
+    let tmp_cached = tempfile::tempdir().unwrap();
+    assert!(run_cli(&tmp_cached, &["read", "QuoteChat", "--json"]).await.status.success());
+    let out = run_cli(&tmp_cached, &["reply", "QuoteChat", "m-orig", "CLI cached body", "--json"]).await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let html = state.posted_chat_bodies.read().unwrap().last().unwrap().clone();
+    assert_single_reply_bq(&html, "m-orig", "CLI cached body", "CLI cached");
+
+    // User-written markdown blockquote in reply preserves both Skype Reply + user blockquote
+    let out_user_bq = run_cli(
+        &tmp_cached,
+        &["reply", "QuoteChat", "m-orig", "> user quote line\n\nMy response", "--json"],
+    )
+    .await;
+    assert!(out_user_bq.status.success());
+    let html_user_bq = state.posted_chat_bodies.read().unwrap().last().unwrap().clone();
+    assert_single_reply_bq(&html_user_bq, "m-orig", "My response", "CLI with user blockquote");
+    assert!(
+        html_user_bq.contains("<blockquote>user quote line</blockquote>"),
+        "user markdown blockquote must be preserved: {html_user_bq}"
+    );
+
+    let tmp_uncached = tempfile::tempdir().unwrap();
+    let out_u1 = run_cli(&tmp_uncached, &["reply", "QuoteChat", "m-orig", "CLI uncached body", "--json"]).await;
+    assert!(out_u1.status.success());
+    let html_u1 = state.posted_chat_bodies.read().unwrap().last().unwrap().clone();
+    assert_single_reply_bq(&html_u1, "m-orig", "CLI uncached body", "CLI uncached");
+
+    let out_u2 = run_cli(&tmp_uncached, &["reply", "QuoteChat", "m-older-99", "CLI fallback body", "--json"]).await;
+    assert!(out_u2.status.success());
+    let html_u2 = state.posted_chat_bodies.read().unwrap().last().unwrap().clone();
+    assert_single_reply_bq(&html_u2, "m-older-99", "CLI fallback body", "CLI single-GET fallback");
+
+    // 2. MCP cached & uncached
+    let mut cfg = AppConfig::default();
+    cfg.graph_base_url = graph_base.clone();
+    cfg.auth_base_url = auth_base.clone();
+    let tokens = StoredTokens {
+        access_token: jwt.clone(),
+        refresh_token: None,
+        expires_at: 4_102_444_800,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("me-user-1".into()),
+        user_display_name: Some("Me (Tester)".into()),
+        user_email: Some("tester@contoso.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap().with_my_user_id("me-user-1");
+
+    for (label, warm_cache) in [("MCP uncached", false), ("MCP cached", true)] {
+        let storage = Storage::open_in_memory().unwrap();
+        if warm_cache {
+            let chats = graph.list_chats(10).await.unwrap();
+            storage.upsert_conversations(&chats).unwrap();
+            let msgs = graph.list_messages(&chats[0].target, 10).await.unwrap();
+            storage.upsert_messages(&msgs).unwrap();
+        }
+        let body_text = format!("{label} reply");
+        let call_line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "reply_message",
+                "arguments": {
+                    "target": "QuoteChat",
+                    "msg_id": "m-orig",
+                    "markdown": body_text
+                }
+            }
+        }))
+        .unwrap();
+        let resp = mcp::handle_rpc_line(&cfg, &graph, &storage, &call_line)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{label}: {resp}");
+        let html_mcp = state.posted_chat_bodies.read().unwrap().last().unwrap().clone();
+        assert_single_reply_bq(&html_mcp, "m-orig", &body_text, label);
+    }
+
+    // 3. HTTP cached & uncached
+    for (label, warm_cache) in [("HTTP uncached", false), ("HTTP cached", true)] {
+        let storage = Storage::open_in_memory().unwrap();
+        if warm_cache {
+            let chats = graph.list_chats(10).await.unwrap();
+            storage.upsert_conversations(&chats).unwrap();
+            let msgs = graph.list_messages(&chats[0].target, 10).await.unwrap();
+            storage.upsert_messages(&msgs).unwrap();
+        }
+        let api_router = serve::build_router(
+            cfg.clone(),
+            graph.clone(),
+            storage,
+            Some("http-test-tok".to_string()),
+        );
+        let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_addr = api_listener.local_addr().unwrap();
+        let api_task = tokio::spawn(async move {
+            axum::serve(api_listener, api_router).await.unwrap();
+        });
+        let body_text = format!("{label} reply");
+        let resp = reqwest::Client::new()
+            .post(format!(
+                "http://{api_addr}/conversations/{}/messages/m-orig/replies",
+                urlencoding::encode("chat:19:q@thread.v2")
+            ))
+            .bearer_auth("http-test-tok")
+            .json(&json!({ "markdown": body_text }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "{label}");
+        let html_http = state.posted_chat_bodies.read().unwrap().last().unwrap().clone();
+        assert_single_reply_bq(&html_http, "m-orig", &body_text, label);
+        api_task.abort();
+    }
+
+    // Regression control: Channel thread reply uses /replies endpoint with 0 Skype Reply blockquotes
+    let chan_rep = run_cli(&tmp_cached, &["reply", "Eng/General", "root-1", "Channel reply text", "--json"]).await;
+    assert!(chan_rep.status.success(), "stderr={}", String::from_utf8_lossy(&chan_rep.stderr));
+    let chan_posts = state.posted_channel_reply_bodies.read().unwrap();
+    assert_eq!(chan_posts.len(), 1);
+    assert_eq!(chan_posts[0].0, "root-1");
+    assert_eq!(chan_posts[0].1, "<p>Channel reply text</p>");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_10_markdown_links_and_mentions() {
+    #[derive(Default)]
+    struct Bug10State {
+        posted: RwLock<Vec<Value>>,
+    }
+
+    let state = Arc::new(Bug10State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:md@thread.v2",
+                        "chatType": "group",
+                        "topic": "MdChat",
+                        "lastUpdatedDateTime": "2026-11-21T09:00:01Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "u1", "displayName": "Alex" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route("/v1.0/me/joinedTeams", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            post(
+                |State(st): State<Arc<Bug10State>>, Json(payload): Json<Value>| async move {
+                    st.posted.write().unwrap().push(payload.clone());
+                    let html = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "md-sent",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T09:01:00Z",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": html },
+                            "mentions": payload.get("mentions").cloned().unwrap_or(json!([])),
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+
+    let run_send = |args: &[&str]| {
+        let mut full = vec!["send".to_string(), "MdChat".to_string()];
+        full.extend(args.iter().map(|s| (*s).to_string()));
+        full.push("--json".to_string());
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        let state = state.clone();
+        async move {
+            let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&full)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams send");
+            assert!(
+                out.status.success(),
+                "send {full:?} failed: stderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let payload = state.posted.read().unwrap().last().unwrap().clone();
+            // Invariant: HTML <at id="N"> ID set MUST equal payload.mentions ID set
+            let html = payload["body"]["content"].as_str().unwrap_or("");
+            let mut html_at_ids = std::collections::BTreeSet::new();
+            let mut rest = html;
+            while let Some(pos) = rest.find("<at id=\"") {
+                rest = &rest[pos + 8..];
+                if let Some(end) = rest.find('"') {
+                    let id_num: i64 = rest[..end].parse().expect("numeric at id");
+                    html_at_ids.insert(id_num);
+                    rest = &rest[end + 1..];
+                }
+            }
+            let mention_ids: std::collections::BTreeSet<i64> = payload
+                .get("mentions")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|m| m["id"].as_i64().expect("numeric mention id"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                html_at_ids, mention_ids,
+                "HTML <at> IDs and payload.mentions IDs diverged for {full:?}: payload={payload}"
+            );
+            payload
+        }
+    };
+
+    // 1. Tag prefix before Markdown link: [URGENT] Check [runbook](url) now
+    let p1 = run_send(&["[URGENT] Check [runbook](https://example.com/runbook) now"]).await;
+    assert_eq!(
+        p1["body"]["content"],
+        "<p>[URGENT] Check <a href=\"https://example.com/runbook\">runbook</a> now</p>"
+    );
+
+    // 2. Balanced parentheses inside URL
+    let p2 = run_send(&[
+        "See [Rust](https://en.wikipedia.org/wiki/Rust_(programming_language)) docs",
+    ])
+    .await;
+    assert_eq!(
+        p2["body"]["content"],
+        "<p>See <a href=\"https://en.wikipedia.org/wiki/Rust_(programming_language)\">Rust</a> docs</p>"
+    );
+
+    // 3. Duplicate display names map sequentially to distinct user IDs
+    let p3 = run_send(&[
+        "Hi @Alex and @Alex please review",
+        "--mention",
+        "u1:Alex",
+        "--mention",
+        "u2:Alex",
+    ])
+    .await;
+    assert_eq!(
+        p3["body"]["content"],
+        "<p>Hi <at id=\"0\">Alex</at> and <at id=\"1\">Alex</at> please review</p>"
+    );
+    let m3: Vec<(i64, &str)> = p3["mentions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["id"].as_i64().unwrap(),
+                m["mentioned"]["user"]["id"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(m3, vec![(0, "u1"), (1, "u2")]);
+
+    // 4. Korean honorific "님" stays outside <at>
+    let p4 = run_send(&["@김철수님 확인 부탁드립니다", "--mention", "u3:김철수"]).await;
+    assert_eq!(
+        p4["body"]["content"],
+        "<p><at id=\"0\">김철수</at>님 확인 부탁드립니다</p>"
+    );
+    assert_eq!(p4["mentions"][0]["mentioned"]["user"]["id"], "u3");
+
+    // 5. Case-insensitive English mention
+    let p5 = run_send(&["ping @alice", "--mention", "u4:Alice"]).await;
+    assert_eq!(p5["body"]["content"], "<p>ping <at id=\"0\">Alice</at></p>");
+    assert_eq!(p5["mentions"][0]["mentioned"]["user"]["id"], "u4");
+
+    // 6. Unused mention produces 0 mention metadata entries
+    let p6 = run_send(&["no at here", "--mention", "u5:Bob"]).await;
+    assert_eq!(p6["body"]["content"], "<p>no at here</p>");
+    assert!(
+        p6.get("mentions").is_none()
+            || p6["mentions"].as_array().is_some_and(|a| a.is_empty()),
+        "unused mention must emit 0 metadata entries: {p6}"
+    );
+
+    // 7. Regression controls: plain link, space-separated Korean mention, HTML escaping, partial unused
+    let p7 = run_send(&[
+        "Check [docs](https://example.com) & <tag> @김철수 님",
+        "--mention",
+        "u-unused:Nobody",
+        "--mention",
+        "u3:김철수",
+    ])
+    .await;
+    assert_eq!(
+        p7["body"]["content"],
+        "<p>Check <a href=\"https://example.com\">docs</a> &amp; &lt;tag&gt; <at id=\"0\">김철수</at> 님</p>"
+    );
+    assert_eq!(p7["mentions"].as_array().unwrap().len(), 1);
+    assert_eq!(p7["mentions"][0]["id"], 0);
+    assert_eq!(p7["mentions"][0]["mentioned"]["user"]["id"], "u3");
+
+    server.abort();
+}
+
+#[test]
+fn regression_teams_bug_07_short_token_multiword_search() {
+    use teams_cli::models::ConversationKind;
+    use teams_cli::models::ConversationSummary;
+
+    let storage = Storage::open_in_memory().unwrap();
+    let c1_target = ConversationTarget::Chat {
+        chat_id: "c1".to_string(),
+    };
+    let c2_target = ConversationTarget::Chat {
+        chat_id: "c2".to_string(),
+    };
+    let conv1 = ConversationSummary {
+        conv_key: c1_target.conv_key(),
+        target: c1_target,
+        kind: ConversationKind::Group,
+        team_id: None,
+        team_name: None,
+        title: "SearchChat1".to_string(),
+        topic: Some("SearchChat1".to_string()),
+        unread_count: 0,
+        last_read_at: None,
+        last_msg_id: None,
+        last_msg_author: None,
+        last_msg_preview: None,
+        last_updated_at: None,
+        pinned: false,
+        peer_user_id: None,
+        web_url: None,
+    };
+    let conv2 = ConversationSummary {
+        conv_key: c2_target.conv_key(),
+        target: c2_target,
+        kind: ConversationKind::Group,
+        team_id: None,
+        team_name: None,
+        title: "SearchChat2".to_string(),
+        topic: Some("SearchChat2".to_string()),
+        unread_count: 0,
+        last_read_at: None,
+        last_msg_id: None,
+        last_msg_author: None,
+        last_msg_preview: None,
+        last_updated_at: None,
+        pinned: false,
+        peer_user_id: None,
+        web_url: None,
+    };
+    storage.upsert_conversations(&[conv1.clone(), conv2.clone()]).unwrap();
+
+    let mk = |conv_key: &str, id: &str, ts: &str, body: &str, subj: Option<&str>| MessageItem {
+        msg_key: MessageItem::make_msg_key(conv_key, id),
+        conv_key: conv_key.to_string(),
+        msg_id: id.to_string(),
+        parent_msg_id: None,
+        reply_to_id: None,
+        reply_to_author: None,
+        reply_to_preview: None,
+        subject: subj.map(str::to_string),
+        author_id: Some("u1".to_string()),
+        author_name: "Alice".to_string(),
+        is_me: false,
+        created_at: ts.to_string(),
+        last_modified_at: None,
+        deleted: false,
+        importance: "normal".to_string(),
+        message_type: "message".to_string(),
+        body_html: format!("<p>{body}</p>"),
+        body_plain: body.to_string(),
+        attachments: vec![],
+        mentions: vec![],
+        reactions: vec![],
+        reply_count: 0,
+        web_url: None,
+    };
+
+    storage
+        .upsert_messages(&[
+            mk(&conv1.conv_key, "s1", "2026-11-21T09:00:01Z", "프로덕션 배포 오늘 완료", None),
+            mk(&conv1.conv_key, "s2", "2026-11-21T09:00:02Z", "deploy release v2", None),
+            mk(&conv1.conv_key, "s3", "2026-11-21T09:00:03Z", "canary rollout will deploy at noon", None),
+            mk(&conv1.conv_key, "s4", "2026-11-21T09:00:04Z", "프로덕션 배포만 진행", None),
+            mk(&conv1.conv_key, "s5", "2026-11-21T09:00:05Z", "progress 100% ok", None),
+            mk(&conv1.conv_key, "s6", "2026-11-21T09:00:06Z", "progress 1000 ok", None),
+            mk(&conv2.conv_key, "s7", "2026-11-21T09:00:07Z", "프로덕션 배포 오늘 완료", None),
+        ])
+        .unwrap();
+
+    let hit_ids = |q: &str, scope: Option<&str>| -> Vec<String> {
+        storage
+            .search_messages(q, scope, 20)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.msg_id)
+            .collect()
+    };
+
+    // Multi-word with 2-char Korean tokens matches regardless of token order and excludes partial-token s4
+    assert_eq!(hit_ids("배포 완료", Some(&conv1.conv_key)), vec!["s1"]);
+    assert_eq!(hit_ids("완료 배포", Some(&conv1.conv_key)), vec!["s1"]);
+
+    // Mixed short English token + long token matches regardless of order and excludes single-token s3
+    assert_eq!(hit_ids("v2 deploy", Some(&conv1.conv_key)), vec!["s2"]);
+    assert_eq!(hit_ids("deploy v2", Some(&conv1.conv_key)), vec!["s2"]);
+
+    // LIKE wildcard escaping: '100% ok' matches literal '100%' (s5), not '1000' (s6)
+    assert_eq!(hit_ids("100% ok", Some(&conv1.conv_key)), vec!["s5"]);
+
+    // Regression controls: single 2-char token, >=3-char multiword AND, conversation scope filter
+    assert_eq!(hit_ids("배포", Some(&conv1.conv_key)), vec!["s4", "s1"]);
+    assert_eq!(hit_ids("canary deploy", Some(&conv1.conv_key)), vec!["s3"]);
+    assert_eq!(hit_ids("배포 완료", None), vec!["s7", "s1"]);
+    assert_eq!(hit_ids("배포 완료", Some(&conv2.conv_key)), vec!["s7"]);
+}
+
+#[tokio::test]
+async fn regression_teams_bug_13_download_by_single_message_get() {
+    #[derive(Default)]
+    struct Bug13State {
+        requested_paths: RwLock<Vec<String>>,
+    }
+
+    let state = Arc::new(Bug13State::default());
+    let chat_share_url = "https://contoso.sharepoint.com/personal/tester/archive.txt";
+    let reply_share_url = "https://contoso.sharepoint.com/sites/eng/reply-log.txt";
+    let expected_chat_bytes = b"archived-chat-attachment-bytes-bug13".to_vec();
+    let expected_reply_bytes = b"channel-reply-attachment-bytes-bug13".to_vec();
+
+    let chat_bytes_srv = expected_chat_bytes.clone();
+    let reply_bytes_srv = expected_reply_bytes.clone();
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "19:dl@thread.v2",
+                        "chatType": "group",
+                        "topic": "DlChat",
+                        "lastUpdatedDateTime": "2026-11-21T09:00:55Z",
+                        "members": [
+                            { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                            { "userId": "peer-kim", "displayName": "Alice" }
+                        ]
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({ "value": [{ "id": "t1", "displayName": "Eng" }] }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        json!({
+                            "id": req["id"].as_str().unwrap_or("0"),
+                            "status": 200,
+                            "body": { "value": [{ "id": "ch1", "displayName": "General", "membershipType": "standard" }] }
+                        })
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        // List endpoints (only return recent 50, excluding d01!)
+        .route(
+            "/v1.0/chats/{chat_id}/messages",
+            get(|State(st): State<Arc<Bug13State>>, Path(chat_id): Path<String>| async move {
+                st.requested_paths
+                    .write()
+                    .unwrap()
+                    .push(format!("LIST:/chats/{chat_id}/messages"));
+                let recent: Vec<Value> = (6..=55)
+                    .rev()
+                    .map(|i| {
+                        json!({
+                            "id": format!("d{i:02}"),
+                            "messageType": "message",
+                            "createdDateTime": format!("2026-11-21T09:00:{i:02}Z"),
+                            "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": format!("<p>d{i}</p>") },
+                            "mentions": [],
+                            "attachments": [],
+                            "reactions": []
+                        })
+                    })
+                    .collect();
+                Json(json!({ "value": recent }))
+            }),
+        )
+        // Single-message GET for chat
+        .route(
+            "/v1.0/chats/{chat_id}/messages/{msg_id}",
+            get(
+                move |State(st): State<Arc<Bug13State>>,
+                 Path((chat_id, msg_id)): Path<(String, String)>| async move {
+                    st.requested_paths
+                        .write()
+                        .unwrap()
+                        .push(format!("GET:/chats/{chat_id}/messages/{msg_id}"));
+                    if msg_id == "d01" {
+                        Json(json!({
+                            "id": "d01",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T08:00:01Z",
+                            "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>old archive</p><attachment id=\"att-d01\"></attachment>" },
+                            "mentions": [],
+                            "attachments": [{
+                                "id": "att-d01",
+                                "contentType": "reference",
+                                "contentUrl": chat_share_url,
+                                "name": "archive.txt"
+                            }],
+                            "reactions": []
+                        }))
+                        .into_response()
+                    } else {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": { "code": "NotFound", "message": "message not found" } })),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        )
+        // Single-message GET for channel reply
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}/replies/{msg_id}",
+            get(
+                move |State(st): State<Arc<Bug13State>>,
+                 Path((team_id, channel_id, root_id, msg_id)): Path<(String, String, String, String)>| async move {
+                    st.requested_paths.write().unwrap().push(format!(
+                        "GET:/teams/{team_id}/channels/{channel_id}/messages/{root_id}/replies/{msg_id}"
+                    ));
+                    if root_id == "root-1" && msg_id == "rep-old" {
+                        Json(json!({
+                            "id": "rep-old",
+                            "replyToId": "root-1",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T08:05:00Z",
+                            "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                            "body": { "contentType": "html", "content": "<p>reply log</p><attachment id=\"att-rep\"></attachment>" },
+                            "mentions": [],
+                            "attachments": [{
+                                "id": "att-rep",
+                                "contentType": "reference",
+                                "contentUrl": reply_share_url,
+                                "name": "reply-log.txt"
+                            }],
+                            "reactions": []
+                        }))
+                        .into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                },
+            ),
+        )
+        // Guard: thread replies list and channel messages list must NOT be called
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
+            get(|State(st): State<Arc<Bug13State>>| async move {
+                st.requested_paths
+                    .write()
+                    .unwrap()
+                    .push("LIST:channel_messages".to_string());
+                Json(json!({ "value": [] }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages/{root_id}/replies",
+            get(|State(st): State<Arc<Bug13State>>| async move {
+                st.requested_paths
+                    .write()
+                    .unwrap()
+                    .push("LIST:thread_replies".to_string());
+                Json(json!({ "value": [] }))
+            }),
+        )
+        .route(
+            "/v1.0/shares/{share_token}/driveItem/content",
+            get(move |Path(share_token): Path<String>| {
+                let chat_bytes = chat_bytes_srv.clone();
+                let reply_bytes = reply_bytes_srv.clone();
+                async move {
+                    let encoded = share_token.strip_prefix("u!").unwrap_or("");
+                    let decoded = String::from_utf8(URL_SAFE_NO_PAD.decode(encoded).unwrap_or_default())
+                        .unwrap_or_default();
+                    if decoded == chat_share_url {
+                        (StatusCode::OK, chat_bytes).into_response()
+                    } else if decoded == reply_share_url {
+                        (StatusCode::OK, reply_bytes).into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    let dl_dir = tmp.path().join("dl");
+    std::fs::create_dir_all(&dl_dir).unwrap();
+
+    let run_cli = |args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    // Seed conversations only (not messages)
+    assert!(run_cli(&["chats", "--refresh", "--json"]).await.status.success());
+    assert!(run_cli(&["teams", "--refresh", "--json"]).await.status.success());
+
+    // 1. Download attachment from chat message outside recent 50 (d01) -> single GET, no list GET
+    state.requested_paths.write().unwrap().clear();
+    let out = run_cli(&["download", "DlChat", "d01", "--out", dl_dir.to_str().unwrap(), "--json"]).await;
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+    let dj: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let saved = std::path::PathBuf::from(dj["path"].as_str().unwrap());
+    assert_eq!(std::fs::read(&saved).unwrap(), expected_chat_bytes);
+    let paths1 = state.requested_paths.read().unwrap().clone();
+    assert!(
+        paths1.iter().any(|p| p == "GET:/chats/19:dl@thread.v2/messages/d01"),
+        "expected single-message GET, got: {paths1:?}"
+    );
+    assert!(
+        !paths1.iter().any(|p| p.starts_with("LIST:")),
+        "must not issue list query on single-message download: {paths1:?}"
+    );
+
+    // 2. Regression control: cached message d01 makes 0 message GETs on second download
+    state.requested_paths.write().unwrap().clear();
+    let dl_dir2 = tmp.path().join("dl2");
+    std::fs::create_dir_all(&dl_dir2).unwrap();
+    let out2 = run_cli(&["download", "DlChat", "d01", "--out", dl_dir2.to_str().unwrap(), "--json"]).await;
+    assert!(out2.status.success());
+    let paths2 = state.requested_paths.read().unwrap().clone();
+    assert!(
+        paths2.is_empty(),
+        "cached message download must issue 0 message GETs, got: {paths2:?}"
+    );
+
+    // 3. Invalid ID returning 404 returns error and creates 0 files
+    let dl_dir_404 = tmp.path().join("dl404");
+    std::fs::create_dir_all(&dl_dir_404).unwrap();
+    let out_404 = run_cli(&[
+        "download",
+        "DlChat",
+        "nonexistent-id",
+        "--out",
+        dl_dir_404.to_str().unwrap(),
+        "--json",
+    ])
+    .await;
+    assert!(!out_404.status.success());
+    let err_404 = String::from_utf8_lossy(&out_404.stderr);
+    assert!(err_404.contains("404"), "expected 404 error, got: {err_404}");
+    assert_eq!(std::fs::read_dir(&dl_dir_404).unwrap().count(), 0, "no file should be created on 404");
+
+    // 4. Regression control: channel reply attachment uses ONLY /messages/{root}/replies/{id}
+    state.requested_paths.write().unwrap().clear();
+    let dl_dir_rep = tmp.path().join("dlrep");
+    std::fs::create_dir_all(&dl_dir_rep).unwrap();
+    let out_rep = run_cli(&[
+        "download",
+        "Eng/General",
+        "rep-old",
+        "--thread",
+        "root-1",
+        "--out",
+        dl_dir_rep.to_str().unwrap(),
+        "--json",
+    ])
+    .await;
+    assert!(
+        out_rep.status.success(),
+        "reply download failed: stderr={}",
+        String::from_utf8_lossy(&out_rep.stderr)
+    );
+    let rj: Value = serde_json::from_slice(&out_rep.stdout).unwrap();
+    assert_eq!(
+        std::fs::read(rj["path"].as_str().unwrap()).unwrap(),
+        expected_reply_bytes
+    );
+    let paths_rep = state.requested_paths.read().unwrap().clone();
+    assert_eq!(
+        paths_rep,
+        vec!["GET:/teams/t1/channels/ch1/messages/root-1/replies/rep-old"]
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_14_mcp_list_chats_schema_and_presence_reset() {
+    #[derive(Default)]
+    struct Bug14State {
+        chats_get_count: RwLock<usize>,
+        posted_messages: RwLock<Vec<String>>,
+        cleared_presence_count: RwLock<usize>,
+        base_url: RwLock<String>,
+    }
+
+    let state = Arc::new(Bug14State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|State(st): State<Arc<Bug14State>>, RawQuery(query): RawQuery| async move {
+                *st.chats_get_count.write().unwrap() += 1;
+                let q = query.unwrap_or_default();
+                let mut top = 50usize;
+                let mut skip = 0usize;
+                for pair in q.split('&').filter(|s| !s.is_empty()) {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        if k == "$top" {
+                            if let Ok(n) = v.parse::<usize>() {
+                                top = n;
+                            }
+                        } else if k == "$skiptoken" {
+                            if let Ok(n) = v.parse::<usize>() {
+                                skip = n;
+                            }
+                        }
+                    }
+                }
+                let all: Vec<Value> = (1..=5)
+                    .map(|i| {
+                        json!({
+                            "id": format!("19:c{i}@thread.v2"),
+                            "chatType": "group",
+                            "topic": format!("Chat{i}"),
+                            "lastUpdatedDateTime": format!("2026-11-21T09:00:{i:02}Z"),
+                            "members": [
+                                { "userId": "me-user-1", "displayName": "Me (Tester)" },
+                                { "userId": "peer-kim", "displayName": "Alice" }
+                            ]
+                        })
+                    })
+                    .collect();
+                let page: Vec<Value> = all.into_iter().skip(skip).take(top).collect();
+                let next_skip = skip + page.len();
+                let mut body = json!({ "value": page });
+                if next_skip < 5 {
+                    let base = st.base_url.read().unwrap().clone();
+                    body["@odata.nextLink"] = Value::String(format!(
+                        "{base}/me/chats?$top={top}&$skiptoken={next_skip}"
+                    ));
+                }
+                Json(body)
+            }),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({ "value": [{ "id": "t1", "displayName": "BigTeam" }] }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        json!({
+                            "id": req["id"].as_str().unwrap_or("0"),
+                            "status": 200,
+                            "body": { "value": [{ "id": "ch1", "displayName": "Channel-01", "membershipType": "standard" }] }
+                        })
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels/{channel_id}/messages",
+            post(
+                |State(st): State<Arc<Bug14State>>,
+                 Path((team_id, channel_id)): Path<(String, String)>,
+                 Json(payload): Json<Value>| async move {
+                    st.posted_messages
+                        .write()
+                        .unwrap()
+                        .push(format!("/teams/{team_id}/channels/{channel_id}/messages"));
+                    let html = payload
+                        .pointer("/body/content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    (
+                        StatusCode::CREATED,
+                        Json(json!({
+                            "id": "sent-1",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-21T09:05:00Z",
+                            "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                            "body": { "contentType": "html", "content": html },
+                            "mentions": [],
+                            "attachments": [],
+                            "reactions": []
+                        })),
+                    )
+                },
+            ),
+        )
+        .route(
+            "/v1.0/me/presence/clearUserPreferredPresence",
+            post(|State(st): State<Arc<Bug14State>>| async move {
+                *st.cleared_presence_count.write().unwrap() += 1;
+                StatusCode::OK
+            }),
+        )
+        .route(
+            "/v1.0/me/presence",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "availability": "Busy",
+                    "activity": "InACall"
+                }))
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    *state.base_url.write().unwrap() = graph_base.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut cfg = AppConfig::default();
+    cfg.graph_base_url = graph_base.clone();
+    cfg.auth_base_url = auth_base.clone();
+    let tokens = StoredTokens {
+        access_token: "tok".into(),
+        refresh_token: None,
+        expires_at: 4_102_444_800,
+        client_id: cfg.client_id.clone(),
+        tenant_id: cfg.tenant_id.clone(),
+        user_id: Some("me-user-1".into()),
+        user_display_name: Some("Me (Tester)".into()),
+        user_email: Some("tester@contoso.com".into()),
+        auth_mode: "access_token".into(),
+    };
+    let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+    let graph = GraphClient::new(cfg.clone(), auth).unwrap().with_my_user_id("me-user-1");
+    let storage = Storage::open_in_memory().unwrap();
+
+    // Part A: Server has 5 chats -> list_chats(limit=2) returns 2, then list_chats(limit=5) returns 5
+    let call_mcp = |name: &str, arguments: Value| {
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))
+        .unwrap();
+        let cfg = cfg.clone();
+        let graph = graph.clone();
+        let storage = storage.clone();
+        async move { mcp::handle_rpc_line(&cfg, &graph, &storage, &line).await.unwrap() }
+    };
+
+    let r2 = call_mcp("list_chats", json!({ "limit": 2 })).await;
+    assert_eq!(r2["result"]["isError"], false, "{r2}");
+    let p2: Value = serde_json::from_str(r2["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(p2["chats"].as_array().unwrap().len(), 2);
+
+    let r5 = call_mcp("list_chats", json!({ "limit": 5 })).await;
+    assert_eq!(r5["result"]["isError"], false, "{r5}");
+    let p5: Value = serde_json::from_str(r5["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        p5["chats"].as_array().unwrap().len(),
+        5,
+        "list_chats(limit=5) after limit=2 must fetch remaining chats: {p5}"
+    );
+
+    // Control: once all 5 chats are fetched (EOF), subsequent list_chats(limit=50) makes 0 Graph requests
+    let hits_before = *state.chats_get_count.read().unwrap();
+    let r50 = call_mcp("list_chats", json!({ "limit": 50 })).await;
+    assert_eq!(r50["result"]["isError"], false);
+    let p50: Value = serde_json::from_str(r50["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(p50["chats"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        *state.chats_get_count.read().unwrap(),
+        hits_before,
+        "complete small chat list must not re-request Graph"
+    );
+
+    // Part B: send_message with unknown args (thread_root_id / bogus_param) -> isError=true, 0 POSTs
+    for bad_args in [
+        json!({ "target": "BigTeam/Channel-01", "markdown": "hello", "thread_root_id": "r1" }),
+        json!({ "target": "BigTeam/Channel-01", "markdown": "hello", "bogus_param": 123 }),
+    ] {
+        let resp = call_mcp("send_message", bad_args.clone()).await;
+        assert_eq!(
+            resp["result"]["isError"], true,
+            "unknown arg must be rejected for {bad_args}: {resp}"
+        );
+    }
+    assert_eq!(
+        state.posted_messages.read().unwrap().len(),
+        0,
+        "rejected send_message must perform 0 POSTs"
+    );
+
+    // Control: valid schema args send exactly once
+    let valid_resp = call_mcp(
+        "send_message",
+        json!({ "target": "BigTeam/Channel-01", "markdown": "valid message", "subject": "Valid" }),
+    )
+    .await;
+    assert_eq!(valid_resp["result"]["isError"], false, "{valid_resp}");
+    assert_eq!(state.posted_messages.read().unwrap().len(), 1);
+
+    // Part C: MCP set_presence("Reset") and HTTP POST /presence ("Reset") cache actual Graph presence ("Busy")
+    let mcp_reset = call_mcp("set_presence", json!({ "availability": "Reset" })).await;
+    assert_eq!(mcp_reset["result"]["isError"], false, "{mcp_reset}");
+    let cached_after_mcp = storage.get_presences().unwrap();
+    let p_mcp = cached_after_mcp.get("me-user-1").expect("presence cached after MCP reset");
+    assert_eq!(
+        p_mcp.availability, "Busy",
+        "MCP Reset must store actual Graph presence, not literal Reset: {p_mcp:?}"
+    );
+    assert_eq!(p_mcp.activity, "InACall");
+
+    let http_storage = Storage::open_in_memory().unwrap();
+    let api_router = serve::build_router(
+        cfg.clone(),
+        graph.clone(),
+        http_storage.clone(),
+        Some("tok-bug14".to_string()),
+    );
+    let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    let api_task = tokio::spawn(async move {
+        axum::serve(api_listener, api_router).await.unwrap();
+    });
+    let http_resp = reqwest::Client::new()
+        .post(format!("http://{api_addr}/presence"))
+        .bearer_auth("tok-bug14")
+        .json(&json!({ "availability": "Reset" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http_resp.status(), reqwest::StatusCode::OK);
+    let cached_after_http = http_storage.get_presences().unwrap();
+    let p_http = cached_after_http.get("me-user-1").expect("presence cached after HTTP reset");
+    assert_eq!(
+        p_http.availability, "Busy",
+        "HTTP Reset must store actual Graph presence, not literal Reset: {p_http:?}"
+    );
+    assert_eq!(p_http.activity, "InACall");
+    api_task.abort();
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_15_team_channels_pagination() {
+    #[derive(Default)]
+    struct Bug15State {
+        fail_big_page2: RwLock<bool>,
+        channel_get_requests: RwLock<Vec<String>>,
+        base_url: RwLock<String>,
+    }
+
+    let state = Arc::new(Bug15State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route("/v1.0/me/chats", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async {
+                Json(json!({
+                    "value": [
+                        { "id": "t-many", "displayName": "BigTeam" },
+                        { "id": "t-small", "displayName": "SmallTeam" },
+                        { "id": "t-other", "displayName": "OtherTeam" }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|State(st): State<Arc<Bug15State>>, Json(payload): Json<Value>| async move {
+                let base = st.base_url.read().unwrap().clone();
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        let req_id = req["id"].as_str().unwrap_or("0");
+                        let url = req["url"].as_str().unwrap_or("");
+                        if url.contains("/teams/t-many/channels") {
+                            json!({
+                                "id": req_id,
+                                "status": 200,
+                                "body": {
+                                    "value": [
+                                        { "id": "ch-01", "displayName": "Channel-01", "membershipType": "standard" },
+                                        { "id": "ch-02", "displayName": "Channel-02", "membershipType": "standard" }
+                                    ],
+                                    "@odata.nextLink": format!("{base}/teams/t-many/channels?page=2")
+                                }
+                            })
+                        } else if url.contains("/teams/t-small/channels") {
+                            json!({
+                                "id": req_id,
+                                "status": 200,
+                                "body": {
+                                    "value": [
+                                        { "id": "sm-01", "displayName": "Small-01", "membershipType": "standard" },
+                                        { "id": "sm-02", "displayName": "Small-02", "membershipType": "standard" }
+                                    ]
+                                }
+                            })
+                        } else if url.contains("/teams/t-other/channels") {
+                            json!({
+                                "id": req_id,
+                                "status": 200,
+                                "body": {
+                                    "value": [
+                                        { "id": "ot-01", "displayName": "Other-01", "membershipType": "standard" },
+                                        { "id": "ot-02", "displayName": "Other-02", "membershipType": "standard" }
+                                    ],
+                                    "@odata.nextLink": format!("{base}/teams/t-other/channels?page=2")
+                                }
+                            })
+                        } else {
+                            json!({ "id": req_id, "status": 404, "body": {} })
+                        }
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/{team_id}/channels",
+            get(
+                |State(st): State<Arc<Bug15State>>,
+                 Path(team_id): Path<String>,
+                 RawQuery(query): RawQuery| async move {
+                    let q = query.unwrap_or_default();
+                    st.channel_get_requests
+                        .write()
+                        .unwrap()
+                        .push(format!("/teams/{team_id}/channels?{q}"));
+                    let base = st.base_url.read().unwrap().clone();
+                    match (team_id.as_str(), q.as_str()) {
+                        ("t-many", "page=2") => {
+                            if *st.fail_big_page2.read().unwrap() {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({ "error": { "code": "InternalServerError", "message": "page 2 failure" } })),
+                                )
+                                    .into_response();
+                            }
+                            Json(json!({
+                                "value": [
+                                    { "id": "ch-03", "displayName": "Channel-03", "membershipType": "standard" },
+                                    { "id": "ch-04", "displayName": "Channel-04", "membershipType": "standard" }
+                                ],
+                                "@odata.nextLink": format!("{base}/teams/t-many/channels?page=3")
+                            }))
+                            .into_response()
+                        }
+                        ("t-many", "page=3") => Json(json!({
+                            "value": [
+                                { "id": "ch-05", "displayName": "Channel-05", "membershipType": "standard" }
+                            ]
+                        }))
+                        .into_response(),
+                        ("t-other", "page=2") => Json(json!({
+                            "value": [
+                                { "id": "ot-03", "displayName": "Other-03", "membershipType": "standard" }
+                            ]
+                        }))
+                        .into_response(),
+                        _ => Json(json!({ "value": [] })).into_response(),
+                    }
+                },
+            ),
+        )
+        .route(
+            "/v1.0/teams/t-many/channels/ch-05/messages",
+            get(|| async {
+                Json(json!({
+                    "value": [{
+                        "id": "m-ch05",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-21T09:00:01Z",
+                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                        "body": { "contentType": "html", "content": "<p>from channel 5</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": [],
+                        "replies": []
+                    }]
+                }))
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    *state.base_url.write().unwrap() = graph_base.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+
+    let run_cli = |tmp: &TempDir, args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = tmp.path().join("config");
+        let data_dir = tmp.path().join("data");
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    // 1. Mid-page failure does NOT record truncated channel list as complete
+    *state.fail_big_page2.write().unwrap() = true;
+    let tmp_fail = tempfile::tempdir().unwrap();
+    let fail_out = run_cli(&tmp_fail, &["teams", "--refresh", "--json"]).await;
+    assert!(!fail_out.status.success(), "mid-page failure must fail teams --refresh");
+    let fail_db = tmp_fail.path().join("data").join("me-user-1").join("cache.db");
+    if fail_db.exists() {
+        let st = Storage::open(&fail_db).unwrap();
+        assert!(
+            st.list_teams().unwrap().is_empty(),
+            "failed paginated refresh must not persist incomplete team channel list"
+        );
+        assert!(st.get_sync_cursor("cli:teams").unwrap().is_none());
+    }
+
+    // 2. Full pagination (2/2/1 for BigTeam, 2 for SmallTeam with no nextLink, 2/1 for OtherTeam)
+    *state.fail_big_page2.write().unwrap() = false;
+    state.channel_get_requests.write().unwrap().clear();
+    let tmp = tempfile::tempdir().unwrap();
+    let t_out = run_cli(&tmp, &["teams", "--refresh", "--json"]).await;
+    assert!(t_out.status.success(), "stderr={}", String::from_utf8_lossy(&t_out.stderr));
+    let tj: Value = serde_json::from_slice(&t_out.stdout).unwrap();
+    let teams_arr = tj["teams"].as_array().unwrap();
+    let big = teams_arr.iter().find(|t| t["id"] == "t-many").unwrap();
+    let small = teams_arr.iter().find(|t| t["id"] == "t-small").unwrap();
+    let other = teams_arr.iter().find(|t| t["id"] == "t-other").unwrap();
+    let big_names: Vec<&str> = big["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        big_names,
+        vec!["Channel-01", "Channel-02", "Channel-03", "Channel-04", "Channel-05"]
+    );
+    let small_names: Vec<&str> = small["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(small_names, vec!["Small-01", "Small-02"]);
+    let other_names: Vec<&str> = other["channels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(other_names, vec!["Other-01", "Other-02", "Other-03"]);
+
+    // Regression control: SmallTeam (no nextLink) has 0 follow-up channel GETs
+    let followups = state.channel_get_requests.read().unwrap().clone();
+    assert!(
+        !followups.iter().any(|u| u.contains("/teams/t-small/")),
+        "team without nextLink must have 0 follow-up requests: {followups:?}"
+    );
+
+    // channels --refresh also returns all 5 channels for BigTeam
+    let c_out = run_cli(&tmp, &["channels", "BigTeam", "--refresh", "--json"]).await;
+    assert!(c_out.status.success(), "stderr={}", String::from_utf8_lossy(&c_out.stderr));
+    let cj: Value = serde_json::from_slice(&c_out.stdout).unwrap();
+    assert_eq!(cj["channels"].as_array().unwrap().len(), 5);
+
+    // Target resolution for Channel-05 succeeds
+    let r_out = run_cli(&tmp, &["read", "BigTeam/Channel-05", "--json"]).await;
+    assert!(r_out.status.success(), "stderr={}", String::from_utf8_lossy(&r_out.stderr));
+    let rj: Value = serde_json::from_slice(&r_out.stdout).unwrap();
+    assert_eq!(rj["messages"][0]["msg_id"], "m-ch05");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_bug_16_read_thread_before_conflict() {
+    #[derive(Default)]
+    struct Bug16State {
+        request_count: RwLock<usize>,
+    }
+
+    let state = Arc::new(Bug16State::default());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|State(st): State<Arc<Bug16State>>| async move {
+                *st.request_count.write().unwrap() += 1;
+                Json(json!({
+                    "id": "me-user-1",
+                    "displayName": "Me (Tester)",
+                    "mail": "tester@contoso.com",
+                    "userPrincipalName": "tester@contoso.com"
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/me/chats",
+            get(|State(st): State<Arc<Bug16State>>| async move {
+                *st.request_count.write().unwrap() += 1;
+                Json(json!({ "value": [] }))
+            }),
+        )
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|State(st): State<Arc<Bug16State>>| async move {
+                *st.request_count.write().unwrap() += 1;
+                Json(json!({ "value": [{ "id": "t1", "displayName": "CoreEng" }] }))
+            }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|State(st): State<Arc<Bug16State>>, Json(payload): Json<Value>| async move {
+                *st.request_count.write().unwrap() += 1;
+                let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                let responses: Vec<Value> = reqs
+                    .into_iter()
+                    .map(|req| {
+                        json!({
+                            "id": req["id"].as_str().unwrap_or("0"),
+                            "status": 200,
+                            "body": { "value": [{ "id": "ch1", "displayName": "General", "membershipType": "standard" }] }
+                        })
+                    })
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages",
+            get(|State(st): State<Arc<Bug16State>>| async move {
+                *st.request_count.write().unwrap() += 1;
+                Json(json!({
+                    "value": [{
+                        "id": "root-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-20T09:00:00Z",
+                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                        "body": { "contentType": "html", "content": "<p>root</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": [],
+                        "replies": []
+                    }]
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages/root-1",
+            get(|State(st): State<Arc<Bug16State>>| async move {
+                *st.request_count.write().unwrap() += 1;
+                Json(json!({
+                    "id": "root-1",
+                    "messageType": "message",
+                    "createdDateTime": "2026-11-20T09:00:00Z",
+                    "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                    "body": { "contentType": "html", "content": "<p>root</p>" },
+                    "mentions": [],
+                    "attachments": [],
+                    "reactions": []
+                }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages/root-1/replies",
+            get(|State(st): State<Arc<Bug16State>>| async move {
+                *st.request_count.write().unwrap() += 1;
+                Json(json!({
+                    "value": [{
+                        "id": "rep-1",
+                        "replyToId": "root-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-21T09:00:12Z",
+                        "from": { "user": { "id": "peer-kim", "displayName": "Alice" } },
+                        "body": { "contentType": "html", "content": "<p>reply 1</p>" },
+                        "mentions": [],
+                        "attachments": [],
+                        "reactions": []
+                    }]
+                }))
+            }),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let graph_base = format!("http://{addr}/v1.0");
+    let auth_base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(
+        json!({
+            "oid": "me-user-1",
+            "name": "Me (Tester)",
+            "upn": "tester@contoso.com",
+            "exp": 4_102_444_800_i64
+        })
+        .to_string()
+        .as_bytes(),
+    );
+    let jwt = format!("{header_b64}.{payload_b64}.sig");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+
+    let run_cli = |args: &[&str]| {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&owned)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams CLI")
+        }
+    };
+
+    // Both flag orders must exit with code 2, 0 Graph requests, and mention both --thread and --before in stderr
+    for bad_args in [
+        &["read", "CoreEng/General", "--thread", "root-1", "--before", "2026-11-21"][..],
+        &["read", "CoreEng/General", "--before", "2026-11-21", "--thread", "root-1"][..],
+    ] {
+        let out = run_cli(bad_args).await;
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected exit code 2 for {bad_args:?}, got {:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--thread") && stderr.contains("--before"),
+            "expected both conflicting option names in stderr, got: {stderr}"
+        );
+    }
+    assert_eq!(
+        *state.request_count.read().unwrap(),
+        0,
+        "conflicting flags must make 0 Graph requests"
+    );
+
+    // Help documents both query forms
+    let help = run_cli(&["read", "--help"]).await;
+    assert!(help.status.success());
+    let help_txt = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_txt.contains("--thread") && help_txt.contains("--before"),
+        "{help_txt}"
+    );
+
+    // Regression controls: --before alone and --thread alone both succeed
+    let before_only = run_cli(&["read", "CoreEng/General", "--before", "2026-11-21", "--json"]).await;
+    assert!(
+        before_only.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&before_only.stderr)
+    );
+    let bj: Value = serde_json::from_slice(&before_only.stdout).unwrap();
+    assert_eq!(bj["messages"][0]["msg_id"], "root-1");
+
+    let thread_only = run_cli(&["read", "CoreEng/General", "--thread", "root-1", "--json"]).await;
+    assert!(
+        thread_only.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&thread_only.stderr)
+    );
+    let tj: Value = serde_json::from_slice(&thread_only.stdout).unwrap();
+    assert_eq!(tj["thread"]["replies"][0]["msg_id"], "rep-1");
+
+    server.abort();
+}

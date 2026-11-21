@@ -442,13 +442,13 @@ async fn current_token_fingerprint(graph: &GraphClient) -> String {
 /// Performs an initial bootstrap sync (chats + joined teams/channels) into SQLite.
 pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> Result<()> {
     let (chats_res, teams_res) = tokio::join!(
-        graph.list_chats_page(50, None),
+        graph.list_chats_page_detailed(50, None),
         graph.list_joined_teams_with_channels(),
     );
-    let (chats, next_link) = chats_res?;
+    let page = chats_res?;
     run_storage(storage, move |st| {
-        st.upsert_conversations(&chats)?;
-        save_initial_chats_list_cursor_if_absent(st, next_link)
+        st.upsert_conversations_with_null_topics(&page.chats, &page.explicit_null_topic_keys)?;
+        save_initial_chats_list_cursor_if_absent(st, page.next_link)
     })
     .await?;
     if let Ok(teams) = teams_res {
@@ -1597,7 +1597,10 @@ async fn poll_chats_tier2_with_rolling_cache(
         *chat_cache_seeded = true;
     }
 
-    let (chats, next_link) = graph.list_chats_page(50, None).await?;
+    let chats_page = graph.list_chats_page_detailed(50, None).await?;
+    let chats = chats_page.chats;
+    let next_link = chats_page.next_link;
+    let explicit_null_topic_keys = chats_page.explicit_null_topic_keys;
 
     let mut dirty_ids = Vec::new();
     let mut dirty_set = HashSet::new();
@@ -1694,7 +1697,7 @@ async fn poll_chats_tier2_with_rolling_cache(
         let save_cursor = !*chats_cursor_initialized;
         run_storage(storage, move |st| {
             if !to_upsert.is_empty() {
-                st.upsert_conversations(&to_upsert)?;
+                st.upsert_conversations_with_null_topics(&to_upsert, &explicit_null_topic_keys)?;
             }
             if save_cursor {
                 save_initial_chats_list_cursor_if_absent(st, next_link)?;
