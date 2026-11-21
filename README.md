@@ -2,12 +2,14 @@
 
 # `teams`
 
-**Blazing-fast Microsoft Teams terminal client & AI agent toolkit — CLI, TUI, HTTP API, and MCP in one native Rust binary.**
+**Read Microsoft Teams chats and channel threads, send Markdown messages, and search cached conversations from the terminal.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fteams?color=7aa2f7&label=%40bitefoundry%2Fteams&logo=npm)](https://www.npmjs.com/package/@bitefoundry/teams)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](https://opensource.org/license/mit)
+[![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-teams) · [Latest release notes](https://github.com/BiteFoundry/teams/releases/latest)
 
 <br />
 
@@ -23,7 +25,7 @@
 | --- | --- |
 | **Minimal-Chrome TUI** | 3-tier responsive `ratatui` layout (`Wide` / `Medium` / `Narrow`), Composer-First workflow, side-by-side Thread Drawer, Link Extractor (`u`), `zoxide` File Picker (`Ctrl+F`), Unified `Ctrl+K` Omni-Switcher, Cozy/Compact density (`Ctrl+D`), and multi-depth themes (`Midnight Dark`, `Daylight Light`, `ANSI 256/16`, `NO_COLOR`). |
 | **High-Res Terminal Images** | Native inline rendering for attachments & pasted `hostedContents` screenshots across **Kitty**, **iTerm2 (`OSC 1337`)**, **Sixel (`DCS q`)**, and **24-bit Half-Blocks (`▀`)** universal fallback with live zoom (`+`/`-`/`0`) and protocol switching (`p`). |
-| **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with `@odata.nextLink` deep history cursors, instant offline hybrid search (`teams search`), and sub-5ms cached CLI reads via `teams daemon`. |
+| **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with `@odata.nextLink` deep history cursors, offline hybrid search (`teams search`), and cached CLI reads via `teams daemon`. |
 | **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 18 tools)**. |
 
 ---
@@ -31,7 +33,7 @@
 ## Quick Start
 
 ```bash
-# 1. Install globally via npm (links prebuilt native binary, zero Node runtime overhead)
+# 1. Install the native CLI via npm
 npm i -g @bitefoundry/teams
 
 # 2. Sign in with the desktop application registered by your organization
@@ -41,10 +43,16 @@ teams login --client-id YOUR_CLIENT_ID --tenant-id YOUR_TENANT_ID
 teams
 ```
 
+```sh
+teams read "Release Room" --json
+```
+
+Read a conversation in compact JSON. The response identifies omitted fields and distinguishes loaded thread replies from the total. For full detail, add `--full` in the CLI or pass `compact: false` to `get_messages` and `get_thread` in MCP.
+
 IT administrators can register the app, select delegated permissions and verify a sign-in in Entra. For the public Microsoft Graph Command Line Tools client, run `teams login`. [Company app registration guide](docs/ENTERPRISE.md)
 
-> **Alternative installs:** Run one-off with `npx @bitefoundry/teams`, download prebuilt binaries from [GitHub Releases](https://github.com/BiteFoundry/teams/releases), or build from source with `cargo build --release` (Rust 1.80+, zero external OpenSSL/SQLite deps). Self-update anytime with `teams update`.
->
+Update a global npm install with `npm install -g @bitefoundry/teams@latest`. For a standalone binary from [GitHub Releases](https://github.com/BiteFoundry/teams/releases), use `teams update`. To build from source, run `cargo build --release --locked`.
+
 > **External Token Brokers & Custom Entra ID Apps:** Supports `TEAMS_ACCESS_TOKEN`, `TEAMS_TOKEN_FILE`, `TEAMS_TOKEN_REFRESH_CMD` (including `az account get-access-token`), and custom `--client-id` / `--tenant-id`. Run `teams whoami` or `teams doctor --probe` for instant JWT scope diagnostics.
 
 ---
