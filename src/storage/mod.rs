@@ -285,6 +285,8 @@ impl Storage {
         };
         msg.body_html = new_body_html.to_string();
         msg.body_plain = crate::parser::html_and_cards_to_plain(new_body_html, &msg.attachments);
+        msg.mentions
+            .retain(|m| new_body_html.contains(&format!("<at id=\"{}\"", m.id)));
         msg.last_modified_at = Some(edited_at.to_string());
         msg.deleted = false;
         let outcome = repo::upsert_messages_detailed(&mut conn, std::slice::from_ref(&msg))?;
@@ -1324,7 +1326,13 @@ mod tests {
         let conv_key = chat.conv_key.clone();
         storage.upsert_conversations(&[chat]).unwrap();
 
-        let m1 = sample_msg(&conv_key, "m1", None, "Alice", "older-token", None, "2026-11-20T01:00:00Z");
+        let mut m1 = sample_msg(&conv_key, "m1", None, "Alice", "older-token", None, "2026-11-20T01:00:00Z");
+        m1.body_html = "<p><at id=\"0\">Alice</at> older-token</p>".to_string();
+        m1.mentions = vec![crate::models::MentionInfo {
+            id: 0,
+            user_id: "u-alice".to_string(),
+            display_name: "Alice".to_string(),
+        }];
         let m2 = sample_msg(&conv_key, "m2", None, "Alice", "alpha-before-edit", None, "2026-11-20T02:00:00Z");
         storage.upsert_messages(&[m1, m2]).unwrap();
         assert_eq!(
@@ -1332,11 +1340,20 @@ mod tests {
             Some("alpha-before-edit")
         );
 
-        // 1) Editing an older message keeps last_msg_preview pointing at m2.
-        storage
+        // 1) Editing an older message keeps last_msg_preview pointing at m2 and drops stale mentions.
+        let (edited_m1, _) = storage
             .apply_local_edit(&conv_key, "m1", "<p>older-edited</p>", "2026-11-20T02:05:00Z")
             .unwrap()
             .unwrap();
+        assert!(edited_m1.mentions.is_empty(), "stale mentions must be cleared on full edit");
+        assert!(
+            storage
+                .get_message(&conv_key, "m1")
+                .unwrap()
+                .unwrap()
+                .mentions
+                .is_empty()
+        );
         assert_eq!(
             storage.get_conversation(&conv_key).unwrap().unwrap().last_msg_preview.as_deref(),
             Some("alpha-before-edit")

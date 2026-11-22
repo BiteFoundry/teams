@@ -1,12 +1,84 @@
 //! Fuzzy target resolver for CLI, HTTP API, and MCP (`"Alice"`, `"Group Chat"`, `"Engineering/General"`, `chat:...`, `chan:...:...`).
 
+use std::fmt;
+
 use anyhow::{bail, Result};
+use serde::Serialize;
 
 use crate::{
     graph::GraphClient,
     models::{ConversationKind, ConversationSummary, ConversationTarget},
     storage::Storage,
 };
+
+const MAX_LIST: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TargetCandidate {
+    pub conv_key: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AmbiguousTarget {
+    pub message: String,
+    pub candidates: Vec<TargetCandidate>,
+}
+
+impl fmt::Display for AmbiguousTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AmbiguousTarget {}
+
+#[derive(Debug, Clone)]
+pub struct UnverifiedTarget {
+    pub message: String,
+    pub candidates: Vec<TargetCandidate>,
+}
+
+impl fmt::Display for UnverifiedTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UnverifiedTarget {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    Id,
+    ExactName,
+    Partial,
+}
+
+fn target_candidates(candidates: &[&ConversationSummary]) -> Vec<TargetCandidate> {
+    candidates
+        .iter()
+        .take(MAX_LIST)
+        .map(|c| TargetCandidate {
+            conv_key: c.conv_key.clone(),
+            title: c.title.clone(),
+            team_name: if c.kind == ConversationKind::Channel {
+                c.team_name.clone().filter(|t| !t.is_empty())
+            } else {
+                None
+            },
+        })
+        .collect()
+}
+
+fn ambiguous_err(message: String, candidates: &[&ConversationSummary]) -> anyhow::Error {
+    AmbiguousTarget {
+        message,
+        candidates: target_candidates(candidates),
+    }
+    .into()
+}
 
 /// Resolves a user-supplied conversation query against the known conversation list.
 ///
@@ -21,6 +93,13 @@ pub fn resolve_from_slice(
     conversations: &[ConversationSummary],
     query: &str,
 ) -> Result<ConversationSummary> {
+    resolve_ranked(conversations, query).map(|(c, _)| c)
+}
+
+fn resolve_ranked(
+    conversations: &[ConversationSummary],
+    query: &str,
+) -> Result<(ConversationSummary, MatchKind)> {
     let q = query.trim();
     if q.is_empty() {
         bail!("Target conversation/channel name is empty.");
@@ -28,7 +107,7 @@ pub fn resolve_from_slice(
 
     // Priority 1: Exact conv_key
     if let Some(exact) = conversations.iter().find(|c| c.conv_key == q) {
-        return Ok(exact.clone());
+        return Ok((exact.clone(), MatchKind::Id));
     }
 
     // Priority 2: Exact raw chat_id or channel_id
@@ -40,12 +119,15 @@ pub fn resolve_from_slice(
         })
         .collect();
     if raw_id_matches.len() == 1 {
-        return Ok(raw_id_matches[0].clone());
+        return Ok((raw_id_matches[0].clone(), MatchKind::Id));
     } else if raw_id_matches.len() > 1 {
-        bail!(
-            "Multiple conversations/channels match target ID '{q}':\n{}",
-            format_candidates(&raw_id_matches)
-        );
+        return Err(ambiguous_err(
+            format!(
+                "Multiple conversations/channels match target ID '{q}':\n{}",
+                format_candidates(&raw_id_matches)
+            ),
+            &raw_id_matches,
+        ));
     }
 
     let q_lower = q.to_lowercase();
@@ -64,12 +146,15 @@ pub fn resolve_from_slice(
         })
         .collect();
     if exact_full_matches.len() == 1 {
-        return Ok(exact_full_matches[0].clone());
+        return Ok((exact_full_matches[0].clone(), MatchKind::ExactName));
     } else if exact_full_matches.len() > 1 {
-        bail!(
-            "Multiple targets match '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
-            format_candidates(&exact_full_matches)
-        );
+        return Err(ambiguous_err(
+            format!(
+                "Multiple targets match '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
+                format_candidates(&exact_full_matches)
+            ),
+            &exact_full_matches,
+        ));
     }
 
     // Priority 3b: Case-insensitive exact channel title match (e.g. "General" without team prefix)
@@ -78,12 +163,15 @@ pub fn resolve_from_slice(
         .filter(|c| c.kind == ConversationKind::Channel && c.title.trim().to_lowercase() == q_lower)
         .collect();
     if exact_channel_title_matches.len() == 1 {
-        return Ok(exact_channel_title_matches[0].clone());
+        return Ok((exact_channel_title_matches[0].clone(), MatchKind::Partial));
     } else if exact_channel_title_matches.len() > 1 {
-        bail!(
-            "Multiple targets match title '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
-            format_candidates(&exact_channel_title_matches)
-        );
+        return Err(ambiguous_err(
+            format!(
+                "Multiple targets match title '{q}' exactly. Use conv_key or 'TeamName/ChannelName':\n{}",
+                format_candidates(&exact_channel_title_matches)
+            ),
+            &exact_channel_title_matches,
+        ));
     }
 
     // Priority 4: Slash notation partial match "<team_part>/<channel_part>" (supports '/' inside team names)
@@ -108,12 +196,15 @@ pub fn resolve_from_slice(
             .collect();
 
         if slash_matches.len() == 1 {
-            return Ok(slash_matches[0].clone());
+            return Ok((slash_matches[0].clone(), MatchKind::Partial));
         } else if slash_matches.len() > 1 {
-            bail!(
-                "Multiple targets match '{q}'. Please specify a more specific target:\n{}",
-                format_candidates(&slash_matches)
-            );
+            return Err(ambiguous_err(
+                format!(
+                    "Multiple targets match '{q}'. Please specify a more specific target:\n{}",
+                    format_candidates(&slash_matches)
+                ),
+                &slash_matches,
+            ));
         }
     }
 
@@ -136,11 +227,14 @@ pub fn resolve_from_slice(
         .collect();
 
     match sub_matches.len() {
-        1 => Ok(sub_matches[0].clone()),
-        n if n > 1 => bail!(
-            "Ambiguous target '{q}' matches multiple conversations ({n}):\n{}",
-            format_candidates(&sub_matches)
-        ),
+        1 => Ok((sub_matches[0].clone(), MatchKind::Partial)),
+        n if n > 1 => Err(ambiguous_err(
+            format!(
+                "Ambiguous target '{q}' matches multiple conversations ({n}):\n{}",
+                format_candidates(&sub_matches)
+            ),
+            &sub_matches,
+        )),
         _ => bail!("Conversation/channel not found: {q}"),
     }
 }
@@ -157,6 +251,65 @@ fn matches_exact_team_channel(q_lower: &str, team_name: &str, channel_title: &st
         }
     }
     false
+}
+
+async fn refresh_lists(
+    storage: &Storage,
+    graph: &GraphClient,
+) -> Result<(
+    Vec<ConversationSummary>,
+    Option<anyhow::Error>,
+    Option<anyhow::Error>,
+)> {
+    let (chats_res, teams_res) = tokio::join!(
+        graph.list_chats_with_cursor(150),
+        graph.list_joined_teams_with_channels(),
+    );
+
+    let mut chats_err: Option<anyhow::Error> = None;
+    let mut teams_err: Option<anyhow::Error> = None;
+    match chats_res {
+        Ok(c) => {
+            storage.upsert_conversations_with_null_topics(&c.chats, &c.explicit_null_topic_keys)?;
+        }
+        Err(err) => {
+            chats_err = Some(err);
+        }
+    }
+    match teams_res {
+        Ok(t) => {
+            storage.upsert_joined_teams(&t)?;
+        }
+        Err(err) => {
+            teams_err = Some(err);
+        }
+    }
+
+    let refreshed = storage.list_conversations()?;
+    Ok((refreshed, chats_err, teams_err))
+}
+
+fn attach_lookup_errors(
+    resolve_err: anyhow::Error,
+    chats_err: Option<anyhow::Error>,
+    teams_err: Option<anyhow::Error>,
+) -> anyhow::Error {
+    let suffix = match (chats_err, teams_err) {
+        (Some(ce), Some(te)) => {
+            format!(" (chats lookup failed: {ce:#}; teams/channels lookup failed: {te:#})")
+        }
+        (Some(ce), None) => format!(" (chats lookup failed: {ce:#})"),
+        (None, Some(te)) => format!(" (teams/channels lookup failed: {te:#})"),
+        (None, None) => return resolve_err,
+    };
+    if let Some(amb) = resolve_err.downcast_ref::<AmbiguousTarget>() {
+        return AmbiguousTarget {
+            message: format!("{}{suffix}", amb.message),
+            candidates: amb.candidates.clone(),
+        }
+        .into();
+    }
+    anyhow::anyhow!("{resolve_err}{suffix}")
 }
 
 /// Resolves against local SQLite cache first, refreshing from Graph once if not found.
@@ -204,45 +357,64 @@ pub async fn resolve_conversation(
         return resolve_from_slice(&refreshed, q);
     }
 
-    let (chats_res, teams_res) = tokio::join!(
-        graph.list_chats_with_cursor(150),
-        graph.list_joined_teams_with_channels(),
-    );
-
-    let mut chats_err: Option<anyhow::Error> = None;
-    let mut teams_err: Option<anyhow::Error> = None;
-    match chats_res {
-        Ok(c) => {
-            storage.upsert_conversations_with_null_topics(&c.chats, &c.explicit_null_topic_keys)?;
-        }
-        Err(err) => {
-            chats_err = Some(err);
-        }
-    }
-    match teams_res {
-        Ok(t) => {
-            storage.upsert_joined_teams(&t)?;
-        }
-        Err(err) => {
-            teams_err = Some(err);
-        }
-    }
-
-    let refreshed = storage.list_conversations()?;
+    let (refreshed, chats_err, teams_err) = refresh_lists(storage, graph).await?;
     match resolve_from_slice(&refreshed, q) {
         Ok(found) => Ok(found),
-        Err(resolve_err) => match (chats_err, teams_err) {
-            (Some(ce), Some(te)) => Err(anyhow::anyhow!(
-                "{resolve_err} (chats lookup failed: {ce:#}; teams/channels lookup failed: {te:#})"
-            )),
-            (Some(ce), None) => Err(anyhow::anyhow!(
-                "{resolve_err} (chats lookup failed: {ce:#})"
-            )),
-            (None, Some(te)) => Err(anyhow::anyhow!(
-                "{resolve_err} (teams/channels lookup failed: {te:#})"
-            )),
-            (None, None) => Err(resolve_err),
-        },
+        Err(resolve_err) => Err(attach_lookup_errors(resolve_err, chats_err, teams_err)),
+    }
+}
+
+/// Resolves a posting target (`send` / `send-file`): accepts exact IDs and exact full names
+/// directly from cache, but verifies partial matches against a fresh fetch of both chats and
+/// joined teams/channels. Refuses to return an unverified partial match if either lookup fails.
+pub async fn resolve_post_target(
+    storage: &Storage,
+    graph: &GraphClient,
+    query: &str,
+) -> Result<ConversationSummary> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Target conversation/channel name is empty.");
+    }
+
+    let cached = storage.list_conversations()?;
+    if let Ok((found, MatchKind::Id | MatchKind::ExactName)) = resolve_ranked(&cached, q) {
+        return Ok(found);
+    }
+
+    if q.starts_with("chat:") || q.starts_with("chan:") {
+        return resolve_conversation(storage, graph, q).await;
+    }
+
+    let (refreshed, chats_err, teams_err) = refresh_lists(storage, graph).await?;
+    match resolve_ranked(&refreshed, q) {
+        Ok((found, MatchKind::Id | MatchKind::ExactName)) => Ok(found),
+        Ok((found, MatchKind::Partial)) => {
+            if chats_err.is_none() && teams_err.is_none() {
+                return Ok(found);
+            }
+            let reason = match (chats_err, teams_err) {
+                (Some(ce), Some(te)) => format!(
+                    "the chats lookup failed: {ce:#}; the teams/channels lookup failed: {te:#}"
+                ),
+                (Some(ce), None) => format!("the chats lookup failed: {ce:#}"),
+                (None, Some(te)) => format!("the teams/channels lookup failed: {te:#}"),
+                (None, None) => unreachable!(),
+            };
+            let closest = format_candidates(&[&found]);
+            let message = format!(
+                "Not sent: cannot confirm target '{q}' because {reason}\n\
+                 Closest known match:\n\
+                 {closest}\n\
+                 Retry with a conv_key, an exact chat title, or 'TeamName/ChannelName'."
+            );
+            Err(UnverifiedTarget {
+                message,
+                candidates: target_candidates(&[&found]),
+            }
+            .into())
+        }
+        Err(resolve_err) => Err(attach_lookup_errors(resolve_err, chats_err, teams_err)),
     }
 }
 
@@ -280,7 +452,6 @@ fn summary_from_target(target: ConversationTarget) -> ConversationSummary {
 }
 
 fn format_candidates(candidates: &[&ConversationSummary]) -> String {
-    const MAX_LIST: usize = 8;
     let mut lines: Vec<String> = candidates
         .iter()
         .take(MAX_LIST)
@@ -578,6 +749,208 @@ mod tests {
             err.contains("403") || err.contains("Forbidden") || err.contains("Authorization_RequestDenied"),
             "expected Graph 403 error, got: {err}"
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_post_target_partial_cache_and_lookup_failure() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use axum::{
+            http::StatusCode,
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        use crate::{
+            auth::{AuthManager, StoredTokens},
+            config::AppConfig,
+        };
+
+        let chats_hits = Arc::new(AtomicUsize::new(0));
+        let teams_hits = Arc::new(AtomicUsize::new(0));
+        let teams_fail = Arc::new(AtomicBool::new(false));
+
+        let ch_hits = chats_hits.clone();
+        let tm_hits = teams_hits.clone();
+        let tm_fail = teams_fail.clone();
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(move || {
+                    let hits = ch_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "value": [{
+                                "id": "19:group-general-sync@thread.v2",
+                                "chatType": "group",
+                                "topic": "General Sync",
+                                "members": []
+                            }]
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(move || {
+                    let hits = tm_hits.clone();
+                    let fail = tm_fail.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if fail.load(Ordering::SeqCst) {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({"error": {"code": "Authorization_RequestDenied", "message": "Forbidden"}})),
+                            )
+                                .into_response();
+                        }
+                        Json(json!({
+                            "value": [
+                                { "id": "team-eng", "displayName": "Engineering" },
+                                { "id": "team-des", "displayName": "Design" }
+                            ]
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(|Json(payload): Json<serde_json::Value>| async move {
+                    let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                    let responses: Vec<serde_json::Value> = reqs
+                        .into_iter()
+                        .map(|req| {
+                            let id = req["id"].as_str().unwrap_or("0");
+                            let url = req["url"].as_str().unwrap_or("");
+                            let chan_id = if url.contains("team-eng") {
+                                "19:gen-eng@thread.tacv2"
+                            } else {
+                                "19:gen-des@thread.tacv2"
+                            };
+                            json!({
+                                "id": id,
+                                "status": 200,
+                                "body": {
+                                    "value": [{
+                                        "id": chan_id,
+                                        "displayName": "General",
+                                        "membershipType": "standard"
+                                    }]
+                                }
+                            })
+                        })
+                        .collect();
+                    Json(json!({ "responses": responses }))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("me-1".to_string()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1");
+
+        // 1. Cache has only "General Sync" chat while server has 2 "General" channels:
+        //    resolve_post_target("General") refreshes and fails with AmbiguousTarget (2 candidates).
+        let storage1 = Storage::open_in_memory().unwrap();
+        storage1
+            .upsert_conversations(&[make_chat("19:group-general-sync@thread.v2", "General Sync")])
+            .unwrap();
+        let err = resolve_post_target(&storage1, &graph, "General")
+            .await
+            .unwrap_err();
+        let amb = err
+            .downcast_ref::<AmbiguousTarget>()
+            .expect("expected AmbiguousTarget");
+        assert_eq!(amb.candidates.len(), 2, "{amb:?}");
+        assert_eq!(teams_hits.load(Ordering::SeqCst), 1);
+
+        // 2. Same partial cache with teams lookup returning 403 -> UnverifiedTarget with General Sync candidate & 403
+        teams_fail.store(true, Ordering::SeqCst);
+        let storage2 = Storage::open_in_memory().unwrap();
+        storage2
+            .upsert_conversations(&[make_chat("19:group-general-sync@thread.v2", "General Sync")])
+            .unwrap();
+        let err_unv = resolve_post_target(&storage2, &graph, "General")
+            .await
+            .unwrap_err();
+        let unv = err_unv
+            .downcast_ref::<UnverifiedTarget>()
+            .expect("expected UnverifiedTarget");
+        assert_eq!(unv.candidates.len(), 1);
+        assert_eq!(
+            unv.candidates[0].conv_key,
+            "chat:19:group-general-sync@thread.v2"
+        );
+        assert!(unv.message.contains("403"), "{}", unv.message);
+        assert!(
+            unv.message.contains("chat:19:group-general-sync@thread.v2"),
+            "{}",
+            unv.message
+        );
+
+        // 3. Controls with teams lookup still 403: exact conv_key & exact chat title hit 0 lookups
+        let ch_before = chats_hits.load(Ordering::SeqCst);
+        let tm_before = teams_hits.load(Ordering::SeqCst);
+        let by_key = resolve_post_target(&storage2, &graph, "chat:19:group-general-sync@thread.v2")
+            .await
+            .unwrap();
+        assert_eq!(by_key.title, "General Sync");
+        let by_exact = resolve_post_target(&storage2, &graph, "General Sync")
+            .await
+            .unwrap();
+        assert_eq!(by_exact.conv_key, "chat:19:group-general-sync@thread.v2");
+        assert_eq!(chats_hits.load(Ordering::SeqCst), ch_before);
+        assert_eq!(teams_hits.load(Ordering::SeqCst), tm_before);
+
+        // Read path (resolve_conversation) keeps partial cache hit with 0 lookups
+        let read_hit = resolve_conversation(&storage2, &graph, "General")
+            .await
+            .unwrap();
+        assert_eq!(read_hit.conv_key, "chat:19:group-general-sync@thread.v2");
+        assert_eq!(chats_hits.load(Ordering::SeqCst), ch_before);
+        assert_eq!(teams_hits.load(Ordering::SeqCst), tm_before);
+
+        // 4. When both lookups succeed and partial match remains unique ("Sync"), returns General Sync after 1 refresh
+        teams_fail.store(false, Ordering::SeqCst);
+        let by_unique_partial = resolve_post_target(&storage2, &graph, "Sync")
+            .await
+            .unwrap();
+        assert_eq!(
+            by_unique_partial.conv_key,
+            "chat:19:group-general-sync@thread.v2"
+        );
+        assert_eq!(chats_hits.load(Ordering::SeqCst), ch_before + 1);
+        assert_eq!(teams_hits.load(Ordering::SeqCst), tm_before + 1);
 
         server.abort();
     }

@@ -687,7 +687,11 @@ async fn send_message(
     }
 
     let mentions = parse_mention_inputs(&body.mentions)?;
-    let conv = resolve_target_for_api(&state, &key, false).await?;
+    let requested_mentions = mentions.clone();
+    let conv = match cli::resolve_post_target(&state.storage, &state.graph, &key).await {
+        Ok(conv) => conv,
+        Err(err) => return Err(map_target_error(&state.graph, err).await),
+    };
 
     let mut outgoing = parser::compile_outgoing_markdown(
         &body.markdown,
@@ -697,6 +701,8 @@ async fn send_message(
         vec![],
         None,
     );
+    cli::ensure_mentions_used(&requested_mentions, &outgoing.mentions)
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     if body.important {
         outgoing.importance = Some("high".to_string());
     }
@@ -781,11 +787,14 @@ async fn reply_message(
     }
 
     let mentions = parse_mention_inputs(&body.mentions)?;
+    let requested_mentions = mentions.clone();
     let conv = resolve_target_for_api(&state, &key, false).await?;
 
     let quote = cli::build_quote_reply(&state.storage, &state.graph, &conv, &msg_id).await;
     let mut outgoing =
         parser::compile_outgoing_markdown(&body.markdown, None, mentions, vec![], vec![], quote);
+    cli::ensure_mentions_used(&requested_mentions, &outgoing.mentions)
+        .map_err(|err| ApiError::bad_request(format!("{err:#}")))?;
     if body.important {
         outgoing.importance = Some("high".to_string());
     }
@@ -835,7 +844,10 @@ async fn send_file(
         ));
     }
 
-    let conv = resolve_target_for_api(&state, &key, false).await?;
+    let conv = match cli::resolve_post_target(&state.storage, &state.graph, &key).await {
+        Ok(conv) => conv,
+        Err(err) => return Err(map_target_error(&state.graph, err).await),
+    };
 
     let sent = match cli::send_file_or_inline(
         &state.graph,

@@ -24,7 +24,7 @@ use crate::{
     models::{
         AttachmentInfo, ConversationKind, ConversationSummary, ConversationTarget, DownloadedFile,
         InlineImageUpload, MemberInfo, MentionInfo, MessageItem, QuotedReply, SyncCursor,
-        TeamChannelError, TeamSummary, ThreadCoverage, ThreadView,
+        TeamChannelError, TeamSummary, ThreadCoverage, ThreadView, UserProfile,
     },
     parser, resolver,
     serve::{self, ServeOptions},
@@ -520,31 +520,41 @@ pub enum Command {
         full: bool,
     },
     /// Send a Markdown message
-    #[command(visible_alias = "msg")]
+    #[command(
+        visible_alias = "msg",
+        after_help = "Markdown support: converts **bold**, *italic*, `code`, ~~strike~~, [label](url), > quote, fenced code blocks, single-level `- ` bullet lists, and @mentions. Headings (#), tables (|...|), _italic_, nested lists, and numbered lists are sent verbatim."
+    )]
     Send {
         target: String,
         markdown: String,
         #[arg(long)]
         subject: Option<String>,
-        /// Add a mention: <user_id:DisplayName> (repeatable)
+        /// Add a mention: <user_id:DisplayName> (repeatable; @DisplayName must appear in the body or the command fails; duplicate display names are assigned in --mention order)
         #[arg(long = "mention", value_name = "user_id:DisplayName")]
         mention: Vec<String>,
         #[arg(long)]
         important: bool,
         #[arg(long)]
         json: bool,
+        /// Return complete conversation and message objects instead of the compact default
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Reply to a channel thread or quote-reply to a chat message
     Reply {
         target: String,
         msg_id: String,
         markdown: String,
+        /// Add a mention: <user_id:DisplayName> (repeatable; @DisplayName must appear in the body or the command fails; duplicate display names are assigned in --mention order)
         #[arg(long = "mention", value_name = "user_id:DisplayName")]
         mention: Vec<String>,
         #[arg(long)]
         important: bool,
         #[arg(long)]
         json: bool,
+        /// Return complete conversation and message objects instead of the compact default
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Upload and send a file via OneDrive/SharePoint (or inline image with `--inline`)
     #[command(name = "send-file", visible_alias = "file")]
@@ -559,6 +569,9 @@ pub enum Command {
         inline: bool,
         #[arg(long)]
         json: bool,
+        /// Return complete conversation and message objects instead of the compact default
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Download a message attachment
     #[command(visible_alias = "dl")]
@@ -630,6 +643,15 @@ pub enum Command {
         cursor: Option<String>,
         #[arg(long)]
         offline: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search directory users by display name or email prefix
+    Users {
+        query: String,
+        /// Maximum number of users to return
+        #[arg(long, visible_alias = "top", default_value_t = 10)]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -774,6 +796,50 @@ pub enum DaemonCommand {
     Run,
 }
 
+impl Command {
+    fn json_output(&self) -> bool {
+        match self {
+            Command::Login { json, .. }
+            | Command::Logout { json }
+            | Command::Whoami { json }
+            | Command::Doctor { json, .. }
+            | Command::Chats { json, .. }
+            | Command::NewChat { json, .. }
+            | Command::UpdateChat { json, .. }
+            | Command::Teams { json, .. }
+            | Command::Channels { json, .. }
+            | Command::Read { json, .. }
+            | Command::Thread { json, .. }
+            | Command::Send { json, .. }
+            | Command::Reply { json, .. }
+            | Command::SendFile { json, .. }
+            | Command::Download { json, .. }
+            | Command::React { json, .. }
+            | Command::Edit { json, .. }
+            | Command::Delete { json, .. }
+            | Command::Members { json, .. }
+            | Command::Users { json, .. }
+            | Command::Search { json, .. }
+            | Command::Sync { json, .. }
+            | Command::Presence { json, .. }
+            | Command::Update { json, .. } => *json,
+            Command::Daemon { command } => match command {
+                DaemonCommand::Start { json }
+                | DaemonCommand::Stop { json }
+                | DaemonCommand::Status { json }
+                | DaemonCommand::Restart { json } => *json,
+                DaemonCommand::Run => false,
+            },
+            Command::Export { .. }
+            | Command::Preview { .. }
+            | Command::PreviewFile { .. }
+            | Command::Tui
+            | Command::Serve { .. }
+            | Command::Mcp => false,
+        }
+    }
+}
+
 
 /// Synchronously handles `--help`, `-h`, `--version`, `-V`, and `help` before Tokio/rustls/Keyring/SQLite init.
 pub fn try_fast_help_or_version() -> Option<Result<()>> {
@@ -814,8 +880,17 @@ where
 pub async fn run_from_env() -> Result<()> {
     let persona = Persona::detect();
     let cli = Cli::parse();
+    let json = cli.command.as_ref().is_some_and(Command::json_output);
     let mut cfg = AppConfig::load();
-    Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await
+    match Box::pin(dispatch_command(&mut cfg, persona, cli.command)).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if json {
+                println!("{}", error_json(&err));
+            }
+            Err(err)
+        }
+    }
 }
 
 async fn dispatch_command(
@@ -952,6 +1027,7 @@ async fn dispatch_command(
             mention,
             important,
             json,
+            full,
         }) => {
             Box::pin(cmd_send(
                 cfg,
@@ -961,6 +1037,7 @@ async fn dispatch_command(
                 &mention,
                 important,
                 json,
+                full,
             ))
             .await
         }
@@ -971,6 +1048,7 @@ async fn dispatch_command(
             mention,
             important,
             json,
+            full,
         }) => {
             Box::pin(cmd_reply(
                 cfg,
@@ -980,6 +1058,7 @@ async fn dispatch_command(
                 &mention,
                 important,
                 json,
+                full,
             ))
             .await
         }
@@ -990,6 +1069,7 @@ async fn dispatch_command(
             thread,
             inline,
             json,
+            full,
         }) => {
             Box::pin(cmd_send_file(
                 cfg,
@@ -999,6 +1079,7 @@ async fn dispatch_command(
                 thread.as_deref(),
                 inline,
                 json,
+                full,
             ))
             .await
         }
@@ -1080,6 +1161,9 @@ async fn dispatch_command(
             offline,
             json,
         }) => Box::pin(cmd_members(cfg, &target, limit, cursor.as_deref(), offline, json)).await,
+        Some(Command::Users { query, limit, json }) => {
+            Box::pin(cmd_users(cfg, &query, limit, json)).await
+        }
         Some(Command::Search {
             query,
             target,
@@ -1706,28 +1790,32 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
             ),
         };
         if json_out {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "persona": persona,
-                    "user_id": tokens.user_id,
-                    "display_name": tokens.user_display_name,
-                    "email": tokens.user_email,
-                    "client_id": tokens.client_id,
-                    "tenant_id": tokens.tenant_id,
-                    "auth_mode": tokens.auth_mode,
-                    "expires_at": tokens.expires_at,
-                    "expires_at_human": format_unix_ts(tokens.expires_at),
-                    "expired": true,
-                    "expiring_soon": true,
-                    "status": "expired",
-                    "scopes": scope_diag.scopes,
-                    "roles": scope_diag.roles,
-                    "scope_warnings": scope_diag.warnings,
-                    "error": format!("Token expired (exp: {}) — refresh and retry", format_unix_ts(tokens.expires_at)),
-                }))?
-            );
-            bail!("Token expired (exp: {}) — refresh the token and retry.", format_unix_ts(tokens.expires_at));
+            let details = json!({
+                "persona": persona,
+                "user_id": tokens.user_id,
+                "display_name": tokens.user_display_name,
+                "email": tokens.user_email,
+                "client_id": tokens.client_id,
+                "tenant_id": tokens.tenant_id,
+                "auth_mode": tokens.auth_mode,
+                "expires_at": tokens.expires_at,
+                "expires_at_human": format_unix_ts(tokens.expires_at),
+                "expired": true,
+                "expiring_soon": true,
+                "status": "expired",
+                "scopes": scope_diag.scopes,
+                "roles": scope_diag.roles,
+                "scope_warnings": scope_diag.warnings,
+                "error": format!("Token expired (exp: {}) — refresh and retry", format_unix_ts(tokens.expires_at)),
+            });
+            return Err(DetailedError {
+                message: format!(
+                    "Token expired (exp: {}) — refresh the token and retry.",
+                    format_unix_ts(tokens.expires_at)
+                ),
+                details,
+            }
+            .into());
         }
         bail!("{err_detail}");
     }
@@ -2826,16 +2914,19 @@ async fn cmd_send(
     mentions_raw: &[String],
     important: bool,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     if markdown.trim().is_empty() {
         bail!("Message body is empty.");
     }
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
+    let conv = resolve_post_target(&storage, &graph, target).await?;
     let mentions = parse_mentions_cli(mentions_raw)?;
+    let requested_mentions = mentions.clone();
 
     let mut outgoing =
         parser::compile_outgoing_markdown(markdown, subject, mentions, vec![], vec![], None);
+    ensure_mentions_used(&requested_mentions, &outgoing.mentions)?;
     if important {
         outgoing.importance = Some("high".to_string());
     }
@@ -2844,14 +2935,16 @@ async fn cmd_send(
     let _ = storage.upsert_messages(std::slice::from_ref(&sent));
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let payload = if full {
+            json!({
                 "ok": true,
                 "conversation": conv,
                 "message": sent,
-            }))?
-        );
+            })
+        } else {
+            sent_ack_json(&conv, &sent)
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!("Sent: {} ({}) msg_id={}", conv.title, conv.conv_key, sent.msg_id);
     }
@@ -2866,6 +2959,7 @@ async fn cmd_reply(
     mentions_raw: &[String],
     important: bool,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     if markdown.trim().is_empty() {
         bail!("Reply body is empty.");
@@ -2873,10 +2967,12 @@ async fn cmd_reply(
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_target(&storage, &graph, target, false).await?;
     let mentions = parse_mentions_cli(mentions_raw)?;
+    let requested_mentions = mentions.clone();
 
     let quote = build_quote_reply(&storage, &graph, &conv, msg_id).await;
     let mut outgoing =
         parser::compile_outgoing_markdown(markdown, None, mentions, vec![], vec![], quote);
+    ensure_mentions_used(&requested_mentions, &outgoing.mentions)?;
     if important {
         outgoing.importance = Some("high".to_string());
     }
@@ -2885,15 +2981,19 @@ async fn cmd_reply(
     let _ = storage.upsert_messages(std::slice::from_ref(&sent));
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let payload = if full {
+            json!({
                 "ok": true,
                 "conversation": conv,
                 "reply_to": msg_id,
                 "message": sent,
-            }))?
-        );
+            })
+        } else {
+            let mut ack = sent_ack_json(&conv, &sent);
+            ack["reply_to"] = json!(msg_id);
+            ack
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
             "Replied: {} ({}) msg_id={} (to {})",
@@ -2911,22 +3011,28 @@ async fn cmd_send_file(
     thread: Option<&str>,
     inline: bool,
     json_out: bool,
+    full: bool,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
-    let conv = resolve_target(&storage, &graph, target, false).await?;
+    let conv = resolve_post_target(&storage, &graph, target).await?;
     let sent = send_file_or_inline(&graph, &storage, &conv, path, caption, thread, inline).await?;
 
     if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
+        let payload = if full {
+            json!({
                 "ok": true,
                 "conversation": conv,
                 "path": path,
                 "inline": inline,
                 "message": sent,
-            }))?
-        );
+            })
+        } else {
+            let mut ack = sent_ack_json(&conv, &sent);
+            ack["path"] = json!(path);
+            ack["inline"] = json!(inline);
+            ack
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
             "File sent: {} ({}) msg_id={} ({})",
@@ -3251,6 +3357,38 @@ async fn cmd_members(
                         returned
                     ),
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_users(
+    cfg: &AppConfig,
+    query: &str,
+    limit: usize,
+    json_out: bool,
+) -> Result<()> {
+    let q = query.trim();
+    if q.is_empty() {
+        bail!("Search query is empty.");
+    }
+    let (_auth, graph, _storage) = open_runtime(cfg, true).await?;
+    let users = match graph.search_users(q, clamp_limit(limit)).await {
+        Ok(users) => users,
+        Err(err) => return Err(wrap_graph_permission_error(&graph, err).await),
+    };
+
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&users_search_json(&users))?);
+    } else if users.is_empty() {
+        println!("No matching users found.");
+    } else {
+        for u in &users {
+            if let Some(addr) = u.mail.as_deref().or(u.user_principal_name.as_deref()) {
+                println!("{}  <{addr}>  {}", u.display_name, u.id);
+            } else {
+                println!("{}  {}", u.display_name, u.id);
             }
         }
     }
@@ -4038,6 +4176,15 @@ fn compact_message(msg: &MessageItem) -> serde_json::Value {
     if !attachments.is_empty() {
         value["attachments"] = serde_json::Value::Array(attachments);
     }
+    let links: Vec<serde_json::Value> =
+        crate::ui::overlays::links::extract_links_from_text(&msg.body_html, "")
+            .into_iter()
+            .filter(|link| !msg.body_plain.contains(&link.url))
+            .map(|link| json!({ "text": link.label, "url": link.url }))
+            .collect();
+    if !links.is_empty() {
+        value["links"] = serde_json::Value::Array(links);
+    }
     if !msg.mentions.is_empty() || !msg.reactions.is_empty() {
         value["omitted"] = json!({
             "mentions": msg.mentions.len(),
@@ -4045,6 +4192,61 @@ fn compact_message(msg: &MessageItem) -> serde_json::Value {
         });
     }
     value
+}
+
+pub(crate) fn sent_ack_json(
+    conv: &ConversationSummary,
+    msg: &MessageItem,
+) -> serde_json::Value {
+    let mut conv_val = json!({
+        "conv_key": conv.conv_key,
+        "title": conv.title,
+    });
+    if conv.kind == ConversationKind::Channel {
+        if let Some(team) = conv.team_name.as_deref().filter(|t| !t.is_empty()) {
+            conv_val["team_name"] = json!(team);
+        }
+    }
+    let mut msg_val = json!({
+        "msg_id": msg.msg_id,
+        "created_at": msg.created_at,
+    });
+    if !msg.mentions.is_empty() {
+        msg_val["mentions"] = json!(msg.mentions.len());
+    }
+    let attachments: Vec<serde_json::Value> = msg
+        .attachments
+        .iter()
+        .filter(|att| !att.is_message_reference())
+        .map(|att| json!({ "id": att.id, "name": att.name }))
+        .collect();
+    if !attachments.is_empty() {
+        msg_val["attachments"] = serde_json::Value::Array(attachments);
+    }
+    json!({
+        "ok": true,
+        "conversation": conv_val,
+        "message": msg_val,
+    })
+}
+
+pub(crate) fn users_search_json(users: &[UserProfile]) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = users
+        .iter()
+        .map(|u| {
+            json!({
+                "user_id": u.id,
+                "display_name": u.display_name,
+                "email": u.mail,
+                "user_principal_name": u.user_principal_name,
+            })
+        })
+        .collect();
+    let returned = items.len();
+    json!({
+        "users": items,
+        "returned": returned,
+    })
 }
 
 pub(crate) fn finish_thread_value(
@@ -4170,8 +4372,22 @@ pub(crate) async fn read_thread(
     Ok((thread, coverage))
 }
 
-pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
-    let lower = format!("{err:#}").to_ascii_lowercase();
+#[derive(Debug)]
+struct DetailedError {
+    message: String,
+    details: serde_json::Value,
+}
+
+impl std::fmt::Display for DetailedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DetailedError {}
+
+fn is_forbidden_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
     lower.contains("403")
         || lower.contains("forbidden")
         || lower.contains("authorization_requestdenied")
@@ -4180,6 +4396,107 @@ pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
         || lower.contains("aclcheckfailed")
         || lower.contains("insufficient graph permissions")
         || lower.contains("insufficient permissions")
+}
+
+pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
+    is_forbidden_message(&format!("{err:#}"))
+}
+
+pub(crate) fn extract_graph_http_status(msg: &str) -> Option<u16> {
+    let start = msg.find(crate::graph::GRAPH_API_ERROR_PREFIX)?;
+    let rest = &msg[start..];
+    let (_, after) = rest.split_once("): ")?;
+    let bytes = after.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_digit()
+        || !bytes[1].is_ascii_digit()
+        || !bytes[2].is_ascii_digit()
+    {
+        return None;
+    }
+    if bytes.len() > 3 && bytes[3].is_ascii_digit() {
+        return None;
+    }
+    after[..3].parse::<u16>().ok()
+}
+
+pub(crate) fn error_code_for_message(msg: &str) -> &'static str {
+    if msg.contains("Conversation/channel not found") {
+        "target_not_found"
+    } else if msg.contains("Sign-in required") {
+        "not_signed_in"
+    } else if msg.contains("Token expired") {
+        "token_expired"
+    } else if is_forbidden_message(msg) {
+        "permission_denied"
+    } else {
+        match extract_graph_http_status(msg) {
+            Some(401) => "unauthorized",
+            Some(404) => "not_found",
+            _ => "error",
+        }
+    }
+}
+
+pub(crate) fn error_json_from_message(msg: &str) -> serde_json::Value {
+    let code = error_code_for_message(msg);
+    let http_status = if code == "permission_denied" {
+        Some(403)
+    } else {
+        extract_graph_http_status(msg)
+    };
+    let mut err_obj = json!({
+        "code": code,
+        "message": msg,
+    });
+    if let Some(status) = http_status {
+        err_obj["http_status"] = json!(status);
+    }
+    json!({
+        "ok": false,
+        "error": err_obj,
+    })
+}
+
+pub(crate) fn error_json(err: &anyhow::Error) -> serde_json::Value {
+    let message = format!("{err:#}");
+    let mut err_obj = if let Some(amb) = err.downcast_ref::<resolver::AmbiguousTarget>() {
+        json!({
+            "code": "target_ambiguous",
+            "message": message,
+            "candidates": amb.candidates,
+        })
+    } else {
+        let code = error_code_for_message(&message);
+        let http_status = if code == "permission_denied" {
+            Some(403)
+        } else {
+            extract_graph_http_status(&message)
+        };
+        let mut obj = json!({
+            "code": code,
+            "message": message,
+        });
+        if let Some(status) = http_status {
+            obj["http_status"] = json!(status);
+        }
+        if let Some(unv) = err.downcast_ref::<resolver::UnverifiedTarget>() {
+            obj["candidates"] = json!(unv.candidates);
+        }
+        if let Some(det) = err.downcast_ref::<DetailedError>() {
+            obj["details"] = det.details.clone();
+        }
+        obj
+    };
+    if let Some(det) = err.downcast_ref::<DetailedError>() {
+        if err_obj.get("details").is_none() {
+            err_obj["details"] = det.details.clone();
+        }
+    }
+    json!({
+        "ok": false,
+        "error": err_obj,
+    })
 }
 
 pub(crate) async fn wrap_graph_permission_error(
@@ -4547,6 +4864,14 @@ pub(crate) async fn resolve_target(
     }
 }
 
+pub(crate) async fn resolve_post_target(
+    storage: &Storage,
+    graph: &GraphClient,
+    query: &str,
+) -> Result<ConversationSummary> {
+    resolver::resolve_post_target(storage, graph, query).await
+}
+
 pub(crate) fn parse_mentions_cli(values: &[String]) -> Result<Vec<MentionInfo>> {
     values
         .iter()
@@ -4569,6 +4894,32 @@ pub(crate) fn parse_mention_spec(spec: &str, id: i32) -> Result<MentionInfo> {
         user_id: user_id.to_string(),
         display_name: display_name.to_string(),
     })
+}
+
+pub(crate) fn ensure_mentions_used(
+    requested: &[MentionInfo],
+    used: &[MentionInfo],
+) -> Result<()> {
+    let missing: Vec<&MentionInfo> = requested
+        .iter()
+        .filter(|req| !used.iter().any(|u| u.user_id == req.user_id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let list = missing
+        .iter()
+        .map(|m| format!("@{} ({})", m.display_name, m.user_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tokens = missing
+        .iter()
+        .map(|m| format!("@{}", m.display_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "Mention not found in message body: {list}. Write {tokens} in the text where the mention should appear."
+    );
 }
 
 pub(crate) fn normalize_reaction(raw: &str) -> Result<String> {
@@ -5095,6 +5446,7 @@ mod tests {
                 mention,
                 important,
                 json,
+                full: false,
             } => {
                 assert_eq!(target, "Engineering/General");
                 assert_eq!(markdown, "Hello");
@@ -5127,6 +5479,7 @@ mod tests {
                 thread,
                 inline,
                 json,
+                full: false,
             } => {
                 assert_eq!(target, "Alice");
                 assert_eq!(path, PathBuf::from("C:\\tmp\\shot.png"));
@@ -5185,6 +5538,22 @@ mod tests {
             "teams", "thread", "chan:t:c", "m1", "--json", "--full",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from(["teams", "send", "chat:c", "hi", "--full"]).is_err());
+        assert!(Cli::try_parse_from(["teams", "send", "chat:c", "hi", "--json", "--full"]).is_ok());
+        assert!(Cli::try_parse_from(["teams", "reply", "chat:c", "m1", "hi", "--full"]).is_err());
+        assert!(Cli::try_parse_from([
+            "teams", "reply", "chat:c", "m1", "hi", "--json", "--full",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "teams", "send-file", "chat:c", "a.txt", "--full",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "teams", "send-file", "chat:c", "a.txt", "--json", "--full",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["teams", "users", "Alice", "--limit", "5", "--json"]).is_ok());
     }
 
     #[test]
@@ -5813,6 +6182,7 @@ mod tests {
                 mention,
                 important,
                 json,
+                full: false,
             } => {
                 assert_eq!(target, "chat:c1");
                 assert_eq!(markdown, multiline);
@@ -6339,8 +6709,20 @@ mod tests {
             thumbnail_url: None,
         }];
 
+        let mut m5 = base_msg("m5");
+        m5.body_html =
+            "<p>Check <a href=\"https://docs.example.com/runbook-42\">Incident Runbook</a></p>"
+                .to_string();
+        m5.body_plain = "Check Incident Runbook".to_string();
+
+        let mut m6 = base_msg("m6");
+        m6.body_html =
+            "<p>See <a href=\"https://docs.example.com/bare\">https://docs.example.com/bare</a></p>"
+                .to_string();
+        m6.body_plain = "See https://docs.example.com/bare".to_string();
+
         let res = ReadMessagesResult {
-            messages: vec![m1.clone(), m2, m3, m4],
+            messages: vec![m1.clone(), m2, m3, m4, m5, m6],
             has_more: false,
             next_before: Some("m1".to_string()),
         };
@@ -6354,11 +6736,17 @@ mod tests {
         assert!(msgs[0].get("deleted").is_none());
         assert!(msgs[0].get("subject").is_none());
         assert!(msgs[0].get("omitted").is_none());
+        assert!(msgs[0].get("links").is_none());
         assert_eq!(msgs[1]["deleted"], true);
         assert_eq!(msgs[2]["subject"], "Q4 Plan");
         assert_eq!(msgs[2]["importance"], "high");
         assert_eq!(msgs[2]["omitted"], json!({ "mentions": 2, "reactions": 1 }));
         assert!(msgs[3].get("attachments").is_none());
+        assert_eq!(
+            msgs[4]["links"],
+            json!([{ "text": "Incident Runbook", "url": "https://docs.example.com/runbook-42" }])
+        );
+        assert!(msgs[5].get("links").is_none(), "bare URL already in body_plain must not add links");
 
         let full = read_messages_json(&conv, &res, None);
         assert!(full.get("omitted").is_none());
@@ -6468,5 +6856,80 @@ mod tests {
         assert_eq!(page_d["total"], 3);
         assert_eq!(page_d["has_more"], false);
         assert!(page_d["fetched_at"].is_string());
+    }
+
+    #[test]
+    fn error_json_classifies_runtime_errors_and_candidates() {
+        let not_signed = error_json(&anyhow::anyhow!(
+            "Sign-in required. Run 'teams login' first."
+        ));
+        assert_eq!(not_signed["ok"], false);
+        assert_eq!(not_signed["error"]["code"], "not_signed_in");
+        assert!(not_signed["error"].get("http_status").is_none());
+
+        let expired = error_json(&anyhow::Error::new(DetailedError {
+            message: "Token expired (exp: 2026-01-01) — refresh the token and retry.".to_string(),
+            details: json!({ "expired": true, "status": "expired" }),
+        }));
+        assert_eq!(expired["error"]["code"], "token_expired");
+        assert_eq!(expired["error"]["details"]["expired"], true);
+
+        let forbidden = error_json(&anyhow::anyhow!(
+            "Graph API error (POST https://graph.microsoft.com/v1.0/chats/c1/messages): 403 Forbidden"
+        ));
+        assert_eq!(forbidden["error"]["code"], "permission_denied");
+        assert_eq!(forbidden["error"]["http_status"], 403);
+
+        let not_found = error_json(&anyhow::anyhow!(
+            "Cannot reply: message missing-1 was not found in this chat: Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages/missing-1): 404 Not Found"
+        ));
+        assert_eq!(not_found["error"]["code"], "not_found");
+        assert_eq!(not_found["error"]["http_status"], 404);
+
+        let target_missing = error_json(&anyhow::anyhow!(
+            "Conversation/channel not found: NonExistentRoom"
+        ));
+        assert_eq!(target_missing["error"]["code"], "target_not_found");
+
+        let generic = error_json(&anyhow::anyhow!(
+            "Deleting with --json requires passing --yes."
+        ));
+        assert_eq!(generic["error"]["code"], "error");
+        assert!(generic["error"].get("http_status").is_none());
+
+        let amb = error_json(&anyhow::Error::new(resolver::AmbiguousTarget {
+            message: "Multiple targets match title 'General' exactly.".to_string(),
+            candidates: vec![
+                resolver::TargetCandidate {
+                    conv_key: "chan:team-eng:c1".to_string(),
+                    title: "General".to_string(),
+                    team_name: Some("Engineering".to_string()),
+                },
+                resolver::TargetCandidate {
+                    conv_key: "chan:team-des:c2".to_string(),
+                    title: "General".to_string(),
+                    team_name: Some("Design".to_string()),
+                },
+            ],
+        }));
+        assert_eq!(amb["error"]["code"], "target_ambiguous");
+        assert_eq!(amb["error"]["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(amb["error"]["candidates"][0]["team_name"], "Engineering");
+
+        let unv = error_json(&anyhow::Error::new(resolver::UnverifiedTarget {
+            message: "Not sent: cannot confirm target 'General' because the teams/channels lookup failed: Graph API error (GET https://graph.microsoft.com/v1.0/me/joinedTeams): 403 Forbidden".to_string(),
+            candidates: vec![resolver::TargetCandidate {
+                conv_key: "chat:19:group-general-sync@thread.v2".to_string(),
+                title: "General Sync".to_string(),
+                team_name: None,
+            }],
+        }));
+        assert_eq!(unv["error"]["code"], "permission_denied");
+        assert_eq!(unv["error"]["http_status"], 403);
+        assert_eq!(
+            unv["error"]["candidates"][0]["conv_key"],
+            "chat:19:group-general-sync@thread.v2"
+        );
+        assert!(unv["error"]["candidates"][0].get("team_name").is_none());
     }
 }

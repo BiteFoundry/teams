@@ -480,9 +480,15 @@ async fn call_tool(
             let markdown = args.required_text("markdown")?;
             let subject = args.optional_str("subject")?;
             let mentions = args.optional_mentions("mentions")?;
+            let requested_mentions = mentions.clone();
             let important = args.optional_bool("important")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            let conv = map_graph_result(
+                graph,
+                cli::resolve_post_target(storage, graph, &target).await,
+            )
+            .await?;
 
             let mut outgoing = parser::compile_outgoing_markdown(
                 &markdown,
@@ -492,6 +498,8 @@ async fn call_tool(
                 vec![],
                 None,
             );
+            cli::ensure_mentions_used(&requested_mentions, &outgoing.mentions)
+                .map_err(format_error)?;
             if important {
                 outgoing.importance = Some("high".to_string());
             }
@@ -505,11 +513,15 @@ async fn call_tool(
             .await;
             cli::hydrate_message_attachments(&mut sent);
 
-            Ok(json!({
-                "ok": true,
-                "conversation": conv,
-                "message": sent,
-            }))
+            if compact {
+                Ok(cli::sent_ack_json(&conv, &sent))
+            } else {
+                Ok(json!({
+                    "ok": true,
+                    "conversation": conv,
+                    "message": sent,
+                }))
+            }
         }
 
         "reply_message" => {
@@ -517,7 +529,9 @@ async fn call_tool(
             let msg_id = args.required_str("msg_id")?;
             let markdown = args.required_text("markdown")?;
             let mentions = args.optional_mentions("mentions")?;
+            let requested_mentions = mentions.clone();
             let important = args.optional_bool("important")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
             let conv = resolve_target_mcp(storage, graph, &target, false).await?;
             let quote = cli::build_quote_reply(storage, graph, &conv, &msg_id).await;
@@ -529,6 +543,8 @@ async fn call_tool(
                 vec![],
                 quote,
             );
+            cli::ensure_mentions_used(&requested_mentions, &outgoing.mentions)
+                .map_err(format_error)?;
             if important {
                 outgoing.importance = Some("high".to_string());
             }
@@ -545,12 +561,18 @@ async fn call_tool(
             .await;
             cli::hydrate_message_attachments(&mut sent);
 
-            Ok(json!({
-                "ok": true,
-                "conversation": conv,
-                "reply_to": msg_id,
-                "message": sent,
-            }))
+            if compact {
+                let mut ack = cli::sent_ack_json(&conv, &sent);
+                ack["reply_to"] = json!(msg_id);
+                Ok(ack)
+            } else {
+                Ok(json!({
+                    "ok": true,
+                    "conversation": conv,
+                    "reply_to": msg_id,
+                    "message": sent,
+                }))
+            }
         }
 
         "send_file" => {
@@ -559,8 +581,13 @@ async fn call_tool(
             let caption = args.optional_str("caption")?;
             let thread_root_id = args.optional_str("thread_root_id")?;
             let inline = args.optional_bool("inline")?.unwrap_or(false);
+            let compact = args.optional_bool("compact")?.unwrap_or(true);
 
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
+            let conv = map_graph_result(
+                graph,
+                cli::resolve_post_target(storage, graph, &target).await,
+            )
+            .await?;
             let sent = map_graph_result(
                 graph,
                 cli::send_file_or_inline(
@@ -576,12 +603,20 @@ async fn call_tool(
             )
             .await?;
 
-            Ok(json!({
-                "ok": true,
-                "conversation": conv,
-                "path": path,
-                "message": sent,
-            }))
+            if compact {
+                let mut ack = cli::sent_ack_json(&conv, &sent);
+                ack["path"] = json!(path);
+                ack["inline"] = json!(inline);
+                Ok(ack)
+            } else {
+                Ok(json!({
+                    "ok": true,
+                    "conversation": conv,
+                    "path": path,
+                    "inline": inline,
+                    "message": sent,
+                }))
+            }
         }
 
         "download_attachment" => {
@@ -771,6 +806,18 @@ async fn call_tool(
             .map_err(format_error)
         }
 
+        "search_users" => {
+            let query = args.required_str("query")?;
+            let limit = bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(10),
+                1,
+                1_000,
+            )?;
+            let users = map_graph_result(graph, graph.search_users(&query, limit).await).await?;
+            Ok(cli::users_search_json(&users))
+        }
+
         "mark_read" => {
             let target = args.required_str("target")?;
             let conv = resolve_target_mcp(storage, graph, &target, false).await?;
@@ -933,7 +980,7 @@ fn initialize_result(message: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (18 Teams tools)
+// Tool catalog (19 Teams tools)
 // ---------------------------------------------------------------------------
 
 fn mentions_schema() -> Value {
@@ -1058,7 +1105,8 @@ fn tool_catalog() -> Vec<Value> {
                     "markdown": { "type": "string", "minLength": 1 },
                     "subject": { "type": "string", "description": "Optional subject line for team channel root posts." },
                     "mentions": mentions_schema(),
-                    "important": { "type": "boolean", "default": false }
+                    "important": { "type": "boolean", "default": false },
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target", "markdown"],
                 "additionalProperties": false
@@ -1074,7 +1122,8 @@ fn tool_catalog() -> Vec<Value> {
                     "msg_id": { "type": "string", "minLength": 1 },
                     "markdown": { "type": "string", "minLength": 1 },
                     "mentions": mentions_schema(),
-                    "important": { "type": "boolean", "default": false }
+                    "important": { "type": "boolean", "default": false },
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target", "msg_id", "markdown"],
                 "additionalProperties": false
@@ -1090,7 +1139,8 @@ fn tool_catalog() -> Vec<Value> {
                     "path": { "type": "string", "minLength": 1, "description": "Local file path on the host running teams." },
                     "caption": { "type": "string" },
                     "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID." },
-                    "inline": { "type": "boolean", "default": false }
+                    "inline": { "type": "boolean", "default": false },
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target", "path"],
                 "additionalProperties": false
@@ -1196,6 +1246,19 @@ fn tool_catalog() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "search_users",
+            "description": "Search directory users by display name or email prefix.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 1, "description": "Display name or email prefix to search for." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 10 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "mark_read",
             "description": "Mark a chat read on Graph and in the local cache. A channel updates the local cache.",
             "inputSchema": {
@@ -1251,10 +1314,14 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
                 "isError": false
             })
         }
-        Err(error) => json!({
-            "content": [{ "type": "text", "text": error }],
-            "isError": true
-        }),
+        Err(error) => {
+            let payload = cli::error_json_from_message(&error);
+            let text = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
+            json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": true
+            })
+        }
     }
 }
 
@@ -1363,25 +1430,37 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_bool("compact")?;
         }
         "send_message" => {
+            args.reject_unknown(&[
+                "target", "markdown", "subject", "mentions", "important", "compact",
+            ])?;
             args.required_str("target")?;
             args.required_text("markdown")?;
             args.optional_str("subject")?;
             args.optional_mentions("mentions")?;
             args.optional_bool("important")?;
+            args.optional_bool("compact")?;
         }
         "reply_message" => {
+            args.reject_unknown(&[
+                "target", "msg_id", "markdown", "mentions", "important", "compact",
+            ])?;
             args.required_str("target")?;
             args.required_str("msg_id")?;
             args.required_text("markdown")?;
             args.optional_mentions("mentions")?;
             args.optional_bool("important")?;
+            args.optional_bool("compact")?;
         }
         "send_file" => {
+            args.reject_unknown(&[
+                "target", "path", "caption", "thread_root_id", "inline", "compact",
+            ])?;
             args.required_str("target")?;
             args.required_str("path")?;
             args.optional_str("caption")?;
             args.optional_str("thread_root_id")?;
             args.optional_bool("inline")?;
+            args.optional_bool("compact")?;
         }
         "download_attachment" => {
             args.required_str("target")?;
@@ -1433,6 +1512,16 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             )?;
             args.optional_str("cursor")?;
             args.optional_bool("offline")?;
+        }
+        "search_users" => {
+            args.reject_unknown(&["query", "limit"])?;
+            args.required_str("query")?;
+            bounds(
+                "limit",
+                args.optional_usize("limit")?.unwrap_or(10),
+                1,
+                1_000,
+            )?;
         }
         "mark_read" => {
             args.required_str("target")?;
@@ -1771,6 +1860,7 @@ mod tests {
                 "delete_message",
                 "search_messages",
                 "list_members",
+                "search_users",
                 "mark_read",
                 "get_presence",
                 "set_presence",
@@ -1932,6 +2022,28 @@ mod tests {
         assert!(validate_tool_args("update_chat", &json!({
             "target": "chat:c", "topic": "New topic", "members": []
         })).is_err());
+        validate_tool_args(
+            "search_users",
+            &json!({"query": "Alice", "limit": 5}),
+        )
+        .unwrap();
+        assert!(validate_tool_args("search_users", &json!({})).is_err());
+        assert!(validate_tool_args("search_users", &json!({"query": ""})).is_err());
+        assert!(validate_tool_args(
+            "search_users",
+            &json!({"query": "Alice", "extra": true}),
+        )
+        .is_err());
+        validate_tool_args(
+            "send_message",
+            &json!({"target": "chat:c", "markdown": "hi", "compact": false}),
+        )
+        .unwrap();
+        assert!(validate_tool_args(
+            "send_message",
+            &json!({"target": "chat:c", "markdown": "hi", "compact": "false"}),
+        )
+        .is_err());
     }
 
     #[tokio::test]

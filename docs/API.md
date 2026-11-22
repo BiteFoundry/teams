@@ -187,7 +187,7 @@ Body:
 ```bash
 curl -X POST http://127.0.0.1:8788/conversations/Engineering%2FGeneral/messages \
   -H "Content-Type: application/json" \
-  -d '{"markdown":"Deploy **v1.2.0** complete!","subject":"Release","mentions":["u1:Alice"],"important":true}'
+  -d '{"markdown":"@Alice Deploy **v1.2.0** complete!","subject":"Release","mentions":["u1:Alice"],"important":true}'
 ```
 
 ### `GET /conversations/{key}/threads/{root_id}?limit=50&offline=false`

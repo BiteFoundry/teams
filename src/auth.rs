@@ -1535,6 +1535,19 @@ pub fn explain_graph_permission_error(err_msg: &str, access_token: Option<&str>)
     if !looks_forbidden {
         return None;
     }
+    let write_method = err_msg
+        .find(crate::graph::GRAPH_API_ERROR_PREFIX)
+        .and_then(|pos| {
+            err_msg[pos + crate::graph::GRAPH_API_ERROR_PREFIX.len()..]
+                .split_whitespace()
+                .next()
+        })
+        .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_uppercase()) && *m != "GET");
+    if write_method.is_some() {
+        return Some(format!(
+            "{INSUFFICIENT_PERMISSIONS_PREFIX} Graph denied this write. Sending needs `ChatMessage.Send` or `Chat.ReadWrite` (chats) / `ChannelMessage.Send` (channels); editing channel messages needs `ChannelMessage.ReadWrite`; or Teams policy restricts this conversation."
+        ));
+    }
     if let Some(tok) = access_token {
         let diag = diagnose_access_token_scopes(tok);
         if let Some(first) = diag.warnings.first() {
@@ -2863,6 +2876,20 @@ mod tests {
         .expect("403 with full token falls back to generic explanation");
         assert!(explained_full.contains("403"));
         assert!(!explained_full.contains("Chat.ReadBasic"));
+
+        let read_only_jwt = make_test_jwt_with_encoder(
+            &serde_json::json!({
+                "scp": "User.Read Chat.Read ChannelMessage.Read.All"
+            }),
+            false,
+        );
+        let explained_patch = explain_graph_permission_error(
+            "Graph API error (PATCH https://graph.microsoft.com/v1.0/teams/t1/channels/c1/messages/m1): 403 Forbidden",
+            Some(&read_only_jwt),
+        )
+        .expect("write 403 must be explained");
+        assert!(explained_patch.contains("denied this write"), "{explained_patch}");
+        assert!(!explained_patch.contains("read scopes"), "{explained_patch}");
 
         assert_eq!(
             explain_graph_permission_error(

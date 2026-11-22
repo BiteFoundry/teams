@@ -83,9 +83,22 @@ args = ["mcp"]
 - **Notifications**: requests without `id` or methods starting with `notifications/` (such as `notifications/initialized`) emit no response.
 - **`ping`**: returns `{}`.
 - **Error codes**: `-32700` parse error, `-32600` invalid JSON-RPC envelope (or oversized line > `8 MiB`), `-32601` method not found.
-- **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with an error message (including JWT `scp`/`roles` permission diagnostics on `403`) on validation/Graph failures.
+- **`tools/call`**: returns `{ "content": [{ "type": "text", "text": "<pretty JSON>" }], "isError": false }` on success, or `"isError": true` with `content[0].text` set to a compact JSON error object `{"ok":false,"error":{"code":"...","message":"...","http_status"?:N}}` on validation/Graph failures (including JWT `scp`/`roles` permission diagnostics on read `403`, or write-scope guidance on write `403`).
 
-## Microsoft Teams Tools (18)
+`error.code` uses the same classification as CLI `--json` runtime errors:
+
+| `code` | Meaning | Extra fields |
+| --- | --- | --- |
+| `target_ambiguous` | Target matched multiple chats/channels (CLI `--json` includes `candidates`) | `candidates` (CLI) |
+| `target_not_found` | Target conversation/channel was not found | |
+| `not_signed_in` | No active sign-in token | |
+| `token_expired` | Token expired | `details` (CLI `whoami`) |
+| `permission_denied` | Graph `403` / insufficient permissions | `http_status: 403` |
+| `unauthorized` | Graph `401` | `http_status: 401` |
+| `not_found` | Graph `404` | `http_status: 404` |
+| `error` | Validation, missing confirmation, or other errors | `http_status` (when from Graph) |
+
+## Microsoft Teams Tools (19)
 
 `target` arguments accept a canonical `conv_key` (`chat:...` or `chan:<team_id>:<channel_id>`), raw `chat_id`, `"Team/Channel"`, or a unique case-insensitive conversation title substring.
 
@@ -97,22 +110,23 @@ args = ["mcp"]
 | `list_teams_channels` | `refresh?` (bool), `limit?` (1..1000, default `50`), `cursor?` (conflicts with `refresh: true`) | `{ "teams": [...], "returned": int, "has_more": bool, "next_cursor": string \| null, "total": int, "channel_errors"?: [...] }` |
 | `get_messages` | `target`, `limit?` (1..1000), `before?` (ISO-8601 timestamp, `YYYY-MM-DD`, or `msg_id`), `offline?`, `compact?` (default `true`) | `{ "conversation": {...}, "messages": [...], "has_more": bool, "next_before": string \| null, "omitted"?: {...}, "hint"?: string }` |
 | `get_thread` | `target`, `root_msg_id`, `limit?` (1..1000 replies), `offline?`, `compact?` (default `true`) | `{ "conversation": {...}, "thread": { "root": {...}, "replies": [...], "returned": int, "has_more": bool }, "omitted"?: {...}, "hint"?: string }` |
-| `send_message` | `target`, `markdown`, `subject?`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "message": {...} }` |
-| `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?` | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` |
-| `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?` | `{ "ok": true, "conversation": {...}, "path": "...", "message": {...} }` |
+| `send_message` | `target`, `markdown`, `subject?`, `mentions?`, `important?`, `compact?` (default `true`) | `{ "ok": true, "conversation": {...}, "message": {...} }` (compact ack by default; set `compact: false` for full objects) |
+| `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?`, `compact?` (default `true`) | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` (compact ack by default; set `compact: false` for full objects) |
+| `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?`, `compact?` (default `true`) | `{ "ok": true, "conversation": {...}, "path": "...", "inline": bool, "message": {...} }` (compact ack by default; set `compact: false` for full objects) |
 | `download_attachment` | `target`, `msg_id`, `index?`, `out_dir?`, `thread_root_id?` | `{ "ok": true, "path": "...", "file_name": "...", "bytes_written": ... }` |
 | `react_message` | `target`, `msg_id`, `reaction`, `enable?` (default `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "...", "reaction": "...", "enable": ... }` |
 | `edit_message` | `target`, `msg_id`, and one mode. Body modes use `markdown` or both `find` and `replace`, with optional `thread_root_id`. The title mode uses `subject`. | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `delete_message` | `target`, `msg_id`, `confirm` (must be literal `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `search_messages` | `query`, `target?`, `limit?` (1..1000) | `{ "query": "...", "hits": [...] }` |
 | `list_members` | `target`, `limit?` (1..1000, default `50`), `cursor?`, `offline?` (default `false`) | `{ "conv_key": "...", "title": "...", "members": [...], "returned": int, "has_more": bool \| null, "next_cursor": string \| null, "total": int \| null, "fetched_at": string \| null }` |
+| `search_users` | `query` (name or email prefix), `limit?` (1..1000, default `10`) | `{ "users": [{ "user_id", "display_name", "email", "user_principal_name" }], "returned": int }` |
 | `mark_read` | `target` | `{ "ok": true, "conv_key": "...", "scope": "server_and_local_cache" }` for chats, `"scope": "local_cache"` for channels |
 | `get_presence` | `user_ids?` (`string[]`) | `{ "presence": {...} }` or `{ "presences": [...] }` |
 | `set_presence` | `availability` (`Available\|Busy\|DoNotDisturb\|BeRightBack\|Away\|Reset`), `activity?`, `expiration_mins?` (1..1440) | `{ "ok": true, "availability": "...", "activity": "...", "expiration_mins": ... }` |
 
 ### Mentions and importance in `send_message` and `reply_message`
 
-`mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects. Set `important: true` to mark the message with high importance.
+`mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects. Each mentioned user's `@DisplayName` must appear in `markdown` or the call fails before sending. Duplicate display names are assigned in `mentions` order. Set `important: true` to mark the message with high importance.
 
 ### Compact and offline reads
 
@@ -125,6 +139,7 @@ args = ["mcp"]
 | `message_type` | Not `"message"` | `"message"` |
 | `importance` | Not `"normal"` (case-insensitive) | `"normal"` |
 | `reply_count` | `> 0` (always present on `get_thread` root as number or `null`) | `0` |
+| `links` | `body_html` has `<a href>` links whose URL is not verbatim in `body_plain` (`[{ "text", "url" }]`) | No hidden link URLs |
 
 Compact responses include top-level `omitted` (`{ "mentions": N, "reactions": N, "fields": [...] }`) and `hint` (telling how to request `"compact": false`). Individual messages include `"omitted": { "mentions": N, "reactions": N }` only when `mentions + reactions > 0`. Full responses omit `omitted` and `hint`.
 
@@ -156,7 +171,7 @@ Channel edits require delegated `ChannelMessage.ReadWrite` or legacy `Group.Read
 {"jsonrpc":"2.0","id":2,"method":"tools/list"}
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_chats","arguments":{"refresh":true,"limit":100}}}
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_messages","arguments":{"target":"Engineering/General","before":"2026-11-01","limit":50}}}
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Engineering/General","markdown":"Build **passed**!","subject":"CI","mentions":["u1:Alice"]}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Engineering/General","markdown":"@Alice Build **passed**!","subject":"CI","mentions":["u1:Alice"]}}}
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"target":"Engineering/General","msg_id":"1700000000000","confirm":true}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_thread","arguments":{"target":"Engineering/General","root_msg_id":"1700000000001","limit":2,"offline":true}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","find":"STATE: STAGED","replace":"STATE: READY"}}}

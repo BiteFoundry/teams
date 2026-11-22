@@ -692,24 +692,24 @@ impl GraphClient {
                         urlencoding::encode(chat_id),
                         urlencoding::encode(root_or_target_msg_id)
                     );
-                    if let Ok(orig) = self.get_json::<GraphChatMessage>(&msg_path).await {
-                        let norm = normalize_chat_message(
-                            &target.conv_key(),
-                            None,
-                            my_id.as_deref(),
-                            orig,
-                        );
-                        QuotedReply {
-                            msg_id: root_or_target_msg_id.to_string(),
-                            author_name: norm.author_name,
-                            preview_plain: norm.body_plain,
-                        }
-                    } else {
-                        QuotedReply {
-                            msg_id: root_or_target_msg_id.to_string(),
-                            author_name: String::new(),
-                            preview_plain: String::new(),
-                        }
+                    let orig: GraphChatMessage = self
+                        .get_json(&msg_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Cannot reply: message {root_or_target_msg_id} was not found in this chat"
+                            )
+                        })?;
+                    let norm = normalize_chat_message(
+                        &target.conv_key(),
+                        None,
+                        my_id.as_deref(),
+                        orig,
+                    );
+                    QuotedReply {
+                        msg_id: root_or_target_msg_id.to_string(),
+                        author_name: norm.author_name,
+                        preview_plain: norm.body_plain,
                     }
                 };
                 let quote_html = build_quote_blockquote_html(&quote);

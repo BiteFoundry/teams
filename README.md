@@ -95,8 +95,9 @@ teams edit "Acme Engineering/platform-release" 1700000000000 --find "STATE: STAG
 teams edit "Acme Engineering/platform-release" 1700000000000 --subject "Canary rollout"
 teams update-chat "Release handoff" --topic "Canary war room"
 
-# Paginate members, channels, and teams (JSON defaults to 50 per page)
+# Paginate members, channels, and teams (JSON defaults to 50 per page) and search directory users
 teams members "Acme Engineering/platform-release" --limit 50 --json
+teams users "Alice" --limit 10 --json
 teams channels "Acme Engineering" --limit 50 --cursor 50-1795260879123 --json
 teams teams --limit 50 --cursor 50-1795260879123 --json
 
@@ -111,9 +112,15 @@ teams daemon start
 
 `teams edit --subject` changes the plain-text title of a channel root post you sent. Use the subject option by itself for a PATCH containing only `subject`. `teams update-chat --topic` changes an existing group chat's title using delegated `Chat.ReadWrite`. Topics allow up to 250 characters and exclude colons. [Microsoft Graph chat update](https://learn.microsoft.com/en-us/graph/api/chat-patch?view=graph-rest-1.0)
 
-`read --json`, `read --thread --json`, and `thread --json` return compact objects by default with top-level `omitted` (omitted mention/reaction counts and field names) and a `hint` command; pass `--json --full` for complete conversation and message objects (`--compact` remains a compatibility alias). In a thread, `--limit` caps the replies while including the root separately, and responses report `thread.returned`, `thread.has_more`, and `thread.root.reply_count` (the total reply count when known, or `null` when truncated). Use `--offline` after an online thread read that covered the requested replies.
+`read --json`, `read --thread --json`, and `thread --json` return compact objects by default with top-level `omitted` (omitted mention/reaction counts and field names) and a `hint` command; compact messages also include `links` (`[{ "text", "url" }]`) when `<a href>` links in `body_html` do not appear verbatim in `body_plain`. Pass `--json --full` for complete conversation and message objects (`--compact` remains a compatibility alias). In a thread, `--limit` caps the replies while including the root separately, and responses report `thread.returned`, `thread.has_more`, and `thread.root.reply_count` (the total reply count when known, or `null` when truncated). Use `--offline` after an online thread read that covered the requested replies.
 
-For `members`, `channels`, and `teams`, passing `--cursor` reads the next page directly from the local SQLite cache without calling Microsoft Graph. A verified empty member list (`0` members from a completed fetch) returns `members: []` even with `--offline`, whereas an unfetched conversation fails with an error until fetched online.
+`send --json`, `reply --json`, and `send-file --json` also return compact acknowledgements by default (`ok`, `conversation.{conv_key,title,team_name?}`, `message.{msg_id,created_at,mentions?,attachments?}`, plus `reply_to` or `path`/`inline`); pass `--json --full` for complete conversation and message objects.
+
+Markdown sent via `send` / `reply` converts `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`, `[label](url)`, `> quote`, fenced code blocks, single-level `- ` bullet lists, and `@mentions`. Headings (`#`), tables (`|...|`), `_italic_`, nested lists, and numbered lists are sent verbatim.
+
+When any `--json` command fails at runtime (exit `1`), stdout emits a single JSON line `{"ok":false,"error":{"code":"...","message":"..."}}` alongside the existing stderr `Error: ...` message (`error.code` is one of `target_ambiguous` with `candidates`, `target_not_found`, `not_signed_in`, `token_expired` with `details` on `whoami`, `permission_denied` with `http_status: 403`, `unauthorized` with `http_status: 401`, `not_found` with `http_status: 404`, or `error`). Usage/flag errors from argument parsing exit with code `2` and print usage text on stderr without stdout JSON.
+
+For `members`, `channels`, and `teams`, passing `--cursor` reads the next page directly from the local SQLite cache without calling Microsoft Graph. A verified empty member list (`0` members from a completed fetch) returns `members: []` even with `--offline`, whereas an unfetched conversation fails with an error until fetched online. `teams users <QUERY>` searches directory users by display name or email prefix (`startswith`).
 
 ### Local HTTP REST API (`teams serve`)
 
@@ -131,7 +138,7 @@ Full endpoint & schema docs: **[docs/API.md](docs/API.md)** · **[docs/openapi.y
 
 ### MCP Server (`teams mcp`)
 
-Exposes **18 Microsoft Teams tools** (`list_chats`, `create_chat`, `update_chat`, `list_teams_channels`, `get_messages`, `get_thread`, `send_message`, `reply_message`, `send_file`, `download_attachment`, `react_message`, `edit_message`, `delete_message`, `search_messages`, `list_members`, `mark_read`, `get_presence`, `set_presence`) over newline-delimited stdio JSON-RPC 2.0:
+Exposes **19 Microsoft Teams tools** (`list_chats`, `create_chat`, `update_chat`, `list_teams_channels`, `get_messages`, `get_thread`, `send_message`, `reply_message`, `send_file`, `download_attachment`, `react_message`, `edit_message`, `delete_message`, `search_messages`, `list_members`, `search_users`, `mark_read`, `get_presence`, `set_presence`) over newline-delimited stdio JSON-RPC 2.0:
 
 ```bash
 # Claude Code

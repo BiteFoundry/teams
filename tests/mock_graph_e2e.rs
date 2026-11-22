@@ -1306,6 +1306,21 @@ async fn e2e_mock_graph_auth_chats_channels_files_and_agent_surfaces() {
             .await
             .expect("mcp delete_message rejection");
     assert_eq!(del_err_resp["result"]["isError"], Value::Bool(true));
+    let del_err_json: Value = serde_json::from_str(
+        del_err_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text"),
+    )
+    .expect("MCP error text must parse as JSON");
+    assert_eq!(del_err_json["ok"], false);
+    assert_eq!(del_err_json["error"]["code"], "error");
+    assert!(
+        del_err_json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("confirm"),
+        "{del_err_json}"
+    );
 
     let delete_false_confirm = json!({
         "jsonrpc": "2.0",
@@ -4638,6 +4653,15 @@ async fn regression_teams_bug_01_single_quote_reply_blockquote() {
         .route(
             "/v1.0/chats/{chat_id}/messages/{msg_id}",
             get(|Path((_chat_id, msg_id)): Path<(String, String)>| async move {
+                if msg_id == "nonexistent-msg-999" {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({
+                            "error": { "code": "NotFound", "message": "Message not found" }
+                        })),
+                    )
+                        .into_response();
+                }
                 Json(json!({
                     "id": msg_id,
                     "messageType": "message",
@@ -4648,6 +4672,7 @@ async fn regression_teams_bug_01_single_quote_reply_blockquote() {
                     "attachments": [],
                     "reactions": []
                 }))
+                .into_response()
             }),
         )
         .route(
@@ -4874,6 +4899,34 @@ async fn regression_teams_bug_01_single_quote_reply_blockquote() {
     assert_eq!(chan_posts[0].0, "root-1");
     assert_eq!(chan_posts[0].1, "<p>Channel reply text</p>");
 
+    // W2: Replying to a nonexistent chat message ID fails without posting an empty quote reply
+    let posts_before = state.posted_chat_bodies.read().unwrap().len();
+    let missing_rep = run_cli(
+        &tmp_uncached,
+        &["reply", "QuoteChat", "nonexistent-msg-999", "Should not post", "--json"],
+    )
+    .await;
+    assert!(
+        !missing_rep.status.success(),
+        "reply to missing chat message must fail; stdout={}",
+        String::from_utf8_lossy(&missing_rep.stdout)
+    );
+    assert_eq!(
+        state.posted_chat_bodies.read().unwrap().len(),
+        posts_before,
+        "missing chat reply target must not POST"
+    );
+    let missing_stderr = String::from_utf8_lossy(&missing_rep.stderr);
+    assert!(
+        missing_stderr.contains("Cannot reply: message nonexistent-msg-999 was not found in this chat"),
+        "unexpected stderr: {missing_stderr}"
+    );
+    let missing_json: Value =
+        serde_json::from_slice(&missing_rep.stdout).expect("missing reply --json error stdout");
+    assert_eq!(missing_json["ok"], false);
+    assert_eq!(missing_json["error"]["code"], "not_found");
+    assert_eq!(missing_json["error"]["http_status"], 404);
+
     server.abort();
 }
 
@@ -5083,20 +5136,70 @@ async fn regression_teams_bug_10_markdown_links_and_mentions() {
     assert_eq!(p5["body"]["content"], "<p>ping <at id=\"0\">Alice</at></p>");
     assert_eq!(p5["mentions"][0]["mentioned"]["user"]["id"], "u4");
 
-    // 6. Unused mention produces 0 mention metadata entries
-    let p6 = run_send(&["no at here", "--mention", "u5:Bob"]).await;
-    assert_eq!(p6["body"]["content"], "<p>no at here</p>");
-    assert!(
-        p6.get("mentions").is_none()
-            || p6["mentions"].as_array().is_some_and(|a| a.is_empty()),
-        "unused mention must emit 0 metadata entries: {p6}"
+    // 6. Unused mention fails before POST and leaves posted count unchanged (W3)
+    let run_send_raw = |args: &[&str]| {
+        let mut full = vec!["send".to_string(), "MdChat".to_string()];
+        full.extend(args.iter().map(|s| (*s).to_string()));
+        full.push("--json".to_string());
+        let graph_base = graph_base.clone();
+        let auth_base = auth_base.clone();
+        let jwt = jwt.clone();
+        let cfg_dir = cfg_dir.clone();
+        let data_dir = data_dir.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+                .args(&full)
+                .env("TEAMS_GRAPH_BASE_URL", &graph_base)
+                .env("TEAMS_AUTH_BASE_URL", &auth_base)
+                .env("TEAMS_ACCESS_TOKEN", &jwt)
+                .env("TEAMS_DISABLE_KEYRING", "1")
+                .env("TEAMS_CONFIG_DIR", &cfg_dir)
+                .env("TEAMS_DATA_DIR", &data_dir)
+                .env("TEAMS_AUTO_DAEMON", "0")
+                .env_remove("TEAMS_TOKEN_FILE")
+                .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+                .output()
+                .await
+                .expect("run teams send")
+        }
+    };
+    let posted_before = state.posted.read().unwrap().len();
+    let unused_out = run_send_raw(&["no at here", "--mention", "u5:Bob"]).await;
+    assert!(!unused_out.status.success(), "unused mention must fail");
+    assert_eq!(
+        state.posted.read().unwrap().len(),
+        posted_before,
+        "unused mention must perform 0 POSTs"
     );
+    let unused_stderr = String::from_utf8_lossy(&unused_out.stderr);
+    assert!(
+        unused_stderr.contains("Mention not found in message body: @Bob (u5)"),
+        "unexpected stderr: {unused_stderr}"
+    );
+    let unused_json: Value =
+        serde_json::from_slice(&unused_out.stdout).expect("unused mention --json error");
+    assert_eq!(unused_json["ok"], false);
+    assert_eq!(unused_json["error"]["code"], "error");
 
-    // 7. Regression controls: plain link, space-separated Korean mention, HTML escaping, partial unused
-    let p7 = run_send(&[
+    // Partial unused mention also fails before POST
+    let partial_unused = run_send_raw(&[
         "Check [docs](https://example.com) & <tag> @김철수 님",
         "--mention",
         "u-unused:Nobody",
+        "--mention",
+        "u3:김철수",
+    ])
+    .await;
+    assert!(!partial_unused.status.success());
+    assert_eq!(state.posted.read().unwrap().len(), posted_before);
+    assert!(
+        String::from_utf8_lossy(&partial_unused.stderr)
+            .contains("Mention not found in message body: @Nobody (u-unused)")
+    );
+
+    // 7. Regression controls: plain link, space-separated Korean mention, HTML escaping
+    let p7 = run_send(&[
+        "Check [docs](https://example.com) & <tag> @김철수 님",
         "--mention",
         "u3:김철수",
     ])
@@ -5529,9 +5632,14 @@ async fn regression_teams_bug_13_download_by_single_message_get() {
         "--json",
     ])
     .await;
-    assert!(!out_404.status.success());
+    assert_eq!(out_404.status.code(), Some(1));
     let err_404 = String::from_utf8_lossy(&out_404.stderr);
     assert!(err_404.contains("404"), "expected 404 error, got: {err_404}");
+    let out_404_json: Value = serde_json::from_slice(&out_404.stdout)
+        .expect("--json 404 error must emit JSON on stdout");
+    assert_eq!(out_404_json["ok"], false);
+    assert_eq!(out_404_json["error"]["code"], "not_found");
+    assert_eq!(out_404_json["error"]["http_status"], 404);
     assert_eq!(std::fs::read_dir(&dl_dir_404).unwrap().count(), 0, "no file should be created on 404");
 
     // 4. Regression control: channel reply attachment uses ONLY /messages/{root}/replies/{id}
@@ -6523,10 +6631,19 @@ async fn regression_teams_bug_17_batch_channel_failure_keeps_cache() {
     assert_eq!(tb3["channels"][0]["id"], "chan-secret");
     assert!(j3.get("channel_errors").is_none(), "cached response must omit channel_errors: {j3}");
 
-    // 4. channels Restricted --json fails with exit 1 and empty stdout
+    // 4. channels Restricted --json fails with exit 1 and structured JSON error on stdout
     let out4 = run_cli(&tmp, &["channels", "Restricted", "--json"]).await;
     assert_eq!(out4.status.code(), Some(1));
-    assert!(out4.stdout.is_empty());
+    let j4: Value = serde_json::from_slice(&out4.stdout)
+        .expect("failed --json command must emit structured error JSON on stdout");
+    assert_eq!(j4["ok"], false);
+    assert!(
+        j4["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains(r#"Could not list channels for team "Restricted" (team-b)"#),
+        "{j4}"
+    );
     let stderr4 = String::from_utf8_lossy(&out4.stderr);
     assert!(
         stderr4.contains(r#"Could not list channels for team "Restricted" (team-b)"#),
@@ -6799,7 +6916,17 @@ async fn regression_teams_bug_18_thread_window_reply_count() {
     )
     .await;
     assert_eq!(off3.status.code(), Some(1));
-    assert!(off3.stdout.is_empty());
+    let j_off3: Value = serde_json::from_slice(&off3.stdout)
+        .expect("failed --json command must emit structured error JSON on stdout");
+    assert_eq!(j_off3["ok"], false);
+    assert_eq!(j_off3["error"]["code"], "error");
+    assert!(
+        j_off3["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reply limit 3"),
+        "{j_off3}"
+    );
     assert!(String::from_utf8_lossy(&off3.stderr).contains("reply limit 3"));
 
     // MCP get_thread with limit 2
@@ -7399,6 +7526,25 @@ async fn regression_teams_bug_20_compact_default_and_full() {
                         }
                     ]
                 }))
+            })
+            .post(|Json(payload): Json<Value>| async move {
+                let html = payload
+                    .pointer("/body/content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<p></p>");
+                (
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "id": "c-msg-sent-1",
+                        "messageType": "message",
+                        "createdDateTime": "2026-11-20T08:10:00Z",
+                        "from": { "user": { "id": "me-user-1", "displayName": "Me (Tester)" } },
+                        "body": { "contentType": "html", "content": html },
+                        "attachments": [],
+                        "mentions": [],
+                        "reactions": []
+                    })),
+                )
             }),
         );
 
@@ -7530,6 +7676,66 @@ async fn regression_teams_bug_20_compact_default_and_full() {
     assert!(mp_full.get("omitted").is_none());
     assert!(mp_full.get("hint").is_none());
     assert!(mp_full["messages"][0].get("body_html").is_some());
+
+    // W6a: send --json returns compact ack by default; --json --full returns full object
+    let send_compact = run_cli(&tmp, &["send", "Release Room", "Compact ack body", "--json"]).await;
+    assert!(
+        send_compact.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&send_compact.stderr)
+    );
+    let sc_json: Value = serde_json::from_slice(&send_compact.stdout).unwrap();
+    assert_eq!(sc_json["ok"], true);
+    assert_eq!(sc_json["conversation"]["conv_key"], "chat:19:release-room@thread.v2");
+    assert_eq!(sc_json["message"]["msg_id"], "c-msg-sent-1");
+    assert!(sc_json["message"].get("body_html").is_none(), "{sc_json}");
+
+    let send_full = run_cli(
+        &tmp,
+        &["send", "Release Room", "Full ack body", "--json", "--full"],
+    )
+    .await;
+    assert!(
+        send_full.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&send_full.stderr)
+    );
+    let sf_json: Value = serde_json::from_slice(&send_full.stdout).unwrap();
+    assert_eq!(sf_json["ok"], true);
+    assert_eq!(sf_json["message"]["msg_id"], "c-msg-sent-1");
+    assert!(sf_json["message"].get("body_html").is_some(), "{sf_json}");
+
+    // MCP send_message compact default vs compact: false
+    let mcp_send_def = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Release Room","markdown":"MCP compact ack"}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_send_def["result"]["isError"], false, "{mcp_send_def}");
+    let msd_json: Value = serde_json::from_str(
+        mcp_send_def["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(msd_json["message"]["msg_id"], "c-msg-sent-1");
+    assert!(msd_json["message"].get("body_html").is_none(), "{msd_json}");
+
+    let mcp_send_full = mcp::handle_rpc_line(
+        &cfg,
+        &graph,
+        &storage,
+        &json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"send_message","arguments":{"target":"Release Room","markdown":"MCP full ack","compact":false}}}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mcp_send_full["result"]["isError"], false, "{mcp_send_full}");
+    let msf_json: Value = serde_json::from_str(
+        mcp_send_full["result"]["content"][0]["text"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert!(msf_json["message"].get("body_html").is_some(), "{msf_json}");
 
     server.abort();
 }
