@@ -213,7 +213,7 @@ fn has_candidate_hyphen_value(raw: &[std::ffi::OsString]) -> bool {
     false
 }
 
-/// Normalizes hyphen-prefixed free-text literals (such as `"- 목록 항목"` or multiline
+/// Normalizes hyphen-prefixed free-text literals (such as `"- list item"` or multiline
 /// Markdown lists) for eligible subcommand arguments while preserving known/unknown flags,
 /// missing option value errors, `--flag=value`, `--`, and `-h`/`--help`.
 /// Returns `None` without building the clap command tree when argv needs no rewriting.
