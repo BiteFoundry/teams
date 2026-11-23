@@ -64,7 +64,9 @@ pub(crate) fn upsert_conversations_with_null_topics(
                     THEN excluded.last_updated_at
                     ELSE conversations.last_updated_at
                 END,
-                pinned = excluded.pinned,
+                -- A pin is local state: Graph-derived summaries always carry pinned = 0, so an
+                -- upsert may set a pin but never clear one (set_conversation_pinned does that).
+                pinned = MAX(conversations.pinned, excluded.pinned),
                 peer_user_id = COALESCE(excluded.peer_user_id, conversations.peer_user_id),
                 web_url = COALESCE(excluded.web_url, conversations.web_url)
             ",
@@ -129,6 +131,70 @@ pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> 
         return Ok(());
     }
     let tx = conn.transaction()?;
+    upsert_teams_in_transaction(&tx, teams)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Stores a joined-teams fetch and drops what Graph no longer lists, in one transaction.
+///
+/// `teams` is the complete joined-team list; `channel_fetch_failed` names the teams whose
+/// channel list could not be fetched, so their cached channels are kept. An empty `teams` is
+/// indistinguishable from a failed fetch and changes nothing. Message rows are never removed.
+pub(crate) fn upsert_joined_teams_and_prune(
+    conn: &mut Connection,
+    teams: &[TeamSummary],
+    channel_fetch_failed: &HashSet<String>,
+) -> Result<()> {
+    if teams.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    upsert_teams_in_transaction(&tx, teams)?;
+
+    // `None` = keep every cached channel of that team (its channel fetch failed).
+    let fetched: HashMap<&str, Option<HashSet<String>>> = teams
+        .iter()
+        .map(|team| {
+            let channels = (!channel_fetch_failed.contains(&team.id))
+                .then(|| team.channels.iter().map(|ch| ch.target().conv_key()).collect());
+            (team.id.as_str(), channels)
+        })
+        .collect();
+
+    let cached_team_ids: Vec<String> = {
+        let mut stmt = tx.prepare_cached("SELECT team_id FROM teams")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for team_id in cached_team_ids.iter().filter(|id| !fetched.contains_key(id.as_str())) {
+        tx.execute("DELETE FROM teams WHERE team_id = ?1", params![team_id])?;
+    }
+
+    let cached_channels: Vec<(String, String)> = {
+        let mut stmt = tx.prepare_cached(
+            "SELECT conv_key, team_id FROM conversations
+             WHERE kind = 'channel' AND team_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (conv_key, team_id) in &cached_channels {
+        let keep = match fetched.get(team_id.as_str()) {
+            None => false,
+            Some(None) => true,
+            Some(Some(channels)) => channels.contains(conv_key),
+        };
+        if !keep {
+            tx.execute("DELETE FROM conversations WHERE conv_key = ?1", params![conv_key])?;
+        }
+    }
+
+    tx.commit()?;
+    Ok(())
+}
+
+fn upsert_teams_in_transaction(tx: &Transaction<'_>, teams: &[TeamSummary]) -> Result<()> {
     {
         let mut team_stmt = tx.prepare_cached(
             "
@@ -193,7 +259,6 @@ pub fn upsert_teams(conn: &mut Connection, teams: &[TeamSummary]) -> Result<()> 
             }
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -922,6 +987,66 @@ pub(crate) fn save_fetched_thread(
     Ok(())
 }
 
+/// Extends a complete reply window with the replies sync cached for the same root afterwards.
+///
+/// The window is a full snapshot, so it stays authoritative for everything up to its newest
+/// reply: a cached row that sorts before it and is not in the window did not exist on the
+/// server at snapshot time and stays out. Only replies created after the newest window reply
+/// are appended. An empty window has no such anchor and is returned as it is. Returns the ids
+/// (oldest first) and how many of them are not deleted, or `None` when a window id has no
+/// cached row (the cache cannot answer; the caller reads online).
+fn merge_thread_window_with_cache(
+    conn: &Connection,
+    conv_key: &str,
+    root_msg_id: &str,
+    window_ids: &[String],
+) -> Result<Option<(Vec<String>, usize)>> {
+    let mut live = 0usize;
+    let mut anchor: Option<(String, String)> = None;
+    {
+        let mut by_id_stmt = conn.prepare_cached(
+            "SELECT created_at_sort, deleted FROM messages WHERE conv_key = ?1 AND msg_id = ?2",
+        )?;
+        for id in window_ids {
+            let row: Option<(String, bool)> = by_id_stmt
+                .query_row(params![conv_key, id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            let Some((sort, deleted)) = row else {
+                return Ok(None);
+            };
+            live += usize::from(!deleted);
+            let key = (sort, id.clone());
+            if anchor.as_ref().is_none_or(|newest| key > *newest) {
+                anchor = Some(key);
+            }
+        }
+    }
+    let mut merged = window_ids.to_vec();
+    let Some(anchor) = anchor else {
+        return Ok(Some((merged, live)));
+    };
+
+    let mut newer: Vec<(String, String, bool)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT created_at_sort, msg_id, deleted FROM messages
+             WHERE conv_key = ?1 AND parent_msg_id = ?2
+               AND (created_at_sort > ?3 OR (created_at_sort = ?3 AND msg_id > ?4))",
+        )?;
+        let mapped = stmt.query_map(params![conv_key, root_msg_id, anchor.0, anchor.1], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    newer.sort();
+    for (_, id, deleted) in newer {
+        if !window_ids.contains(&id) {
+            live += usize::from(!deleted);
+            merged.push(id);
+        }
+    }
+    Ok(Some((merged, live)))
+}
+
 pub(crate) fn get_fetched_thread(
     conn: &Connection,
     conv_key: &str,
@@ -940,7 +1065,7 @@ pub(crate) fn get_fetched_thread(
     let Some((reply_ids_json, complete)) = window else {
         return Ok(None);
     };
-    let ids: Vec<String> = serde_json::from_str(&reply_ids_json)?;
+    let mut ids: Vec<String> = serde_json::from_str(&reply_ids_json)?;
     if !complete && ids.len() < limit {
         return Ok(None);
     }
@@ -948,7 +1073,14 @@ pub(crate) fn get_fetched_thread(
         return Ok(None);
     };
     if complete {
-        root.reply_count = ids.len();
+        // The window is a snapshot from the last online read. Sync keeps writing replies and
+        // tombstones for the same root afterwards, so reconcile with the rows cached now.
+        let Some((merged, live)) = merge_thread_window_with_cache(&tx, conv_key, root_msg_id, &ids)?
+        else {
+            return Ok(None);
+        };
+        ids = merged;
+        root.reply_count = live;
     }
     let requested_ids = &ids[ids.len().saturating_sub(limit)..];
     let replies = get_messages_by_ids(&tx, conv_key, requested_ids)?;

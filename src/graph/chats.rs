@@ -8,7 +8,8 @@ use serde::Deserialize;
 use super::{
     client::{
         compare_rfc3339_gt, is_pure_system_noise, normalize_chat_message,
-        sort_messages_chronologically, truncate_to_newest, BatchSubRequest, GraphChatMessage,
+        sort_messages_chronologically, truncate_to_newest, BatchSubRequest, BatchSubResponse,
+        GraphChatMessage,
         GraphIdentitySet, GraphItemBody, GraphListPage,
     },
     GraphClient,
@@ -288,6 +289,9 @@ impl GraphClient {
             if remaining == 0 {
                 break;
             }
+            // Later pages inherit the first page's `$top` through the nextLink, so a page can
+            // hold more rows than `remaining`. Remember the link that fetched it.
+            let page_link_used = next_link.clone();
             let page = self
                 .list_chats_page_detailed(remaining.min(50), next_link.as_deref())
                 .await?;
@@ -302,6 +306,14 @@ impl GraphClient {
                     }
                     out.push(chat);
                 }
+            }
+            if truncated_page {
+                // Rows of this page were left out: hand back the link to this same page, not
+                // to the next one, so a caller following the cursor re-reads it instead of
+                // skipping the rest (already-seen rows de-duplicate by `conv_key`). `None`
+                // here (the first page over-returned) means "start over", never EOF.
+                next_link = page_link_used;
+                break;
             }
             next_link = page.next_link;
             if out.len() >= limit || next_link.is_none() {
@@ -505,11 +517,14 @@ impl GraphClient {
     }
 
     /// Fetches multiple chat message lists in a single `POST /$batch` call (chunked by 20).
+    ///
+    /// The messages are `None` for a chat whose sub-response is missing, not 2xx (throttled,
+    /// forbidden, ...) or unparseable, so the caller can tell "no messages" from "not fetched".
     pub async fn batch_fetch_chat_messages(
         &self,
         chat_ids: &[String],
         limit_per_chat: usize,
-    ) -> Result<Vec<(String, Vec<MessageItem>)>> {
+    ) -> Result<Vec<(String, Option<Vec<MessageItem>>)>> {
         if chat_ids.is_empty() || limit_per_chat == 0 {
             return Ok(Vec::new());
         }
@@ -529,45 +544,53 @@ impl GraphClient {
             .collect();
 
         let responses = self.batch(&requests).await?;
-        let mut by_idx: std::collections::HashMap<usize, Vec<MessageItem>> =
-            std::collections::HashMap::new();
-
-        for resp in responses {
-            let Ok(idx) = resp.id.parse::<usize>() else {
-                continue;
-            };
-            let Some(chat_id) = chat_ids.get(idx) else {
-                continue;
-            };
-            if !(200..300).contains(&resp.status) {
-                continue;
-            }
-            let Ok(page) = serde_json::from_value::<GraphListPage<GraphChatMessage>>(resp.body)
-            else {
-                continue;
-            };
-            let conv_key = ConversationTarget::Chat {
-                chat_id: chat_id.clone(),
-            }
-            .conv_key();
-            let mut items: Vec<MessageItem> = page
-                .value
-                .into_iter()
-                .map(|raw| normalize_chat_message(&conv_key, None, my_id.as_deref(), raw))
-                .filter(|m| !is_pure_system_noise(m))
-                .collect();
-            sort_messages_chronologically(&mut items);
-            truncate_to_newest(&mut items, limit_per_chat);
-            by_idx.insert(idx, items);
-        }
-
-        let ordered = chat_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, cid)| (cid.clone(), by_idx.remove(&idx).unwrap_or_default()))
-            .collect();
-        Ok(ordered)
+        Ok(collect_batch_chat_messages(chat_ids, responses, my_id.as_deref(), limit_per_chat))
     }
+}
+
+/// Pairs each requested chat with its `$batch` sub-response, in request order.
+fn collect_batch_chat_messages(
+    chat_ids: &[String],
+    responses: Vec<BatchSubResponse>,
+    my_id: Option<&str>,
+    limit_per_chat: usize,
+) -> Vec<(String, Option<Vec<MessageItem>>)> {
+    let mut by_idx: std::collections::HashMap<usize, Vec<MessageItem>> =
+        std::collections::HashMap::new();
+
+    for resp in responses {
+        let Ok(idx) = resp.id.parse::<usize>() else {
+            continue;
+        };
+        let Some(chat_id) = chat_ids.get(idx) else {
+            continue;
+        };
+        if !(200..300).contains(&resp.status) {
+            continue;
+        }
+        let Ok(page) = serde_json::from_value::<GraphListPage<GraphChatMessage>>(resp.body) else {
+            continue;
+        };
+        let conv_key = ConversationTarget::Chat {
+            chat_id: chat_id.clone(),
+        }
+        .conv_key();
+        let mut items: Vec<MessageItem> = page
+            .value
+            .into_iter()
+            .map(|raw| normalize_chat_message(&conv_key, None, my_id, raw))
+            .filter(|m| !is_pure_system_noise(m))
+            .collect();
+        sort_messages_chronologically(&mut items);
+        truncate_to_newest(&mut items, limit_per_chat);
+        by_idx.insert(idx, items);
+    }
+
+    chat_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, cid)| (cid.clone(), by_idx.remove(&idx)))
+        .collect()
 }
 
 fn is_chats_orderby_unsupported(err: &anyhow::Error) -> bool {
@@ -1129,5 +1152,187 @@ mod tests {
         let all = client.list_chat_messages("c1", 10).await.unwrap();
         let all_ids: Vec<&str> = all.iter().map(|m| m.msg_id.as_str()).collect();
         assert_eq!(all_ids, vec!["m0", "m1", "m2"]);
+    }
+
+    #[test]
+    fn batch_chat_messages_report_failed_subresponses_as_none() {
+        let chat_ids = vec!["c-ok".to_string(), "c-throttled".to_string(), "c-missing".to_string(), "c-garbled".to_string()];
+        let responses: Vec<BatchSubResponse> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "1",
+                "status": 429,
+                "headers": { "Retry-After": "5" },
+                "body": { "error": { "code": "TooManyRequests", "message": "throttled" } }
+            },
+            {
+                "id": "0",
+                "status": 200,
+                "body": {
+                    "value": [{
+                        "id": "m1",
+                        "createdDateTime": "2026-11-20T09:00:00Z",
+                        "messageType": "message",
+                        "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                        "body": { "contentType": "html", "content": "<p>hi</p>" }
+                    }]
+                }
+            },
+            { "id": "3", "status": 200, "body": { "value": "not a list" } }
+        ]))
+        .unwrap();
+
+        let out = collect_batch_chat_messages(&chat_ids, responses, Some("u1"), 20);
+        let ids: Vec<&str> = out.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["c-ok", "c-throttled", "c-missing", "c-garbled"]);
+        let ok = out[0].1.as_ref().expect("2xx sub-response yields messages");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].msg_id, "m1");
+        assert_eq!(ok[0].conv_key, "chat:c-ok");
+        assert!(out[1].1.is_none(), "429 sub-response is a failure, not an empty chat");
+        assert!(out[2].1.is_none(), "a missing sub-response is a failure");
+        assert!(out[3].1.is_none(), "an unparseable body is a failure");
+
+        // A real empty chat is `Some(vec![])`.
+        let empty: Vec<BatchSubResponse> = serde_json::from_value(serde_json::json!([
+            { "id": "0", "status": 200, "body": { "value": [] } }
+        ]))
+        .unwrap();
+        let out = collect_batch_chat_messages(&chat_ids[..1], empty, Some("u1"), 20);
+        assert_eq!(out[0].1.as_deref(), Some(&[][..]));
+    }
+
+    /// Mock `/me/chats` with Graph-style paging: the nextLink carries the first page's `$top`.
+    async fn spawn_paged_chats_server(
+        total: usize,
+        ignore_top: bool,
+    ) -> (GraphClient, tokio::task::JoinHandle<()>) {
+        use axum::{extract::RawQuery, routing::get, Json, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let route_base = base.clone();
+        let app = Router::new().route(
+            "/v1.0/me/chats",
+            get(move |RawQuery(query): RawQuery| {
+                let base = route_base.clone();
+                async move {
+                    let q = query.unwrap_or_default();
+                    let param = |name: &str| {
+                        q.split('&').find_map(|kv| {
+                            let (k, v) = kv.split_once('=')?;
+                            (k == name).then(|| v.parse::<usize>().ok()).flatten()
+                        })
+                    };
+                    let top = if ignore_top { 50 } else { param("$top").unwrap_or(50) };
+                    let skip = param("$skiptoken").unwrap_or(0);
+                    let page: Vec<serde_json::Value> = (skip..total.min(skip + top))
+                        .map(|i| {
+                            serde_json::json!({
+                                "id": format!("c{i:03}"),
+                                "chatType": "group",
+                                "topic": format!("Chat {i}"),
+                                "lastUpdatedDateTime": "2026-11-21T09:00:00Z",
+                                "members": []
+                            })
+                        })
+                        .collect();
+                    let next_skip = skip + page.len();
+                    let mut body = serde_json::json!({ "value": page });
+                    if next_skip < total {
+                        body["@odata.nextLink"] = serde_json::Value::String(format!(
+                            "{base}/me/chats?$top={top}&$skiptoken={next_skip}"
+                        ));
+                    }
+                    Json(body)
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = crate::config::AppConfig {
+            graph_base_url: base,
+            ..crate::config::AppConfig::default()
+        };
+        let tokens = crate::auth::StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Me".to_string()),
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tokens);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+        (graph, server)
+    }
+
+    // TEAMS-08: with limit 70 the second page (50 rows) is cut after 20. The cursor must lead
+    // back to that page; the old cursor pointed at page 3 and rows 70..100 were never listed.
+    #[tokio::test]
+    async fn regression_teams_08_chats_cursor_no_skip() {
+        let (graph, server) = spawn_paged_chats_server(120, false).await;
+
+        let first = graph.list_chats_with_cursor(70).await.unwrap();
+        assert_eq!(first.chats.len(), 70);
+        assert!(!first.eof);
+        let mut seen: HashSet<String> = first.chats.iter().map(|c| c.conv_key.clone()).collect();
+        assert_eq!(seen.len(), 70);
+
+        // Follow the cursor the way the chat list does (`list_chats_page` until no link).
+        let mut cursor = first.next_link.clone();
+        assert!(cursor.as_deref().is_some_and(|l| l.contains("$skiptoken=50")), "{cursor:?}");
+        let mut pages = 0;
+        while let Some(link) = cursor {
+            let (chats, next) = graph.list_chats_page(50, Some(&link)).await.unwrap();
+            seen.extend(chats.into_iter().map(|c| c.conv_key));
+            cursor = next;
+            pages += 1;
+            assert!(pages <= 5, "cursor must reach the end");
+        }
+        let expected: HashSet<String> = (0..120).map(|i| format!("chat:c{i:03}")).collect();
+        assert_eq!(seen, expected, "following the cursor must not skip any chat");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chats_cursor_is_unchanged_when_no_page_is_cut() {
+        let (graph, server) = spawn_paged_chats_server(120, false).await;
+
+        // A limit that ends on a page boundary: the cursor is the next page, as before.
+        let res = graph.list_chats_with_cursor(100).await.unwrap();
+        assert_eq!(res.chats.len(), 100);
+        assert!(!res.eof);
+        assert!(
+            res.next_link.as_deref().is_some_and(|l| l.contains("$skiptoken=100")),
+            "{:?}",
+            res.next_link
+        );
+
+        // Everything fits: end of list, no cursor.
+        let all = graph.list_chats_with_cursor(500).await.unwrap();
+        assert_eq!(all.chats.len(), 120);
+        assert!(all.eof);
+        assert!(all.next_link.is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chats_cursor_restarts_when_first_page_over_returns() {
+        // A server that ignores `$top` cuts the very first page: there is no link to re-read,
+        // so the result says "not at the end, no cursor" and the caller starts over.
+        let (graph, server) = spawn_paged_chats_server(120, true).await;
+        let res = graph.list_chats_with_cursor(30).await.unwrap();
+        assert_eq!(res.chats.len(), 30);
+        assert!(res.next_link.is_none());
+        assert!(!res.eof, "a cut first page is not the end of the list");
+        server.abort();
     }
 }

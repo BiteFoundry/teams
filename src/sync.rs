@@ -139,6 +139,8 @@ impl SyncSharedState {
 pub(crate) enum SyncErrorKind {
     Forbidden403,
     Unauthorized401,
+    /// The response status was 404: the target (a deleted channel, a left team) is gone.
+    NotFound404,
     Transient,
 }
 
@@ -160,6 +162,7 @@ pub(crate) fn classify_sync_error(err: &anyhow::Error) -> SyncErrorKind {
     match crate::graph::extract_graph_http_status(&full) {
         Some(403) => return SyncErrorKind::Forbidden403,
         Some(401) => return SyncErrorKind::Unauthorized401,
+        Some(404) => return SyncErrorKind::NotFound404,
         _ => {}
     }
     let lower = full.to_ascii_lowercase();
@@ -477,7 +480,7 @@ fn handle_lane1_error(
         SyncErrorKind::Unauthorized401 => {
             shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
         }
-        SyncErrorKind::Transient => {
+        SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
             if err_backoff.record_transient_failure(Instant::now()) {
                 let _ = event_tx.send(CoreEvent::SyncStateChanged {
                     busy: false,
@@ -1048,7 +1051,7 @@ pub fn spawn_sync_engine(
                                         // Quietly back off on forbidden /me/chats without toast spam.
                                         chat_err_backoff.record_transient_failure(now);
                                     }
-                                    SyncErrorKind::Transient => {
+                                    SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
                                         let was_degraded = chat_err_backoff.is_degraded()
                                             || channel_err_backoff.is_degraded()
                                             || presence_err_backoff.is_degraded();
@@ -1122,7 +1125,7 @@ pub fn spawn_sync_engine(
                                         );
                                     }
                                     SyncErrorKind::Forbidden403 => {}
-                                    SyncErrorKind::Transient => {
+                                    SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
                                         let was_degraded = chat_err_backoff.is_degraded()
                                             || channel_err_backoff.is_degraded()
                                             || presence_err_backoff.is_degraded();
@@ -1181,7 +1184,7 @@ pub fn spawn_sync_engine(
                                                 Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS),
                                             );
                                         }
-                                        SyncErrorKind::Transient => {
+                                        SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
                                             let was_degraded = chat_err_backoff.is_degraded()
                                                 || channel_err_backoff.is_degraded()
                                                 || presence_err_backoff.is_degraded();
@@ -1712,6 +1715,8 @@ async fn poll_chats_tier2_with_rolling_cache(
     }
 
     let mut any_preview_updated = false;
+    // Chats whose `$batch` sub-response was throttled, failed or unreadable this tick.
+    let mut failed_keys: HashSet<String> = HashSet::new();
     if !fetch_ids.is_empty() {
         let fetched = graph.batch_fetch_chat_messages(&fetch_ids, 20).await?;
         for (chat_id, messages) in fetched {
@@ -1719,6 +1724,10 @@ async fn poll_chats_tier2_with_rolling_cache(
                 chat_id: chat_id.clone(),
             }
             .conv_key();
+            let Some(messages) = messages else {
+                failed_keys.insert(conv_key);
+                continue;
+            };
             let conv_title = chat_by_id
                 .get(&chat_id)
                 .map(|c| c.title.clone())
@@ -1751,8 +1760,24 @@ async fn poll_chats_tier2_with_rolling_cache(
     }
 
     for chat in &changed_chats {
-        // Keep deferred dirty chats marked stale in `chat_cache` so the next tick fetches them.
+        // Keep deferred dirty chats marked stale in `chat_cache` so the next tick fetches them;
+        // the same goes for a chat whose messages could not be fetched this tick.
         if deferred_dirty_keys.contains(&chat.conv_key) {
+            continue;
+        }
+        if failed_keys.contains(&chat.conv_key) {
+            // A chat seen for the first time has no entry yet. Leave a blank one, so the
+            // start-of-rotation seeding from SQLite (which already holds the new summary)
+            // cannot record it as clean before its messages were fetched.
+            chat_cache
+                .entry(chat.conv_key.clone())
+                .or_insert_with(|| ChatPollCacheEntry {
+                    last_msg_id: None,
+                    last_updated_at: None,
+                    last_msg_preview: None,
+                    title: chat.title.clone(),
+                    unread_count: chat.unread_count,
+                });
             continue;
         }
         chat_cache.insert(
@@ -2028,7 +2053,10 @@ async fn poll_channels_tier3_rotating(
                 any_summary_changed |= outcome.any_summary_changed;
             }
             Err(err) => match classify_sync_error(&err) {
-                SyncErrorKind::Forbidden403 => {
+                // A channel we may not read, or one that no longer exists (deleted, or its
+                // team was left): drop it from the rotation until the next full teams refresh
+                // and keep polling the rest of the batch.
+                SyncErrorKind::Forbidden403 | SyncErrorKind::NotFound404 => {
                     restricted_channels.insert(cand.conv_key);
                 }
                 SyncErrorKind::Unauthorized401 | SyncErrorKind::Transient => {
@@ -2805,6 +2833,24 @@ mod tests {
                 .context("refresh failed")
             ),
             SyncErrorKind::Forbidden403
+        );
+
+        // 404 is its own class, decided by the response status only.
+        assert_eq!(
+            classify_sync_error(&anyhow::anyhow!(
+                "Graph API error (GET https://graph.microsoft.com/v1.0/teams/t1/channels/c1/messages/delta): 404 Not Found [NotFound] channel was deleted"
+            )),
+            SyncErrorKind::NotFound404
+        );
+        assert_eq!(
+            classify_sync_error(&anyhow::anyhow!(
+                "Graph API error (GET https://graph.microsoft.com/v1.0/chats/19:404abc/messages/1700000404123): 500 Internal Server Error [generalException] request 404 failed"
+            )),
+            SyncErrorKind::Transient
+        );
+        assert_eq!(
+            classify_sync_error(&anyhow::anyhow!("Failed to parse message 404 of the page")),
+            SyncErrorKind::Transient
         );
 
         assert!(is_expired_delta_error(&anyhow::anyhow!(
@@ -5011,6 +5057,302 @@ mod tests {
         assert!(!saw_slow, "stale slow focus response must never emit MessagesUpdated");
 
         ctrl.request(SyncCommand::Shutdown);
+        server.abort();
+    }
+
+    fn regression_graph(addr: std::net::SocketAddr) -> GraphClient {
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..AppConfig::default()
+        };
+        let tokens = StoredTokens {
+            access_token: "tok".to_string(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".to_string()),
+            user_display_name: Some("Me".to_string()),
+            user_email: None,
+            auth_mode: "pkce".to_string(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tokens);
+        GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1")
+    }
+
+    // TEAMS-10: a chat whose `$batch` sub-response is throttled must stay dirty, so the next
+    // tick fetches it again; the other chats of the same batch are processed as usual.
+    #[tokio::test]
+    async fn regression_teams_10_throttled_batch_subresponse_stays_dirty() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::{atomic::AtomicUsize, Mutex};
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let bc = Arc::clone(&batch_calls);
+        let batch_urls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let bu = Arc::clone(&batch_urls);
+
+        let chat = |id: &str| {
+            serde_json::json!({
+                "id": id,
+                "chatType": "oneOnOne",
+                "lastUpdatedDateTime": "2026-11-20T09:00:00Z",
+                "members": [
+                    { "userId": "u1", "displayName": "Me" },
+                    { "userId": format!("peer-{id}"), "displayName": format!("Peer {id}") }
+                ],
+                "lastMessagePreview": {
+                    "id": format!("{id}-m1"),
+                    "createdDateTime": "2026-11-20T09:00:00Z",
+                    "isDeleted": false,
+                    "from": { "user": { "id": format!("peer-{id}"), "displayName": format!("Peer {id}") } },
+                    "body": { "contentType": "html", "content": "<p>hello</p>" }
+                }
+            })
+        };
+        let chats = serde_json::json!({ "value": [chat("c-ok"), chat("c-throttled")] });
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(move || {
+                    let chats = chats.clone();
+                    async move { Json(chats) }
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(req): Json<serde_json::Value>| {
+                    let bc = Arc::clone(&bc);
+                    let bu = Arc::clone(&bu);
+                    async move {
+                        let call = bc.fetch_add(1, Ordering::SeqCst) + 1;
+                        let reqs = req["requests"].as_array().cloned().unwrap_or_default();
+                        let mut urls = Vec::new();
+                        let mut responses = Vec::new();
+                        for sub in reqs {
+                            let id = sub["id"].as_str().unwrap_or("0").to_string();
+                            let url = sub["url"].as_str().unwrap_or("").to_string();
+                            let chat_id = if url.contains("/chats/c-throttled/") {
+                                "c-throttled"
+                            } else {
+                                "c-ok"
+                            };
+                            if chat_id == "c-throttled" && call == 1 {
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 429,
+                                    "headers": { "Retry-After": "1" },
+                                    "body": { "error": { "code": "TooManyRequests", "message": "throttled" } }
+                                }));
+                            } else {
+                                responses.push(serde_json::json!({
+                                    "id": id,
+                                    "status": 200,
+                                    "body": {
+                                        "value": [{
+                                            "id": format!("{chat_id}-m1"),
+                                            "createdDateTime": "2026-11-20T09:00:00Z",
+                                            "messageType": "message",
+                                            "from": { "user": { "id": format!("peer-{chat_id}"), "displayName": "Peer" } },
+                                            "body": { "contentType": "html", "content": "<p>hello</p>" }
+                                        }]
+                                    }
+                                }));
+                            }
+                            urls.push(url);
+                        }
+                        bu.lock().unwrap().push(urls);
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let graph = regression_graph(addr);
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut chat_cache = HashMap::new();
+        let mut seeded = false;
+        let mut cursor_init = false;
+        let mut rolling = 0usize;
+
+        // Tick 1: c-ok is stored and recorded clean; c-throttled is neither.
+        poll_chats_tier2_with_rolling_cache(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut chat_cache,
+            &mut seeded,
+            &mut cursor_init,
+            &mut rolling,
+        )
+        .await
+        .unwrap();
+        assert!(storage.get_message("chat:c-ok", "c-ok-m1").unwrap().is_some());
+        assert!(storage.get_message("chat:c-throttled", "c-throttled-m1").unwrap().is_none());
+        assert_eq!(
+            chat_cache.get("chat:c-ok").and_then(|e| e.last_msg_id.as_deref()),
+            Some("c-ok-m1")
+        );
+        assert_ne!(
+            chat_cache.get("chat:c-throttled").and_then(|e| e.last_msg_id.as_deref()),
+            Some("c-throttled-m1"),
+            "a throttled chat must not be recorded as clean"
+        );
+
+        // Tick 2: the throttled chat is asked for again and its message arrives.
+        poll_chats_tier2_with_rolling_cache(
+            &graph,
+            &storage,
+            &event_tx,
+            &mut chat_cache,
+            &mut seeded,
+            &mut cursor_init,
+            &mut rolling,
+        )
+        .await
+        .unwrap();
+        let urls = batch_urls.lock().unwrap().clone();
+        assert_eq!(urls.len(), 2, "one $batch per tick, no extra request in the same tick: {urls:?}");
+        assert!(
+            urls[1].iter().any(|u| u.contains("/chats/c-throttled/messages")),
+            "tick 2 must retry the throttled chat: {urls:?}"
+        );
+        assert!(storage.get_message("chat:c-throttled", "c-throttled-m1").unwrap().is_some());
+        assert_eq!(
+            chat_cache.get("chat:c-throttled").and_then(|e| e.last_msg_id.as_deref()),
+            Some("c-throttled-m1")
+        );
+
+        server.abort();
+    }
+
+    // TEAMS-20: a deleted channel (404 on delta) leaves the rotation without aborting the
+    // batch or raising a backoff; the channels after it are still polled in the same tick.
+    #[tokio::test]
+    async fn regression_teams_20_deleted_channel_does_not_abort_rotation() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let gone_hits = Arc::new(AtomicUsize::new(0));
+        let live_hits = Arc::new(AtomicUsize::new(0));
+        let gh = Arc::clone(&gone_hits);
+        let lh = Arc::clone(&live_hits);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let live_delta_link =
+            format!("http://{addr}/v1.0/teams/t1/channels/ch-live/messages/delta?state=next");
+
+        let gone_route = move || {
+            let gh = Arc::clone(&gh);
+            async move {
+                gh.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": { "code": "NotFound", "message": "The channel was deleted." }
+                    })),
+                )
+            }
+        };
+        let app = Router::new()
+            .route("/v1.0/teams/t1/channels/ch-gone/messages/delta", get(gone_route.clone()))
+            .route("/v1.0/teams/t1/channels/ch-gone/messages", get(gone_route))
+            .route(
+                "/v1.0/teams/t1/channels/ch-live/messages/delta",
+                get(move || {
+                    let lh = Arc::clone(&lh);
+                    let link = live_delta_link.clone();
+                    async move {
+                        lh.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "live-1",
+                                "createdDateTime": "2026-11-20T05:00:00Z",
+                                "messageType": "message",
+                                "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                "body": { "contentType": "html", "content": "<p>still here</p>" }
+                            }],
+                            "@odata.deltaLink": link
+                        }))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let graph = regression_graph(addr);
+        let storage = Storage::open_in_memory().unwrap();
+        let channel = |id: &str, name: &str| crate::models::ChannelSummary {
+            id: id.to_string(),
+            team_id: "t1".to_string(),
+            team_name: "Eng".to_string(),
+            display_name: name.to_string(),
+            description: None,
+            membership_type: "standard".to_string(),
+            web_url: None,
+        };
+        storage
+            .upsert_teams(&[TeamSummary {
+                id: "t1".to_string(),
+                display_name: "Eng".to_string(),
+                description: None,
+                channels: vec![channel("ch-gone", "Deleted"), channel("ch-live", "General")],
+            }])
+            .unwrap();
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let pinned = HashSet::new();
+        let mut rotation = ChannelRotationState::default();
+        let mut restricted = HashSet::new();
+
+        // Before the fix the 404 was returned as the tick's error (and counted as a transient
+        // failure by the caller) and the rest of the batch was not polled.
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            None,
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .expect("a deleted channel must not fail the tick");
+        assert_eq!(gone_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1, "the other channel is polled in the same tick");
+        assert!(storage.get_message("chan:t1:ch-live", "live-1").unwrap().is_some());
+        assert!(restricted.contains("chan:t1:ch-gone"));
+        assert!(!restricted.contains("chan:t1:ch-live"));
+
+        // The deleted channel is out of the rotation on the following ticks.
+        poll_channels_tier3_rotating(
+            &graph,
+            &storage,
+            &event_tx,
+            None,
+            &pinned,
+            None,
+            &mut rotation,
+            &mut restricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gone_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 2);
+
         server.abort();
     }
 }

@@ -6916,6 +6916,52 @@ async fn regression_teams_bug_18_thread_window_reply_count() {
         assert_eq!(j["thread"]["has_more"], false);
     }
 
+    // TEAMS-23: sync caches a newer reply after the complete online read above. The offline
+    // read must return it and count it, instead of answering from the stale reply window.
+    {
+        let conv_key = "chan:team-a:chan-general";
+        let storage =
+            Storage::open(&tmp.path().join("data").join("me-user-1").join("cache.db")).unwrap();
+        storage
+            .upsert_messages(&[MessageItem {
+                msg_key: MessageItem::make_msg_key(conv_key, "reply-4"),
+                conv_key: conv_key.to_string(),
+                msg_id: "reply-4".to_string(),
+                parent_msg_id: Some("root-1".to_string()),
+                reply_to_id: None,
+                reply_to_author: None,
+                reply_to_preview: None,
+                subject: None,
+                author_id: Some("u-alice".to_string()),
+                author_name: "Alice Kim".to_string(),
+                is_me: false,
+                created_at: "2026-11-20T10:04:00Z".to_string(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: "<p>reply number 4</p>".to_string(),
+                body_plain: "reply number 4".to_string(),
+                attachments: Vec::new(),
+                mentions: Vec::new(),
+                reactions: Vec::new(),
+                reply_count: 0,
+                web_url: None,
+            }])
+            .unwrap();
+    }
+    let off_synced = run_cli(
+        &tmp,
+        &["thread", "Engineering/General", "root-1", "--offline", "--limit", "50", "--json"],
+    )
+    .await;
+    assert!(off_synced.status.success(), "stderr={}", String::from_utf8_lossy(&off_synced.stderr));
+    let j_synced: Value = serde_json::from_slice(&off_synced.stdout).unwrap();
+    assert_eq!(j_synced["thread"]["root"]["reply_count"], 4, "{j_synced}");
+    assert_eq!(j_synced["thread"]["returned"], 4);
+    assert_eq!(j_synced["thread"]["has_more"], false);
+    assert_eq!(j_synced["thread"]["replies"][3]["msg_id"], "reply-4");
+
     // Text output with --limit 2 -> includes "more exist", no "[💬"
     let txt_out = run_cli(&tmp, &["thread", "Engineering/General", "root-1", "--limit", "2"]).await;
     assert!(txt_out.status.success());

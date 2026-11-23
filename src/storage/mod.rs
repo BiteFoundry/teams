@@ -203,6 +203,8 @@ impl Storage {
     }
 
     /// Stores fetched teams; a team whose channel fetch failed keeps its cached channels.
+    /// Teams and channels Graph no longer lists are removed from the cache (their message
+    /// rows stay); an empty fetch removes nothing.
     pub fn upsert_joined_teams(&self, fetched: &JoinedTeams) -> Result<Vec<TeamSummary>> {
         let cached = self.list_teams()?;
         let mut merged = fetched.teams.clone();
@@ -214,7 +216,10 @@ impl Storage {
                 team.channels = old.channels.clone();
             }
         }
-        self.upsert_teams(&merged)?;
+        let failed: std::collections::HashSet<String> =
+            fetched.channel_errors.iter().map(|e| e.team_id.clone()).collect();
+        let mut conn = self.lock_conn()?;
+        repo::upsert_joined_teams_and_prune(&mut conn, &merged, &failed)?;
         Ok(merged)
     }
 
@@ -1485,6 +1490,171 @@ mod tests {
         let (te, cove) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
         assert!(te.replies.is_empty());
         assert_eq!(cove, ThreadCoverage { has_more: false, reply_total: Some(0) });
+    }
+
+    // TEAMS-38: sync writes Graph-derived summaries, which always carry `pinned: false`.
+    #[test]
+    fn regression_teams_38_upsert_keeps_local_pin() {
+        let storage = Storage::open_in_memory().unwrap();
+        let chat = sample_chat("c1", "Chat", false, Some("2026-11-20T09:00:00Z"));
+        storage.upsert_conversations(std::slice::from_ref(&chat)).unwrap();
+        let pinned = |st: &Storage| st.get_conversation(&chat.conv_key).unwrap().unwrap().pinned;
+        assert!(!pinned(&storage));
+
+        storage.set_conversation_pinned(&chat.conv_key, true).unwrap();
+        storage.upsert_conversations(std::slice::from_ref(&chat)).unwrap();
+        assert!(pinned(&storage), "an upsert must not clear a local pin");
+
+        storage.set_conversation_pinned(&chat.conv_key, false).unwrap();
+        assert!(!pinned(&storage));
+        storage.upsert_conversations(std::slice::from_ref(&chat)).unwrap();
+        assert!(!pinned(&storage));
+
+        // An upsert can still set a pin.
+        let mut pinned_chat = chat.clone();
+        pinned_chat.pinned = true;
+        storage.upsert_conversations(&[pinned_chat]).unwrap();
+        assert!(pinned(&storage));
+    }
+
+    // TEAMS-23: a thread read online once and then extended by sync.
+    #[test]
+    fn regression_teams_23_complete_thread_window_includes_synced_replies() {
+        let storage = Storage::open_in_memory().unwrap();
+        let conv_key = "chan:t1:ch1";
+        let reply_ids = |view: &ThreadView| -> Vec<String> {
+            view.replies.iter().map(|m| m.msg_id.clone()).collect()
+        };
+        let root = sample_msg(conv_key, "m1", None, "Alice", "root", None, "2026-11-20T09:00:00Z");
+        let r1 = sample_msg(conv_key, "r1", Some("m1"), "Bob", "reply 1", None, "2026-11-20T09:01:00Z");
+        let r2 = sample_msg(conv_key, "r2", Some("m1"), "Bob", "reply 2", None, "2026-11-20T09:02:00Z");
+        let fetched = ThreadView {
+            conv_key: conv_key.to_string(),
+            root,
+            replies: vec![r1, r2],
+        };
+        storage.save_fetched_thread(&fetched, true).unwrap();
+
+        // Sync delivers a newer reply; no online thread read happens in between.
+        let r3 = sample_msg(conv_key, "r3", Some("m1"), "Bob", "reply 3", None, "2026-11-20T09:03:00Z");
+        storage.upsert_messages(&[r3]).unwrap();
+
+        let (all, cov) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        assert_eq!(reply_ids(&all), ["r1", "r2", "r3"]);
+        assert_eq!(all.root.reply_count, 3);
+        assert_eq!(cov, ThreadCoverage { has_more: false, reply_total: Some(3) });
+
+        let (newest, cov) = storage.get_fetched_thread(conv_key, "m1", 2).unwrap().unwrap();
+        assert_eq!(reply_ids(&newest), ["r2", "r3"]);
+        assert_eq!(cov, ThreadCoverage { has_more: true, reply_total: Some(3) });
+
+        // A tombstone recorded later lowers the count; the row itself is still returned.
+        storage
+            .apply_local_soft_delete(conv_key, "r2", "2026-11-20T09:10:00Z")
+            .unwrap()
+            .unwrap();
+        let (after_delete, _) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        assert_eq!(after_delete.root.reply_count, 2);
+        assert_eq!(reply_ids(&after_delete), ["r1", "r2", "r3"]);
+        assert!(after_delete.replies[1].deleted);
+
+        // A complete window stays authoritative up to its newest reply: a cached row that
+        // sorts before it and was not part of the snapshot is not resurrected.
+        let stray = sample_msg(conv_key, "r0", Some("m1"), "Bob", "stale", None, "2026-11-20T09:00:30Z");
+        storage.upsert_messages(&[stray]).unwrap();
+        let (no_stray, _) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
+        assert_eq!(reply_ids(&no_stray), ["r1", "r2", "r3"]);
+
+        // A thread that was never read online is still a cache miss.
+        let other_root = sample_msg(conv_key, "m9", None, "Alice", "other", None, "2026-11-20T10:00:00Z");
+        let other_reply = sample_msg(conv_key, "m9-r1", Some("m9"), "Bob", "x", None, "2026-11-20T10:01:00Z");
+        storage.upsert_messages(&[other_root, other_reply]).unwrap();
+        assert!(storage.get_fetched_thread(conv_key, "m9", 50).unwrap().is_none());
+    }
+
+    // TEAMS-20: left teams and deleted channels leave the cache, but only on evidence.
+    #[test]
+    fn regression_teams_20_joined_teams_prune_absent_teams_and_channels() {
+        use crate::models::TeamChannelError;
+
+        let storage = Storage::open_in_memory().unwrap();
+        let channel = |team: &str, id: &str| ChannelSummary {
+            id: id.to_string(),
+            team_id: team.to_string(),
+            team_name: format!("Team {team}"),
+            display_name: id.to_string(),
+            description: None,
+            membership_type: "standard".to_string(),
+            web_url: None,
+        };
+        let team = |id: &str, channels: Vec<ChannelSummary>| TeamSummary {
+            id: id.to_string(),
+            display_name: format!("Team {id}"),
+            description: None,
+            channels,
+        };
+        storage
+            .upsert_teams(&[
+                team("ta", vec![channel("ta", "keep"), channel("ta", "deleted")]),
+                team("tb", vec![channel("tb", "secret")]),
+                team("tgone", vec![channel("tgone", "old")]),
+            ])
+            .unwrap();
+        let chat = sample_chat("c1", "Chat", false, Some("2026-11-20T09:00:00Z"));
+        storage.upsert_conversations(std::slice::from_ref(&chat)).unwrap();
+        storage
+            .upsert_messages(&[
+                sample_msg("chan:ta:deleted", "m1", None, "Alice", "orphan one", None, "2026-11-20T09:00:00Z"),
+                sample_msg("chan:tgone:old", "m2", None, "Alice", "orphan two", None, "2026-11-20T09:00:00Z"),
+            ])
+            .unwrap();
+        let conv_keys = |st: &Storage| -> Vec<String> {
+            let mut keys: Vec<String> =
+                st.list_conversations().unwrap().into_iter().map(|c| c.conv_key).collect();
+            keys.sort();
+            keys
+        };
+        let team_ids = |st: &Storage| -> Vec<String> {
+            let mut ids: Vec<String> = st.list_teams().unwrap().into_iter().map(|t| t.id).collect();
+            ids.sort();
+            ids
+        };
+        let before = conv_keys(&storage);
+
+        // An empty fetch is indistinguishable from a failed one: nothing is removed.
+        storage
+            .upsert_joined_teams(&JoinedTeams {
+                teams: Vec::new(),
+                channel_errors: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(conv_keys(&storage), before);
+        assert_eq!(team_ids(&storage), ["ta", "tb", "tgone"]);
+
+        // Graph now lists ta (one channel left) and tb (channel fetch failed); tgone is gone.
+        let fetched = JoinedTeams {
+            teams: vec![team("ta", vec![channel("ta", "keep")]), team("tb", vec![])],
+            channel_errors: vec![TeamChannelError {
+                team_id: "tb".to_string(),
+                display_name: "Team tb".to_string(),
+                status: Some(429),
+                error: "429 Too Many Requests".to_string(),
+            }],
+        };
+        let merged = storage.upsert_joined_teams(&fetched).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(team_ids(&storage), ["ta", "tb"]);
+        assert_eq!(
+            conv_keys(&storage),
+            ["chan:ta:keep", "chan:tb:secret", "chat:c1"],
+            "deleted channel and left team are gone; the failed team keeps its cached channel; chats are untouched"
+        );
+        let ta = storage.list_teams().unwrap().into_iter().find(|t| t.id == "ta").unwrap();
+        assert_eq!(ta.channels.len(), 1);
+
+        // Message rows of the removed conversations stay.
+        assert!(storage.get_message("chan:ta:deleted", "m1").unwrap().is_some());
+        assert!(storage.get_message("chan:tgone:old", "m2").unwrap().is_some());
     }
 
     #[test]
