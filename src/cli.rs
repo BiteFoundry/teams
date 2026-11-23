@@ -757,8 +757,16 @@ pub enum Command {
         bind: String,
         #[arg(long, default_value_t = 8788)]
         port: u16,
+        /// Bearer token callers must present; without it a random one is generated and
+        /// printed to stderr (loopback binds only)
         #[arg(long)]
         token: Option<String>,
+        /// Run a loopback server with no bearer token at all
+        #[arg(long, conflicts_with = "token")]
+        allow_keyless: bool,
+        /// Exact browser origin allowed to call the API, e.g. http://localhost:3000 (repeatable)
+        #[arg(long = "cors-origin", value_name = "ORIGIN")]
+        cors_origin: Vec<String>,
     },
     /// Start the stdio MCP (JSON-RPC 2.0) server for agents
     #[command(visible_alias = "mcp-server")]
@@ -1246,13 +1254,25 @@ async fn dispatch_command(
             json,
         }) => Box::pin(cmd_update(cfg, check, force, repo.as_deref(), json)).await,
         Some(Command::Tui) => Box::pin(cmd_tui(cfg, persona)).await,
-        Some(Command::Serve { bind, port, token }) => {
+        Some(Command::Serve {
+            bind,
+            port,
+            token,
+            allow_keyless,
+            cors_origin,
+        }) => {
             let (_auth, graph, storage) = Box::pin(open_runtime(cfg, false)).await?;
             Box::pin(serve::run(
                 cfg.clone(),
                 graph,
                 storage,
-                ServeOptions { bind, port, token },
+                ServeOptions {
+                    bind,
+                    port,
+                    token,
+                    allow_keyless,
+                    cors_origins: cors_origin,
+                },
             ))
             .await
         }
@@ -5570,13 +5590,49 @@ mod tests {
         ])
         .unwrap();
         match cli.command.unwrap() {
-            Command::Serve { bind, port, token } => {
+            Command::Serve {
+                bind,
+                port,
+                token,
+                allow_keyless,
+                cors_origin,
+            } => {
                 assert_eq!(bind, "0.0.0.0");
                 assert_eq!(port, 9000);
                 assert_eq!(token.as_deref(), Some("sec"));
+                assert!(!allow_keyless);
+                assert!(cors_origin.is_empty());
             }
             other => panic!("unexpected command: {other:?}"),
         }
+
+        let cli = Cli::try_parse_from([
+            "teams",
+            "serve",
+            "--allow-keyless",
+            "--cors-origin",
+            "http://localhost:3000",
+            "--cors-origin",
+            "https://app.example",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Command::Serve {
+                token,
+                allow_keyless,
+                cors_origin,
+                ..
+            } => {
+                assert!(token.is_none());
+                assert!(allow_keyless);
+                assert_eq!(cors_origin, ["http://localhost:3000", "https://app.example"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from(["teams", "serve", "--allow-keyless", "--token", "sec"]).is_err(),
+            "--allow-keyless and --token are mutually exclusive"
+        );
 
         let cli = Cli::try_parse_from(["teams", "mcp-server"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Command::Mcp));

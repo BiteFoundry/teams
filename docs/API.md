@@ -5,30 +5,40 @@ Local HTTP/JSON server for AI agents, scripts, and integrations. Exposed by `tea
 ## Starting the server
 
 ```bash
-teams serve                     # http://127.0.0.1:8788
+teams serve                     # http://127.0.0.1:8788, prints a generated bearer token on stderr
 teams serve --port 9000         # custom port
 teams serve --bind 127.0.0.1 --port 8788
 teams serve --token secret123   # require Authorization: Bearer secret123
+teams serve --allow-keyless     # loopback only: no bearer token at all
+teams serve --token secret123 --cors-origin http://localhost:3000   # let one browser origin call the API
 teams api                       # alias for `serve`
 ```
 
-- `--bind` defaults to `127.0.0.1` (loopback only). Binding to a non-loopback address (e.g. `0.0.0.0`) requires `--token <SECRET>` unless `TEAMS_ALLOW_INSECURE_SERVE=1` is explicitly set.
+- `--bind` defaults to `127.0.0.1` (loopback only). Binding to a non-loopback address (e.g. `0.0.0.0`) always requires `--token <SECRET>`; `--allow-keyless` and `TEAMS_ALLOW_INSECURE_SERVE` do not apply there.
 - `--port` defaults to `8788`.
-- `--token` is optional; when set, every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
+- **Authentication is on by default.** Every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
+  - `--token <SECRET>` sets the token.
+  - Without `--token`, a loopback server generates a random 32-byte token (64 hex characters) for the session and prints it **once, to stderr**. It is not stored anywhere; a restart generates a new one.
+  - `--allow-keyless` (loopback only, cannot be combined with `--token`) turns bearer authentication off. Any local process can then read and send Teams messages through the port.
+- `--cors-origin <ORIGIN>` (repeatable) allows one exact browser origin, e.g. `http://localhost:3000`. There is no wildcard or prefix match, and no CORS headers are sent without it.
+- The `curl` examples below leave out `-H "Authorization: Bearer <token>"` for brevity; add it unless the server runs with `--allow-keyless`.
 - Requires an existing login (`teams login`) or `TEAMS_ACCESS_TOKEN`.
 - On startup, `teams serve` spawns the background sync engine so the local SQLite cache stays warm while serving requests.
 
 ## Conventions
 
 - All responses are JSON (`Content-Type: application/json`).
-- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `403`, `404`, or `500`.
+- Errors use `{"error": "<message>"}` with HTTP `400`, `401`, `403`, `404`, `415`, or `500`.
 - `limit` defaults to `50` and is clamped to `1..=1000`.
 - `{key}` path parameters accept:
   - URL-encoded `conv_key` (e.g. `chat%3A19%3A...` or `chan%3A<team_id>%3A<channel_id>`),
   - raw `chat_id`,
   - `"<team>/<channel>"` (URL-encoded as needed), or
   - a unique case-insensitive title substring.
-- CORS is restricted to loopback (`localhost` / `127.0.0.1` / `[::1]`) origins when `--token` is unset, and permissive when `--token` is configured.
+- Request guard (all routes, including `/health`, with or without a token):
+  - **Host**: on a loopback bind the `Host` header must be `localhost`, a loopback IPv4 address or `[::1]` (any port); anything else gets `403 {"error": "host not allowed"}`. This stops DNS rebinding. Reaching the port through a reverse proxy or a custom host name requires a non-loopback `--bind` with `--token`.
+  - **Origin**: a request with an `Origin` header is accepted only when the origin is the API's own (`http://<Host>`) or exactly one of the `--cors-origin` values; otherwise `403 {"error": "cross-origin request refused"}` (this includes `Origin: null` and other loopback ports). A request without `Origin` but with `Sec-Fetch-Site: cross-site` is refused the same way. curl, scripts and agents send neither header and are unaffected.
+- CORS headers are sent only for `--cors-origin` origins. Earlier versions allowed every loopback origin without a token and every origin with one.
 
 ## Endpoints
 
@@ -242,6 +252,9 @@ Reads a file **on the host running `teams serve`**, uploads it to OneDrive (for 
 
 Downloads an attachment from a message to `out_dir` (defaults to configured `download_dir`, usually `Downloads/teams`).
 
+- A JSON body must be sent with `Content-Type: application/json` (`415` otherwise). An empty body needs no `Content-Type` and downloads attachment `0` to the default directory.
+- With `--allow-keyless`, `out_dir` must stay inside the configured download directory: a relative value is joined onto it; `..`, absolute paths outside it, drive-relative (`C:foo`), UNC and `\\?\` paths get `400 {"error": "out_dir must be inside the configured download directory"}`. Set `TEAMS_SERVE_ALLOW_ANY_OUT_DIR=1` to lift this. With a bearer token, `out_dir` is used as given.
+
 ```json
 {
   "index": 0,
@@ -283,7 +296,7 @@ curl -X PATCH http://127.0.0.1:8788/conversations/chat%3A19%3Aabc/messages/17000
 curl -X DELETE "http://127.0.0.1:8788/conversations/chat%3A19%3Aabc/messages/1700000000000"
 ```
 
-For channel thread replies, pass `?thread_root_id=<root_id>` or JSON body `{"thread_root_id":"<root_id>"}`.
+For channel thread replies, pass `?thread_root_id=<root_id>` or JSON body `{"thread_root_id":"<root_id>"}`. A `DELETE` body must be sent with `Content-Type: application/json` (`415` otherwise).
 
 ### `POST /conversations/{key}/read`
 
@@ -345,7 +358,8 @@ All failing endpoints return `{"error": "<message>"}`:
 | HTTP Status | Meaning |
 | --- | --- |
 | `400` | Validation error (empty body, invalid `before` cursor, invalid reaction/kind/presence, missing local file, out-of-range attachment index, etc.) |
-| `401` | `--token` is enabled and `Authorization: Bearer <token>` is missing or invalid |
-| `403` | Insufficient Microsoft Graph permissions / missing token scopes (includes JWT `scp`/`roles` diagnostics) |
+| `401` | `Authorization: Bearer <token>` is missing or invalid (every route except `/health`, unless started with `--allow-keyless`) |
+| `403` | Insufficient Microsoft Graph permissions / missing token scopes (includes JWT `scp`/`roles` diagnostics); or the request guard refused the `Host` (`host not allowed`) or `Origin` (`cross-origin request refused`) |
 | `404` | Target conversation, message, or cached thread not found |
+| `415` | A JSON body on attachment download or message delete was sent without `Content-Type: application/json` |
 | `500` | Unexpected Microsoft Graph, IO, or SQLite error |

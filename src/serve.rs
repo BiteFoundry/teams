@@ -1,12 +1,16 @@
 //! Local HTTP JSON API (`teams serve` / `teams api`) powered by `axum`.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::{Component, Path as FsPath, PathBuf, Prefix},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{Path, Query, Request, State},
-    http::{header, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -27,11 +31,19 @@ use crate::{
     sync::{self, SyncCommand},
 };
 
+/// Env opt-out for the keyless `out_dir` containment rule (see [`resolve_api_out_dir`]).
+const ALLOW_ANY_OUT_DIR_ENV: &str = "TEAMS_SERVE_ALLOW_ANY_OUT_DIR";
+
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub bind: String,
     pub port: u16,
     pub token: Option<String>,
+    /// `--allow-keyless`: run a loopback server with no bearer token at all instead of
+    /// generating one for the session.
+    pub allow_keyless: bool,
+    /// `--cors-origin` (repeatable): exact browser origins allowed to call the API.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServeOptions {
@@ -40,6 +52,28 @@ impl Default for ServeOptions {
             bind: "127.0.0.1".to_string(),
             port: 8788,
             token: None,
+            allow_keyless: false,
+            cors_origins: Vec::new(),
+        }
+    }
+}
+
+/// Request-level hardening applied by [`build_router_with`].
+#[derive(Debug, Clone)]
+pub struct RouterSecurity {
+    /// The listener is bound to a loopback address, so the `Host` header must name the
+    /// loopback interface too (DNS-rebinding guard).
+    pub loopback_bind: bool,
+    /// Exact origins (`scheme://host[:port]`) that may call the API from a browser. Every
+    /// other request carrying an `Origin` header is refused; there is no wildcard.
+    pub cors_origins: Vec<String>,
+}
+
+impl Default for RouterSecurity {
+    fn default() -> Self {
+        Self {
+            loopback_bind: true,
+            cors_origins: Vec::new(),
         }
     }
 }
@@ -50,6 +84,13 @@ pub struct AppState {
     pub graph: GraphClient,
     pub storage: Storage,
     pub token: Option<String>,
+    pub security: RouterSecurity,
+}
+
+impl AppState {
+    fn has_token(&self) -> bool {
+        self.token.as_deref().is_some_and(|t| !t.trim().is_empty())
+    }
 }
 
 /// JSON error returned by every failing handler.
@@ -247,28 +288,52 @@ pub struct SetPresenceBody {
 }
 
 
-/// Build the `axum::Router` for the local HTTP JSON API.
+/// Build the `axum::Router` for the local HTTP JSON API, assuming a loopback listener and
+/// no extra browser origins. `token = None` is the keyless mode (`--allow-keyless`).
 pub fn build_router(
     config: AppConfig,
     graph: GraphClient,
     storage: Storage,
     token: Option<String>,
 ) -> axum::Router {
-    let has_token = token.as_deref().is_some_and(|t| !t.trim().is_empty());
+    build_router_with(config, graph, storage, token, RouterSecurity::default())
+}
+
+/// Build the router with explicit request-hardening settings (see [`RouterSecurity`]).
+pub fn build_router_with(
+    config: AppConfig,
+    graph: GraphClient,
+    storage: Storage,
+    token: Option<String>,
+    mut security: RouterSecurity,
+) -> axum::Router {
+    // Keep only well-formed origins, in canonical form, so the guard and the CORS layer
+    // compare against exactly the same strings (`run` rejects malformed ones up front).
+    security.cors_origins = security
+        .cors_origins
+        .iter()
+        .filter_map(|o| normalize_origin(o))
+        .collect();
+    let cors_values: Vec<HeaderValue> = security
+        .cors_origins
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
     let state = Arc::new(AppState {
         config,
         graph,
         storage,
         token,
+        security,
     });
 
-    let cors = if has_token {
-        CorsLayer::permissive()
+    // CORS is opt-in and exact: without `--cors-origin` no `Access-Control-Allow-*` header
+    // is ever sent, with or without a token.
+    let cors = if cors_values.is_empty() {
+        CorsLayer::new()
     } else {
         CorsLayer::new()
-            .allow_origin(AllowOrigin::predicate(|origin, _| {
-                origin.to_str().ok().is_some_and(is_loopback_origin)
-            }))
+            .allow_origin(AllowOrigin::list(cors_values))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -311,7 +376,13 @@ pub fn build_router(
         .route("/search", get(search))
         .route("/presence", get(get_presence).post(set_presence))
         .route("/openapi.json", get(openapi_spec))
+        // Outermost first: CORS answers preflights, the guard refuses foreign Host/Origin
+        // before any credential is looked at, then bearer auth runs.
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_guard_middleware,
+        ))
         .layer(cors)
         .with_state(state)
 }
@@ -326,8 +397,15 @@ pub async fn run(
     let addr: SocketAddr = format!("{}:{}", opts.bind, opts.port)
         .parse()
         .with_context(|| format!("Invalid bind address: {}:{}", opts.bind, opts.port))?;
-    let allow_insecure = std::env::var("TEAMS_ALLOW_INSECURE_SERVE").ok();
-    check_bind_security(addr, opts.token.as_deref(), allow_insecure.as_deref())?;
+    let auth = resolve_serve_auth(addr, opts.token.as_deref(), opts.allow_keyless)?;
+    for origin in &opts.cors_origins {
+        if normalize_origin(origin).is_none() {
+            anyhow::bail!(
+                "Invalid --cors-origin {origin:?}: expected an exact origin such as \
+                 http://localhost:3000 (scheme://host[:port], no path and no wildcard)."
+            );
+        }
+    }
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
@@ -336,13 +414,42 @@ pub async fn run(
         sync::spawn_sync_engine(config.clone(), graph.clone(), storage.clone(), event_tx);
     sync_ctl.request(SyncCommand::RefreshConversations);
 
-    let app = build_router(config, graph, storage, opts.token);
+    let token = match &auth {
+        ServeAuth::Token(token) | ServeAuth::GeneratedToken(token) => Some(token.clone()),
+        ServeAuth::Keyless => None,
+    };
+    let app = build_router_with(
+        config,
+        graph,
+        storage,
+        token,
+        RouterSecurity {
+            loopback_bind: addr.ip().is_loopback(),
+            cors_origins: opts.cors_origins,
+        },
+    );
 
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind listener: {addr}"))?;
 
     println!("teams HTTP API listening on http://{addr}");
+    // The secret goes to stderr only, once, and only after the port is ours.
+    match &auth {
+        ServeAuth::GeneratedToken(token) => {
+            eprintln!("teams serve: no --token given; generated a bearer token for this session:");
+            eprintln!("  {token}");
+            eprintln!(
+                "  Send it as `Authorization: Bearer <token>` on every route except /health. \
+                 Pass --token <SECRET> to choose your own, or --allow-keyless to run without one."
+            );
+        }
+        ServeAuth::Keyless => eprintln!(
+            "teams serve: running WITHOUT a bearer token (--allow-keyless). Any local process \
+             can read and send Teams messages through this port."
+        ),
+        ServeAuth::Token(_) => {}
+    }
 
     axum::serve(listener, app)
         .await
@@ -351,35 +458,267 @@ pub async fn run(
     Ok(())
 }
 
-fn check_bind_security(
-    addr: SocketAddr,
-    token: Option<&str>,
-    allow_insecure_env: Option<&str>,
-) -> Result<()> {
-    let has_token = token.is_some_and(|t| !t.trim().is_empty());
-    let allow_insecure = allow_insecure_env.map(str::trim) == Some("1");
-    if !addr.ip().is_loopback() && !has_token && !allow_insecure {
-        anyhow::bail!(
-            "Refusing to bind HTTP API on non-loopback address {addr} without `--token <SECRET>`. \
-             Pass `--token <SECRET>` to require Bearer authentication before exposing Teams and host file endpoints, \
-             or set `TEAMS_ALLOW_INSECURE_SERVE=1` to override."
-        );
-    }
-    Ok(())
+/// How `teams serve` authenticates callers, decided once at start-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServeAuth {
+    /// `--token <SECRET>` supplied by the operator.
+    Token(String),
+    /// Loopback bind without `--token`: a random per-session secret.
+    GeneratedToken(String),
+    /// Loopback bind with `--allow-keyless`: no bearer token at all.
+    Keyless,
 }
 
-fn is_loopback_origin(origin: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(origin) else {
-        return false;
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
+fn resolve_serve_auth(addr: SocketAddr, token: Option<&str>, allow_keyless: bool) -> Result<ServeAuth> {
+    let token = token.map(str::trim).filter(|t| !t.is_empty());
+    if let Some(token) = token {
+        if allow_keyless {
+            anyhow::bail!("--allow-keyless cannot be combined with --token.");
+        }
+        return Ok(ServeAuth::Token(token.to_string()));
+    }
+    if !addr.ip().is_loopback() {
+        anyhow::bail!(
+            "Refusing to bind HTTP API on non-loopback address {addr} without `--token <SECRET>`. \
+             Pass `--token <SECRET>` to require Bearer authentication before exposing Teams and host file endpoints. \
+             (`--allow-keyless` and `TEAMS_ALLOW_INSECURE_SERVE` do not apply to non-loopback binds.)"
+        );
+    }
+    if allow_keyless {
+        return Ok(ServeAuth::Keyless);
+    }
+    Ok(ServeAuth::GeneratedToken(generate_session_token()))
+}
+
+/// 32 bytes from the OS CSPRNG, hex-encoded (64 characters).
+fn generate_session_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Canonical `scheme://host[:port]` form of a browser origin, or `None` when `raw` is not
+/// a plain http(s) origin (`null`, a wildcard, or anything with a path/query/credentials).
+fn normalize_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || trimmed.contains('*')
+    {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+/// True when a `Host` header value (`name[:port]`, IPv6 in brackets) names the loopback
+/// interface. The port is ignored.
+fn is_loopback_host_header(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty() || host.contains(['/', '@', '?', '#', '\\']) {
         return false;
     }
+    let Ok(parsed) = url::Url::parse(&format!("http://{host}")) else {
+        return false;
+    };
     match parsed.host() {
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         None => false,
+    }
+}
+
+/// An `Origin` is accepted only when it is the API's own origin (same scheme, host and
+/// port as the request's `Host`) or exactly one of the `--cors-origin` values.
+fn origin_allowed(origin: &str, request_host: Option<&str>, cors_origins: &[String]) -> bool {
+    let Some(origin) = normalize_origin(origin) else {
+        return false;
+    };
+    if cors_origins.iter().any(|allowed| *allowed == origin) {
+        return true;
+    }
+    request_host
+        .and_then(|host| normalize_origin(&format!("http://{host}")))
+        .is_some_and(|own| own == origin)
+}
+
+/// Refuses requests that a browser could be tricked into sending: a foreign `Host`
+/// (DNS rebinding against the loopback listener) or a foreign `Origin` (cross-site
+/// request). Local clients such as curl, scripts and agents send neither and pass through.
+async fn request_guard_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let headers = request.headers();
+    let host = match headers.get(header::HOST) {
+        Some(value) => match value.to_str() {
+            Ok(host) => Some(host.to_string()),
+            Err(_) => return Err(ApiError::new(StatusCode::FORBIDDEN, "host not allowed")),
+        },
+        // HTTP/2 carries the authority in the request target instead of a Host header.
+        None => request.uri().authority().map(|a| a.as_str().to_string()),
+    };
+    if state.security.loopback_bind {
+        if let Some(host) = host.as_deref() {
+            if !is_loopback_host_header(host) {
+                return Err(ApiError::new(StatusCode::FORBIDDEN, "host not allowed"));
+            }
+        }
+    }
+
+    match headers.get(header::ORIGIN) {
+        Some(origin) => {
+            let allowed = origin.to_str().ok().is_some_and(|origin| {
+                origin_allowed(origin, host.as_deref(), &state.security.cors_origins)
+            });
+            if !allowed {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "cross-origin request refused",
+                ));
+            }
+        }
+        None => {
+            let cross_site = headers
+                .get("sec-fetch-site")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cross-site"));
+            if cross_site {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "cross-origin request refused",
+                ));
+            }
+        }
+    }
+
+    Ok(next.run(request).await)
+}
+
+/// Raw-body handlers parse JSON themselves, so they must insist on the JSON media type:
+/// a `text/plain` body is a CORS "simple request" that needs no preflight.
+fn require_json_content_type(headers: &HeaderMap, body: &[u8]) -> Result<(), ApiError> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(str::trim)
+        .unwrap_or("");
+    if media_type.eq_ignore_ascii_case("application/json") {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "request body must be sent with Content-Type: application/json",
+        ))
+    }
+}
+
+/// Canonicalises the deepest existing ancestor of `path` and re-appends the rest, so two
+/// paths can be compared canonical-to-canonical even when the leaf does not exist yet.
+fn canonicalize_existing_ancestor(path: &FsPath) -> PathBuf {
+    let mut existing = path;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            let mut out = canonical;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+fn path_is_inside(child: &FsPath, parent: &FsPath) -> bool {
+    let mut child_parts = child.components();
+    for expected in parent.components() {
+        let Some(actual) = child_parts.next() else {
+            return false;
+        };
+        let same = if cfg!(windows) {
+            actual.as_os_str().to_string_lossy().to_lowercase()
+                == expected.as_os_str().to_string_lossy().to_lowercase()
+        } else {
+            actual == expected
+        };
+        if !same {
+            return false;
+        }
+    }
+    true
+}
+
+/// Resolves the directory an API download may write to.
+///
+/// With a bearer token the caller is equivalent to the local CLI user and `out_dir` is
+/// taken as given. Keyless, `out_dir` must stay inside the configured download directory
+/// (relative values are joined onto it) unless `TEAMS_SERVE_ALLOW_ANY_OUT_DIR=1` is set.
+fn resolve_api_out_dir(
+    download_dir: &FsPath,
+    raw: Option<&str>,
+    has_token: bool,
+    allow_any_env: Option<&str>,
+) -> Result<PathBuf, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(download_dir.to_path_buf());
+    };
+    let requested = PathBuf::from(raw);
+    if has_token || allow_any_env.map(str::trim) == Some("1") {
+        return Ok(requested);
+    }
+
+    let refuse = || ApiError::bad_request("out_dir must be inside the configured download directory");
+    let mut has_root = false;
+    let mut disk_prefix = false;
+    for component in requested.components() {
+        match component {
+            Component::ParentDir => return Err(refuse()),
+            Component::RootDir => has_root = true,
+            // UNC, verbatim (`\\?\`) and device paths are refused without touching the
+            // filesystem; only a plain drive letter can be compared against the download dir.
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(_) => disk_prefix = true,
+                _ => return Err(refuse()),
+            },
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    let candidate = if requested.is_absolute() {
+        requested
+    } else if has_root || disk_prefix {
+        // Windows drive-relative (`C:foo`) or root-relative (`\foo`) paths depend on the
+        // process's current drive/directory, not on the download directory.
+        return Err(refuse());
+    } else {
+        download_dir.join(requested)
+    };
+
+    let canonical_root = canonicalize_existing_ancestor(download_dir);
+    let canonical_candidate = canonicalize_existing_ancestor(&candidate);
+    if path_is_inside(&canonical_candidate, &canonical_root) {
+        Ok(candidate)
+    } else {
+        Err(refuse())
     }
 }
 
@@ -874,8 +1213,10 @@ async fn send_file(
 async fn download_attachment(
     State(state): State<Arc<AppState>>,
     Path((key, msg_id)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    require_json_content_type(&headers, &body)?;
     let parsed: DownloadBody = if body.iter().all(u8::is_ascii_whitespace) {
         DownloadBody::default()
     } else {
@@ -883,15 +1224,16 @@ async fn download_attachment(
             .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?
     };
 
-    let conv = resolve_target_for_api(&state, &key, false).await?;
+    // Decide where the file may land before any Graph request is made.
+    let allow_any_out_dir = std::env::var(ALLOW_ANY_OUT_DIR_ENV).ok();
+    let dest_dir = resolve_api_out_dir(
+        &state.config.resolved_download_dir(),
+        parsed.out_dir.as_deref(),
+        state.has_token(),
+        allow_any_out_dir.as_deref(),
+    )?;
 
-    let dest_dir = parsed
-        .out_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.config.resolved_download_dir());
+    let conv = resolve_target_for_api(&state, &key, false).await?;
 
     let downloaded = match cli::download_message_attachment(
         &state.graph,
@@ -1013,8 +1355,10 @@ async fn delete_message(
     State(state): State<Arc<AppState>>,
     Path((key, msg_id)): Path<(String, String)>,
     Query(query): Query<DeleteMessageParams>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    require_json_content_type(&headers, &body)?;
     let body_params: DeleteMessageParams = if body.iter().all(u8::is_ascii_whitespace) {
         DeleteMessageParams::default()
     } else {
@@ -1256,6 +1600,7 @@ pub fn openapi_document() -> Value {
         "info": {
             "title": "teams-cli local HTTP API (Microsoft Teams)",
             "version": env!("CARGO_PKG_VERSION"),
+            "description": "Every route except GET /health requires `Authorization: Bearer <token>` (the --token value, or the token `teams serve` generates and prints to stderr) unless the server was started with --allow-keyless. Requests with a non-loopback Host (loopback binds) or an Origin that is not the API's own or an exact --cors-origin value get 403. Raw JSON bodies on attachment download and message delete need Content-Type: application/json (415 otherwise). Keyless, download out_dir must stay inside the configured download directory (400 otherwise).",
         },
         "components": {
             "securitySchemes": {
@@ -1669,57 +2014,309 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_bind_requires_token_or_env_override() {
+    fn serve_auth_generates_a_token_on_loopback_and_refuses_open_non_loopback_binds() {
         let loopback: SocketAddr = "127.0.0.1:8788".parse().unwrap();
+        let loopback_v6: SocketAddr = "[::1]:8788".parse().unwrap();
         let any_v4: SocketAddr = "0.0.0.0:8788".parse().unwrap();
         let lan_v4: SocketAddr = "192.168.1.10:8788".parse().unwrap();
 
-        assert!(check_bind_security(loopback, None, None).is_ok());
-        assert!(check_bind_security(any_v4, None, None).is_err());
-        assert!(check_bind_security(lan_v4, None, Some("0")).is_err());
-        assert!(check_bind_security(any_v4, Some("   "), None).is_err());
-        assert!(check_bind_security(any_v4, Some("secret"), None).is_ok());
-        assert!(check_bind_security(any_v4, None, Some("1")).is_ok());
+        // Loopback without --token: a fresh 32-byte secret per call.
+        let ServeAuth::GeneratedToken(first) = resolve_serve_auth(loopback, None, false).unwrap() else {
+            panic!("expected a generated token");
+        };
+        let ServeAuth::GeneratedToken(second) = resolve_serve_auth(loopback_v6, Some("   "), false).unwrap() else {
+            panic!("a blank --token must not disable authentication");
+        };
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+
+        assert_eq!(resolve_serve_auth(loopback, None, true).unwrap(), ServeAuth::Keyless);
+        assert_eq!(
+            resolve_serve_auth(loopback, Some(" secret "), false).unwrap(),
+            ServeAuth::Token("secret".to_string())
+        );
+        assert_eq!(
+            resolve_serve_auth(any_v4, Some("secret"), false).unwrap(),
+            ServeAuth::Token("secret".to_string())
+        );
+
+        // Non-loopback always needs an operator-chosen token; keyless is never an option there.
+        assert!(resolve_serve_auth(any_v4, None, false).is_err());
+        assert!(resolve_serve_auth(lan_v4, None, true).is_err());
+        assert!(resolve_serve_auth(any_v4, Some("   "), false).is_err());
+        assert!(resolve_serve_auth(loopback, Some("secret"), true).is_err());
+    }
+
+    #[test]
+    fn origin_and_host_predicates_are_exact() {
+        assert_eq!(normalize_origin("http://localhost:3000").as_deref(), Some("http://localhost:3000"));
+        assert_eq!(normalize_origin("HTTP://LocalHost:3000/").as_deref(), Some("http://localhost:3000"));
+        assert_eq!(normalize_origin("https://app.example:443").as_deref(), Some("https://app.example"));
+        for bad in ["null", "*", "http://*.example", "https://app.example/path", "file:///c:/x", "localhost:3000", "https://u:p@app.example", ""] {
+            assert!(normalize_origin(bad).is_none(), "{bad:?} must not be an origin");
+        }
+
+        for ok in ["127.0.0.1:8788", "localhost:8788", "LOCALHOST", "[::1]:8788", "127.0.0.1", "127.8.9.1:1"] {
+            assert!(is_loopback_host_header(ok), "{ok:?}");
+        }
+        for bad in ["evil.example:8788", "localhost.evil.example", "127.0.0.1.evil.example", "evil.example@127.0.0.1", "192.168.1.10:8788", "", "localhost/x"] {
+            assert!(!is_loopback_host_header(bad), "{bad:?}");
+        }
+
+        let allowed = vec!["http://localhost:3000".to_string()];
+        // Same origin as the API itself, or an exact --cors-origin value.
+        assert!(origin_allowed("http://127.0.0.1:8788", Some("127.0.0.1:8788"), &[]));
+        assert!(origin_allowed("http://localhost:3000", Some("127.0.0.1:8788"), &allowed));
+        // Another loopback port is a different origin: no prefix or loopback wildcard.
+        assert!(!origin_allowed("http://localhost:3000", Some("127.0.0.1:8788"), &[]));
+        assert!(!origin_allowed("http://localhost:3001", Some("127.0.0.1:8788"), &allowed));
+        assert!(!origin_allowed("https://localhost:3000", Some("127.0.0.1:8788"), &allowed));
+        assert!(!origin_allowed("http://localhost:3000.evil.example", Some("127.0.0.1:8788"), &allowed));
+        assert!(!origin_allowed("null", Some("127.0.0.1:8788"), &allowed));
+        assert!(!origin_allowed("https://evil.example", None, &allowed));
+    }
+
+    async fn spawn_router(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    async fn guard_test_router(token: Option<&str>, security: RouterSecurity) -> String {
+        let cfg = AppConfig::default();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap().with_my_user_id("me-123");
+        let storage = Storage::open_in_memory().unwrap();
+        spawn_router(build_router_with(cfg, graph, storage, token.map(str::to_string), security)).await
+    }
+
+    async fn guard_status(base: &str, method: Method, path: &str, headers: &[(&str, &str)], body: &str) -> (StatusCode, HeaderMap) {
+        let mut req = reqwest::Client::new().request(method, format!("{base}{path}"));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let res = req.body(body.to_string()).send().await.unwrap();
+        (res.status(), res.headers().clone())
     }
 
     #[tokio::test]
-    async fn cors_restricts_unauthenticated_remote_origins_and_allows_loopback() {
-        let base_no_tok = spawn_test_server(None).await;
-        let client = reqwest::Client::new();
+    async fn guard_refuses_foreign_origin_and_host_in_keyless_mode() {
+        let router = guard_test_router(None, RouterSecurity::default()).await;
+        let read = "/conversations/chat%3Anope/read";
+        let download = "/conversations/chat%3Anope/messages/1/attachments/download";
 
-        // Remote origin must not receive Access-Control-Allow-Origin when --token is None
-        let res = client
-            .get(format!("{base_no_tok}/conversations"))
-            .header(header::ORIGIN, "https://evil.example.com")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert!(
-            res.headers()
-                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .is_none(),
-            "unexpected ACAO header for remote origin without token"
-        );
+        // The CSRF shape from NEW-1: a "simple" cross-site POST with a text/plain JSON body.
+        let (status, _) = guard_status(
+            &router,
+            Method::POST,
+            download,
+            &[("origin", "https://evil.example"), ("content-type", "text/plain")],
+            r#"{"out_dir":"C:\\Users\\Public"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
 
-        // Localhost origin IS allowed when --token is None
-        let res = client
-            .get(format!("{base_no_tok}/conversations"))
-            .header(header::ORIGIN, "http://localhost:3000")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        for origin in ["https://evil.example", "null", "http://localhost:3000"] {
+            let (status, headers) = guard_status(&router, Method::POST, read, &[("origin", origin)], "").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "origin {origin}");
+            assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        }
+        let (status, _) = guard_status(&router, Method::GET, "/health", &[("sec-fetch-site", "cross-site")], "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // No Origin (curl, agents) and the API's own origin pass the guard.
+        let (status, _) = guard_status(&router, Method::GET, "/health", &[], "").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = guard_status(&router, Method::GET, "/health", &[("origin", router.as_str())], "").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // DNS rebinding: the browser sends the attacker's host name to the loopback listener.
+        let (status, _) = guard_status(&router, Method::GET, "/health", &[("host", "evil.example:8788")], "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        for host in ["127.0.0.1:8788", "localhost:8788", "[::1]:8788"] {
+            let (status, _) = guard_status(&router, Method::GET, "/health", &[("host", host)], "").await;
+            assert_eq!(status, StatusCode::OK, "host {host}");
+        }
+
+        // A non-loopback listener (token required there) serves whatever name reaches it.
+        let lan = guard_test_router(
+            Some("secret"),
+            RouterSecurity { loopback_bind: false, cors_origins: Vec::new() },
+        )
+        .await;
+        let (status, _) = guard_status(&lan, Method::GET, "/health", &[("host", "teams.corp.example:8788")], "").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cors_is_opt_in_and_exact_even_with_a_token() {
+        // With a token and no --cors-origin there is no CORS at all (previously permissive).
+        let router = guard_test_router(Some("secret"), RouterSecurity::default()).await;
+        let bearer = ("authorization", "Bearer secret");
+        let (status, headers) = guard_status(
+            &router,
+            Method::GET,
+            "/conversations",
+            &[bearer, ("origin", "https://app.example")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        let (status, _) = guard_status(&router, Method::GET, "/conversations", &[bearer], "").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let router = guard_test_router(
+            Some("secret"),
+            RouterSecurity {
+                loopback_bind: true,
+                cors_origins: vec!["https://app.example/".to_string(), "not an origin".to_string()],
+            },
+        )
+        .await;
+        let (status, headers) = guard_status(
+            &router,
+            Method::GET,
+            "/conversations",
+            &[bearer, ("origin", "https://app.example")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            res.headers()
-                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                .and_then(|v| v.to_str().ok()),
-            Some("http://localhost:3000")
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).and_then(|v| v.to_str().ok()),
+            Some("https://app.example")
         );
+        // The allowed origin still needs the bearer token.
+        let (status, _) = guard_status(&router, Method::GET, "/conversations", &[("origin", "https://app.example")], "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        // A preflight from the allowed origin is answered by the CORS layer…
+        let (status, headers) = guard_status(
+            &router,
+            Method::OPTIONS,
+            "/conversations",
+            &[("origin", "https://app.example"), ("access-control-request-method", "GET"), ("access-control-request-headers", "authorization")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).and_then(|v| v.to_str().ok()),
+            Some("https://app.example")
+        );
+        // …and every other origin gets nothing, including sibling sub-domains and ports.
+        for origin in ["https://evil.example", "https://app.example:8443", "https://x.app.example", "http://app.example"] {
+            let (status, headers) = guard_status(&router, Method::GET, "/conversations", &[bearer, ("origin", origin)], "").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "origin {origin}");
+            assert!(headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        }
+    }
 
-        // Loopback IPv6 origin IS allowed
-        assert!(is_loopback_origin("http://[::1]:5173"));
-        assert!(!is_loopback_origin("https://localhost.evil.com"));
+    #[tokio::test]
+    async fn raw_body_routes_require_json_content_type() {
+        let router = guard_test_router(None, RouterSecurity::default()).await;
+        let download = "/conversations/chat%3Anope/messages/1/attachments/download";
+        let delete = "/conversations/chat%3Anope/messages/1";
+
+        for (method, path) in [(Method::POST, download), (Method::DELETE, delete)] {
+            let (status, _) = guard_status(&router, method.clone(), path, &[("content-type", "text/plain")], r#"{"index":0}"#).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{method} text/plain");
+            let (status, _) = guard_status(&router, method.clone(), path, &[], r#"{"index":0}"#).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{method} without a Content-Type");
+            // Accepted media type: the request now fails later, on the unknown conversation.
+            for content_type in ["application/json", "application/json; charset=utf-8", "Application/JSON"] {
+                let (status, _) = guard_status(&router, method.clone(), path, &[("content-type", content_type)], r#"{"index":0}"#).await;
+                assert_ne!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{method} {content_type}");
+                assert_ne!(status, StatusCode::FORBIDDEN);
+            }
+            // An empty body needs no Content-Type.
+            let (status, _) = guard_status(&router, method.clone(), path, &[], "  ").await;
+            assert_ne!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{method} empty body");
+        }
+    }
+
+    #[test]
+    fn keyless_out_dir_must_stay_inside_the_download_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let downloads = root.path().join("downloads");
+        std::fs::create_dir_all(downloads.join("existing")).unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_str = outside.to_string_lossy().to_string();
+        let inside_abs = downloads.join("existing").join("new-leaf");
+        let inside_abs_str = inside_abs.to_string_lossy().to_string();
+        let keyless = |raw: Option<&str>| resolve_api_out_dir(&downloads, raw, false, None);
+
+        assert_eq!(keyless(None).unwrap(), downloads);
+        assert_eq!(keyless(Some("   ")).unwrap(), downloads);
+        assert_eq!(keyless(Some("sub")).unwrap(), downloads.join("sub"));
+        assert_eq!(keyless(Some("existing/deeper/leaf")).unwrap(), downloads.join("existing/deeper/leaf"));
+        assert_eq!(keyless(Some(&inside_abs_str)).unwrap(), inside_abs);
+
+        for bad in ["../x", "sub/../../x", "existing/..", outside_str.as_str()] {
+            let err = keyless(Some(bad)).expect_err(bad);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(err.message, "out_dir must be inside the configured download directory");
+        }
+        #[cfg(windows)]
+        for bad in [r"C:\Windows", "C:foo", r"\\srv\share\x", r"\\?\C:\Windows", r"\Windows", "c:/windows/temp"] {
+            assert!(keyless(Some(bad)).is_err(), "{bad}");
+        }
+        #[cfg(windows)]
+        {
+            // Drive-letter and directory case do not matter on Windows.
+            let shouty = inside_abs_str.to_uppercase();
+            assert!(keyless(Some(&shouty)).is_ok(), "{shouty}");
+        }
+        #[cfg(unix)]
+        {
+            assert!(keyless(Some("/etc")).is_err());
+            // A symlink inside the download directory must not lead out of it.
+            std::os::unix::fs::symlink(&outside, downloads.join("escape")).unwrap();
+            assert!(keyless(Some("escape")).is_err());
+            assert!(keyless(Some("escape/deeper")).is_err());
+        }
+
+        // A download directory that does not exist yet still contains its own children.
+        let fresh = root.path().join("not-created-yet");
+        assert_eq!(
+            resolve_api_out_dir(&fresh, Some("a/b"), false, None).unwrap(),
+            fresh.join("a/b")
+        );
+        assert!(resolve_api_out_dir(&fresh, Some(&outside_str), false, None).is_err());
+
+        // A bearer token holder, or the explicit env opt-out, keeps the old behaviour.
+        assert_eq!(resolve_api_out_dir(&downloads, Some(&outside_str), true, None).unwrap(), outside);
+        assert_eq!(resolve_api_out_dir(&downloads, Some(&outside_str), false, Some("1")).unwrap(), outside);
+        assert!(resolve_api_out_dir(&downloads, Some(&outside_str), false, Some("0")).is_err());
+    }
+
+    #[tokio::test]
+    async fn keyless_download_refuses_outside_out_dir_before_any_graph_call() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.download_dir = root.path().join("downloads").to_string_lossy().to_string();
+        let auth = AuthManager::new(cfg.clone()).unwrap();
+        let graph = GraphClient::new(cfg.clone(), auth).unwrap().with_my_user_id("me-123");
+        let router = spawn_router(build_router(cfg, graph, Storage::open_in_memory().unwrap(), None)).await;
+
+        let body = json!({ "out_dir": outside.to_string_lossy() }).to_string();
+        let (status, _) = guard_status(
+            &router,
+            Method::POST,
+            "/conversations/chat%3Anope/messages/1/attachments/download",
+            &[("content-type", "application/json")],
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0, "nothing may be written outside");
     }
 
     #[tokio::test]

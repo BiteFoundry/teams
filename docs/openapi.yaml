@@ -7,9 +7,18 @@ info:
 
     Backed by Microsoft Graph v1.0, local SQLite WAL/FTS5 caching, and the
     background sync engine. Binds to `127.0.0.1:8788` by default (non-loopback
-    binds require `--token <SECRET>` or `TEAMS_ALLOW_INSECURE_SERVE=1`). When
-    started with `--token`, every endpoint except `GET /health` requires
-    `Authorization: Bearer <token>`.
+    binds always require `--token <SECRET>`).
+
+    Every endpoint except `GET /health` requires `Authorization: Bearer <token>`.
+    The token is the `--token` value, or — on a loopback bind without `--token` —
+    a random 32-byte token generated per session and printed once to stderr.
+    `--allow-keyless` (loopback only) turns bearer authentication off.
+
+    Request guard, applied to every route: on a loopback bind the `Host` header
+    must name the loopback interface (`403 host not allowed`), and a request with
+    an `Origin` header is accepted only from the API's own origin or an exact
+    `--cors-origin <ORIGIN>` value (`403 cross-origin request refused`). CORS
+    headers are sent only for `--cors-origin` origins; there is no wildcard.
 
     All errors return `{"error": "<message>"}` with an appropriate HTTP status.
 servers:
@@ -349,6 +358,11 @@ paths:
     post:
       tags: [files]
       summary: Download an attachment from a message
+      description: |
+        A JSON body must be sent with `Content-Type: application/json` (`415`
+        otherwise); an empty body needs no `Content-Type`. With `--allow-keyless`,
+        `out_dir` must stay inside the configured download directory (`400`
+        otherwise) unless `TEAMS_SERVE_ALLOW_ANY_OUT_DIR=1` is set.
       requestBody:
         required: false
         content:
@@ -370,6 +384,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
         "500":
           $ref: "#/components/responses/InternalError"
   /conversations/{key}/messages/{msg_id}/reactions:
@@ -477,6 +493,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
         "500":
           $ref: "#/components/responses/InternalError"
   /conversations/{key}/read:
@@ -662,7 +680,10 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Required when `teams serve --token <secret>` is set.
+      description: >-
+        Required on every route except `GET /health` unless the server was started
+        with `--allow-keyless`. The value is the `--token` secret or the token
+        `teams serve` generates and prints to stderr.
   parameters:
     ConversationKey:
       name: key
@@ -700,7 +721,16 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Forbidden:
-      description: Insufficient Microsoft Graph permissions or missing token scopes
+      description: >-
+        Insufficient Microsoft Graph permissions or missing token scopes; or the
+        request guard refused the `Host` header (`host not allowed`) or the
+        `Origin` (`cross-origin request refused`)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: A JSON request body was sent without `Content-Type: application/json`
       content:
         application/json:
           schema:

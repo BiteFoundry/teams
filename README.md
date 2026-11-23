@@ -124,12 +124,13 @@ For `members`, `channels`, and `teams`, passing `--cursor` reads the next page d
 
 ### Local HTTP REST API (`teams serve`)
 
-Start an Axum JSON server on `127.0.0.1:8788` (add `--token <secret>` for Bearer auth):
+Start an Axum JSON server on `127.0.0.1:8788`. Every route except `/health` needs a Bearer token: pass `--token <secret>`, or use the random one `teams serve` prints to stderr at start-up (`--allow-keyless` turns authentication off on loopback). Browser origins must be allowed one by one with `--cors-origin <ORIGIN>`; requests with a foreign `Host` or `Origin` get `403`.
 
 ```bash
-teams serve --port 8788
-curl http://127.0.0.1:8788/conversations
+teams serve --port 8788 --token "$TEAMS_API_TOKEN"
+curl http://127.0.0.1:8788/conversations -H "Authorization: Bearer $TEAMS_API_TOKEN"
 curl -X POST http://127.0.0.1:8788/conversations/Elena%20Park/messages \
+  -H "Authorization: Bearer $TEAMS_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"markdown":"Build is green — ready to ship!"}'
 ```
