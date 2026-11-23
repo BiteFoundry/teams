@@ -890,7 +890,7 @@ fn spawn_sync_supervisor(
         }
 
         if config.auto_daemon {
-            let _ = crate::daemon::ensure_daemon_started(&config).await;
+            let _ = crate::daemon::ensure_daemon_started(&config, expected_user_id.as_deref()).await;
         }
 
         if core_tx.is_closed() {

@@ -26,7 +26,9 @@ use url::Url;
 use crate::config::{credential_fallback_path, write_atomic, AppConfig};
 
 const KEYRING_SERVICE: &str = "teams-cli";
-const KEYRING_USER: &str = "default";
+/// Keyring account of the default profile. Other `TEAMS_CONFIG_DIR` profiles get their own,
+/// see [`keyring_account`].
+const KEYRING_DEFAULT_ACCOUNT: &str = "default";
 const LOGIN_CALLBACK_TIMEOUT_SECS: u64 = 300;
 #[cfg(target_os = "linux")]
 const LINUX_KEYRING_TIMEOUT: Duration = Duration::from_millis(800);
@@ -1085,8 +1087,9 @@ pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
     if should_use_keyring() {
         #[cfg(target_os = "linux")]
         {
-            if let Some(Ok(secret_json)) = run_linux_keyring_op(|| {
-                let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+            let account = keyring_account();
+            if let Some(Ok(secret_json)) = run_linux_keyring_op(move || {
+                let entry = keyring::Entry::new(KEYRING_SERVICE, &account)?;
                 entry.get_password()
             }) {
                 if !secret_json.trim().is_empty() {
@@ -1098,7 +1101,7 @@ pub fn load_stored_tokens() -> Result<Option<StoredTokens>> {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &keyring_account()) {
                 if let Ok(secret_json) = entry.get_password() {
                     if !secret_json.trim().is_empty() {
                         if let Ok(parsed) = serde_json::from_str::<StoredTokens>(&secret_json) {
@@ -1134,8 +1137,9 @@ pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let json_for_keyring = json;
+        let account = keyring_account();
         if let Some(Ok(())) = run_linux_keyring_op(move || {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+            let entry = keyring::Entry::new(KEYRING_SERVICE, &account)?;
             entry.set_password(&json_for_keyring)
         }) {
             // Mirror to fallback file for consistency across environments.
@@ -1151,7 +1155,7 @@ pub fn save_stored_tokens(tokens: &StoredTokens) -> Result<()> {
         if json.len() > WINDOWS_CRED_MAX_BYTES {
             return save_tokens_to_path(tokens, &fallback);
         }
-        match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        match keyring::Entry::new(KEYRING_SERVICE, &keyring_account()) {
             Ok(entry) => {
                 if entry.set_password(&json).is_ok() {
                     // Mirror to fallback file for consistency across environments.
@@ -1172,8 +1176,9 @@ pub fn delete_stored_tokens() -> Result<()> {
     if should_use_keyring() {
         #[cfg(target_os = "linux")]
         {
-            let _ = run_linux_keyring_op(|| {
-                let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+            let account = keyring_account();
+            let _ = run_linux_keyring_op(move || {
+                let entry = keyring::Entry::new(KEYRING_SERVICE, &account)?;
                 match entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                     Err(e) => Err(e),
@@ -1182,7 +1187,7 @@ pub fn delete_stored_tokens() -> Result<()> {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &keyring_account()) {
                 match entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => {}
                     Err(_) => {}
@@ -1252,6 +1257,38 @@ fn is_truthy_env(val: Option<&str>) -> bool {
         matches!(t.as_str(), "1" | "true" | "yes")
     })
     .unwrap_or(false)
+}
+
+/// Keyring account for the active profile. The default config directory keeps the historical
+/// `"default"` account, so existing sign-ins keep working; any other `TEAMS_CONFIG_DIR` gets an
+/// account derived from its path, so two profiles never read or overwrite each other's token.
+fn keyring_account() -> String {
+    keyring_account_for(&crate::config::config_dir(), &crate::config::default_config_dir())
+}
+
+fn keyring_account_for(config_dir: &Path, default_config_dir: &Path) -> String {
+    let dir = normalize_profile_dir(config_dir);
+    if dir == normalize_profile_dir(default_config_dir) {
+        return KEYRING_DEFAULT_ACCOUNT.to_string();
+    }
+    let digest = Sha256::digest(dir.as_bytes());
+    format!("profile-{}", &hex::encode(digest)[..16])
+}
+
+/// One spelling per directory: absolute, without trailing separators, and on Windows with
+/// backslashes and in lowercase. The directory does not need to exist.
+fn normalize_profile_dir(dir: &Path) -> String {
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    #[allow(unused_mut)]
+    let mut s = abs.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        s = s.replace('/', "\\").to_lowercase();
+    }
+    while s.len() > 1 && (s.ends_with('/') || s.ends_with('\\')) && !s.ends_with(":\\") {
+        s.pop();
+    }
+    s
 }
 
 fn keyring_disabled() -> bool {
@@ -2079,6 +2116,38 @@ struct OAuthErrorResponse {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    // TEAMS-13: each config directory has its own keyring account.
+    #[test]
+    fn regression_teams_13_keyring_account_is_per_config_dir() {
+        let root = tempdir().unwrap();
+        let default_dir = root.path().join("default-profile");
+        let work = root.path().join("work");
+        let home = root.path().join("home");
+
+        assert_eq!(keyring_account_for(&default_dir, &default_dir), "default");
+
+        let a = keyring_account_for(&work, &default_dir);
+        let b = keyring_account_for(&home, &default_dir);
+        assert!(a.starts_with("profile-") && a.len() == "profile-".len() + 16, "{a}");
+        assert_ne!(a, b);
+        assert_ne!(a, "default");
+        assert_eq!(a, keyring_account_for(&work, &default_dir), "stable across calls");
+
+        // Trailing separators do not make a new profile; the directory need not exist.
+        let mut trailing = work.to_string_lossy().into_owned();
+        trailing.push(std::path::MAIN_SEPARATOR);
+        assert_eq!(keyring_account_for(Path::new(&trailing), &default_dir), a);
+        let mut default_trailing = default_dir.to_string_lossy().into_owned();
+        default_trailing.push(std::path::MAIN_SEPARATOR);
+        assert_eq!(keyring_account_for(Path::new(&default_trailing), &default_dir), "default");
+
+        #[cfg(windows)]
+        {
+            let upper = work.to_string_lossy().to_uppercase().replace('\\', "/");
+            assert_eq!(keyring_account_for(Path::new(&upper), &default_dir), a);
+        }
+    }
 
     #[test]
     fn test_pkce_s256_rfc7636_vector() {

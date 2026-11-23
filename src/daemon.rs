@@ -756,11 +756,14 @@ fn is_daemon_alive_fast_at(paths: &DaemonPaths, expected_user_id: Option<&str>) 
             if !addr.ip().is_loopback() {
                 return false;
             }
-            if std::net::TcpStream::connect_timeout(&addr, FAST_TCP_PROBE_TIMEOUT).is_ok() {
-                true
-            } else {
-                cleanup_stale_files(paths, Some(&info));
-                false
+            match std::net::TcpStream::connect_timeout(&addr, FAST_TCP_PROBE_TIMEOUT) {
+                Ok(_) => true,
+                Err(err) => {
+                    if fast_probe_error_proves_stale(&err) {
+                        cleanup_stale_files(paths, Some(&info));
+                    }
+                    false
+                }
             }
         }
         _ => {
@@ -768,6 +771,14 @@ fn is_daemon_alive_fast_at(paths: &DaemonPaths, expected_user_id: Option<&str>) 
             false
         }
     }
+}
+
+/// Whether a failed fast TCP probe proves that nothing listens on the endpoint. Only a refused
+/// connect does: a daemon busy for longer than the 25 ms budget times out instead, and must keep
+/// its state file so the next command attaches to it rather than starting a second daemon. The
+/// slower status / stop paths remove files that really are stale.
+fn fast_probe_error_proves_stale(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::ConnectionRefused
 }
 
 /// Queries live daemon status over IPC (cleaning up stale state files if unreachable).
@@ -783,14 +794,31 @@ async fn query_daemon_status_at(paths: &DaemonPaths) -> Result<DaemonStatus> {
 }
 
 /// Ensures the background daemon process is running, spawning `<current_exe> daemon run` detached if needed.
-pub async fn ensure_daemon_started(cfg: &AppConfig) -> Result<DaemonStatus> {
-    ensure_daemon_started_at(cfg, &DaemonPaths::current()).await
+/// A daemon of another version, or one signed in as an account other than `expected_user_id`
+/// (when both are known), is stopped and replaced.
+pub async fn ensure_daemon_started(
+    cfg: &AppConfig,
+    expected_user_id: Option<&str>,
+) -> Result<DaemonStatus> {
+    ensure_daemon_started_at(cfg, &DaemonPaths::current(), expected_user_id).await
 }
 
-async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Result<DaemonStatus> {
+/// Whether a running daemon can serve this process: same version, and the same account when
+/// both sides know theirs.
+fn running_daemon_is_reusable(status: &DaemonStatus, expected_user_id: Option<&str>) -> bool {
+    status.running
+        && status.version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+        && is_user_compatible(expected_user_id, status.user_id.as_deref())
+}
+
+async fn ensure_daemon_started_at(
+    cfg: &AppConfig,
+    paths: &DaemonPaths,
+    expected_user_id: Option<&str>,
+) -> Result<DaemonStatus> {
     let status = query_daemon_status_at(paths).await?;
     if status.running {
-        if status.version.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+        if running_daemon_is_reusable(&status, expected_user_id) {
             return Ok(status);
         }
         let _ = stop_daemon_at(paths).await?;
@@ -841,6 +869,20 @@ async fn ensure_daemon_started_at(cfg: &AppConfig, paths: &DaemonPaths) -> Resul
 /// Gracefully stops the running background daemon over IPC, if running.
 pub async fn stop_daemon(_cfg: &AppConfig) -> Result<bool> {
     stop_daemon_at(&DaemonPaths::current()).await
+}
+
+/// Stops the running daemon when it is signed in as an account other than `user_id`, e.g.
+/// after `teams login` switched accounts. A daemon whose account is unknown is left alone.
+pub async fn stop_daemon_if_other_user(_cfg: &AppConfig, user_id: &str) -> Result<bool> {
+    stop_daemon_if_other_user_at(&DaemonPaths::current(), user_id).await
+}
+
+async fn stop_daemon_if_other_user_at(paths: &DaemonPaths, user_id: &str) -> Result<bool> {
+    let status = query_daemon_status_at(paths).await?;
+    if !status.running || is_user_compatible(Some(user_id), status.user_id.as_deref()) {
+        return Ok(false);
+    }
+    stop_daemon_at(paths).await
 }
 
 async fn stop_daemon_at(paths: &DaemonPaths) -> Result<bool> {
@@ -1659,9 +1701,17 @@ mod tests {
         .unwrap();
         assert!(paths.state_file.exists());
 
-        // Fast probe detects dead endpoint and cleans up daemon.json.
+        // Fast probe reports the dead endpoint. It removes daemon.json only when the connect
+        // was refused; on Windows a closed loopback port can time out within 25 ms instead, and
+        // then the status path below does the cleanup.
+        let refused = std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{dead_port}").parse().unwrap(),
+            FAST_TCP_PROBE_TIMEOUT,
+        )
+        .err()
+        .is_some_and(|e| fast_probe_error_proves_stale(&e));
         assert!(!is_daemon_alive_fast_at(&paths, Some("stale-user")));
-        assert!(!paths.state_file.exists());
+        assert_eq!(paths.state_file.exists(), !refused);
 
         // Recreate stale file and verify query_daemon_status_at also cleans it up.
         write_secret_file_atomic(
@@ -1679,6 +1729,54 @@ mod tests {
         write_secret_file_atomic(&paths.state_file, b"{corrupt json").unwrap();
         assert!(!is_daemon_alive_fast_at(&paths, None));
         assert!(!paths.state_file.exists());
+    }
+
+    // TEAMS-31: a probe that times out says "not reachable now", not "stale".
+    #[test]
+    fn regression_teams_31_only_a_refused_fast_probe_removes_the_state_file() {
+        use std::io::{Error, ErrorKind};
+        assert!(fast_probe_error_proves_stale(&Error::from(ErrorKind::ConnectionRefused)));
+        for kind in [ErrorKind::TimedOut, ErrorKind::WouldBlock, ErrorKind::Interrupted, ErrorKind::Other] {
+            assert!(!fast_probe_error_proves_stale(&Error::from(kind)), "{kind:?}");
+        }
+    }
+
+    // TEAMS-14: a daemon signed in as another account is not reused.
+    #[test]
+    fn regression_teams_14_daemon_reuse_requires_same_account() {
+        let status = |user: Option<&str>| DaemonStatus {
+            running: true,
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            user_id: user.map(str::to_string),
+            ..DaemonStatus::default()
+        };
+        assert!(running_daemon_is_reusable(&status(Some("user-1")), Some("user-1")));
+        assert!(!running_daemon_is_reusable(&status(Some("user-1")), Some("user-2")));
+        // Unknown on either side stays compatible, as before.
+        assert!(running_daemon_is_reusable(&status(Some("user-1")), None));
+        assert!(running_daemon_is_reusable(&status(None), Some("user-2")));
+        let mut old = status(Some("user-1"));
+        old.version = Some("0.0.1".to_string());
+        assert!(!running_daemon_is_reusable(&old, Some("user-1")));
+        assert!(!running_daemon_is_reusable(&DaemonStatus::default(), None));
+    }
+
+    #[tokio::test]
+    async fn regression_teams_14_login_as_other_account_stops_daemon() {
+        let mut harness = TestDaemonHarness::start(Some("user-1")).await;
+
+        // Same account: the daemon keeps running.
+        assert!(!stop_daemon_if_other_user_at(&harness.paths, "user-1").await.unwrap());
+        assert!(query_daemon_status_at(&harness.paths).await.unwrap().running);
+
+        // Another account: it is shut down and its state file is gone.
+        assert!(stop_daemon_if_other_user_at(&harness.paths, "user-2").await.unwrap());
+        harness.wait_exit().await.unwrap();
+        assert!(!harness.paths.state_file.exists());
+        assert!(!query_daemon_status_at(&harness.paths).await.unwrap().running);
+
+        // Nothing running: nothing to do.
+        assert!(!stop_daemon_if_other_user_at(&harness.paths, "user-2").await.unwrap());
     }
 
     #[tokio::test]

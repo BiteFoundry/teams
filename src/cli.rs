@@ -1321,7 +1321,9 @@ fn print_daemon_status_text(header: &str, cfg: &AppConfig, status: &crate::daemo
 async fn dispatch_daemon_command(cfg: &AppConfig, command: DaemonCommand) -> Result<()> {
     match command {
         DaemonCommand::Start { json } => {
-            let status = crate::daemon::ensure_daemon_started(cfg).await?;
+            let status =
+                crate::daemon::ensure_daemon_started(cfg, current_user_id_fast(cfg).as_deref())
+                    .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
@@ -1357,7 +1359,9 @@ async fn dispatch_daemon_command(cfg: &AppConfig, command: DaemonCommand) -> Res
         }
         DaemonCommand::Restart { json } => {
             let _ = crate::daemon::stop_daemon(cfg).await?;
-            let status = crate::daemon::ensure_daemon_started(cfg).await?;
+            let status =
+                crate::daemon::ensure_daemon_started(cfg, current_user_id_fast(cfg).as_deref())
+                    .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
@@ -1557,9 +1561,15 @@ async fn resolve_daemon_warm(cfg: &AppConfig, refresh: bool, cached: bool) -> bo
     let inferred_user_id = infer_user_id_fast_with(cfg, env_tok.as_deref(), &cred_path);
     let daemon_warm = crate::daemon::is_daemon_alive_fast(cfg, inferred_user_id.as_deref());
     if cfg.auto_daemon && !daemon_warm {
-        let _ = crate::daemon::ensure_daemon_started(cfg).await;
+        let _ = crate::daemon::ensure_daemon_started(cfg, inferred_user_id.as_deref()).await;
     }
     daemon_warm
+}
+
+/// The signed-in account as far as it can be told without the OS keyring or the network.
+fn current_user_id_fast(cfg: &AppConfig) -> Option<String> {
+    let env_tok = std::env::var("TEAMS_ACCESS_TOKEN").ok();
+    infer_user_id_fast_with(cfg, env_tok.as_deref(), &config::credential_fallback_path())
 }
 
 /// Opens local SQLite `Storage` without touching OS Keyring or initializing `reqwest::Client` TLS roots
@@ -1707,6 +1717,10 @@ async fn cmd_login(cfg: &mut AppConfig, opts: LoginOptions, json_out: bool) -> R
         .await?;
 
     let updated = auth.current_tokens().await.unwrap_or(tokens);
+    // A daemon still signed in as the previous account would keep syncing it.
+    if let Err(err) = crate::daemon::stop_daemon_if_other_user(cfg, &me.id).await {
+        eprintln!("warning: could not stop the background daemon of the previous account: {err:#}");
+    }
 
     if json_out {
         println!(
@@ -1738,6 +1752,11 @@ async fn cmd_login(cfg: &mut AppConfig, opts: LoginOptions, json_out: bool) -> R
 }
 
 async fn cmd_logout(cfg: &AppConfig, json_out: bool) -> Result<()> {
+    // The daemon holds its own copy of the tokens: stop it so it does not sync on as the
+    // account that just signed out. Logout itself never fails because of it.
+    if let Err(err) = crate::daemon::stop_daemon(cfg).await {
+        eprintln!("warning: could not stop the background daemon: {err:#}");
+    }
     let auth = AuthManager::new(cfg.clone())?;
     auth.logout().await?;
     if json_out {

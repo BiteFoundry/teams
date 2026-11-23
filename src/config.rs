@@ -205,133 +205,124 @@ pub struct AppConfig {
 }
 
 impl Default for AppConfig {
+    /// Built-in defaults with the `TEAMS_*` environment overrides applied.
     fn default() -> Self {
+        let mut cfg = Self::builtin();
+        apply_env_overrides(&mut cfg);
+        cfg
+    }
+}
+
+/// A config field that an environment variable can override for one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvField {
+    ClientId,
+    TenantId,
+    GraphBaseUrl,
+    AuthBaseUrl,
+    GithubRepo,
+    TokenFile,
+    TokenRefreshCmd,
+    TokenRefreshMins,
+    CliCacheTtlSecs,
+    AutoDaemon,
+    ImageProtocol,
+}
+
+/// Applies the `TEAMS_*` (and `AZURE_*`) overrides to `cfg` and returns the fields they set.
+/// For each field the first variable that is set wins, and a blank value is ignored.
+fn apply_env_overrides(cfg: &mut AppConfig) -> Vec<EnvField> {
+    fn text(names: &[&str]) -> Option<String> {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+    let mut applied = Vec::new();
+    if let Some(v) = text(&["TEAMS_CLIENT_ID", "AZURE_CLIENT_ID"]) {
+        cfg.client_id = v;
+        applied.push(EnvField::ClientId);
+    }
+    if let Some(v) = text(&["TEAMS_TENANT_ID", "AZURE_TENANT_ID"]) {
+        cfg.tenant_id = v;
+        applied.push(EnvField::TenantId);
+    }
+    if let Some(v) = text(&["TEAMS_GRAPH_BASE_URL"]) {
+        cfg.graph_base_url = v;
+        applied.push(EnvField::GraphBaseUrl);
+    }
+    if let Some(v) = text(&["TEAMS_AUTH_BASE_URL"]) {
+        cfg.auth_base_url = v;
+        applied.push(EnvField::AuthBaseUrl);
+    }
+    if let Some(v) = text(&["TEAMS_GITHUB_REPO"]) {
+        cfg.github_repo = v;
+        applied.push(EnvField::GithubRepo);
+    }
+    if let Some(v) = text(&["TEAMS_TOKEN_FILE"]) {
+        cfg.token_file = v;
+        applied.push(EnvField::TokenFile);
+    }
+    if let Some(v) = text(&["TEAMS_TOKEN_REFRESH_CMD"]) {
+        cfg.token_refresh_cmd = v;
+        applied.push(EnvField::TokenRefreshCmd);
+    }
+    if let Some(v) = text(&["TEAMS_TOKEN_REFRESH_MINS"]).and_then(|v| v.parse::<u64>().ok()) {
+        cfg.token_refresh_mins = v;
+        applied.push(EnvField::TokenRefreshMins);
+    }
+    if let Some(v) = text(&["TEAMS_CLI_CACHE_SECS"]).and_then(|v| v.parse::<u64>().ok()) {
+        cfg.cli_cache_ttl_secs = v;
+        applied.push(EnvField::CliCacheTtlSecs);
+    }
+    if let Some(v) = text(&["TEAMS_AUTO_DAEMON"]).and_then(|v| parse_env_bool(&v)) {
+        cfg.auto_daemon = v;
+        applied.push(EnvField::AutoDaemon);
+    }
+    if let Some(v) = text(&["TEAMS_IMAGE_PROTOCOL"]).and_then(|v| ImageProtocolPreference::parse_str(&v)) {
+        cfg.image_protocol = v;
+        applied.push(EnvField::ImageProtocol);
+    }
+    applied
+}
+
+impl AppConfig {
+    /// Defaults without any environment override.
+    fn builtin() -> Self {
         Self {
-            client_id: std::env::var("TEAMS_CLIENT_ID")
-                .or_else(|_| std::env::var("AZURE_CLIENT_ID"))
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_PUBLIC_CLIENT_ID.to_string()),
-            tenant_id: std::env::var("TEAMS_TENANT_ID")
-                .or_else(|_| std::env::var("AZURE_TENANT_ID"))
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_TENANT_ID.to_string()),
+            client_id: DEFAULT_PUBLIC_CLIENT_ID.to_string(),
+            tenant_id: DEFAULT_TENANT_ID.to_string(),
             scopes: Vec::new(),
-            graph_base_url: std::env::var("TEAMS_GRAPH_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_GRAPH_BASE_URL.to_string()),
-            auth_base_url: std::env::var("TEAMS_AUTH_BASE_URL")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_AUTH_BASE_URL.to_string()),
-            github_repo: std::env::var("TEAMS_GITHUB_REPO")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
+            graph_base_url: DEFAULT_GRAPH_BASE_URL.to_string(),
+            auth_base_url: DEFAULT_AUTH_BASE_URL.to_string(),
+            github_repo: DEFAULT_GITHUB_REPO.to_string(),
             notify: true,
             show_nav_rail: true,
             auto_thread_pane: true,
             inline_images: true,
-            image_protocol: std::env::var("TEAMS_IMAGE_PROTOCOL")
-                .ok()
-                .and_then(|s| ImageProtocolPreference::parse_str(&s))
-                .unwrap_or_default(),
+            image_protocol: ImageProtocolPreference::default(),
             download_dir: String::new(),
             active_poll_ms: 2_500,
             chat_poll_ms: 8_000,
             channel_poll_ms: 30_000,
-            token_file: std::env::var("TEAMS_TOKEN_FILE")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default(),
-            token_refresh_cmd: std::env::var("TEAMS_TOKEN_REFRESH_CMD")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_default(),
-            token_refresh_mins: std::env::var("TEAMS_TOKEN_REFRESH_MINS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(5),
-            cli_cache_ttl_secs: std::env::var("TEAMS_CLI_CACHE_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0),
-            auto_daemon: std::env::var("TEAMS_AUTO_DAEMON")
-                .ok()
-                .and_then(|s| parse_env_bool(&s))
-                .unwrap_or(false),
+            token_file: String::new(),
+            token_refresh_cmd: String::new(),
+            token_refresh_mins: 5,
+            cli_cache_ttl_secs: 0,
+            auto_daemon: false,
             density: DensityMode::default(),
             theme: ThemePreset::default(),
             pinned_convs: Vec::new(),
         }
     }
-}
 
-impl AppConfig {
     pub fn load() -> Self {
         let Ok(mut cfg) = Self::load_from(&config_file_path()) else {
             return Self::default();
         };
         // Environment variables take precedence over file values when set.
-        if let Ok(cid) = std::env::var("TEAMS_CLIENT_ID").or_else(|_| std::env::var("AZURE_CLIENT_ID")) {
-            if !cid.trim().is_empty() {
-                cfg.client_id = cid.trim().to_string();
-            }
-        }
-        if let Ok(tid) = std::env::var("TEAMS_TENANT_ID").or_else(|_| std::env::var("AZURE_TENANT_ID")) {
-            if !tid.trim().is_empty() {
-                cfg.tenant_id = tid.trim().to_string();
-            }
-        }
-        if let Ok(gurl) = std::env::var("TEAMS_GRAPH_BASE_URL") {
-            if !gurl.trim().is_empty() {
-                cfg.graph_base_url = gurl.trim().to_string();
-            }
-        }
-        if let Ok(aurl) = std::env::var("TEAMS_AUTH_BASE_URL") {
-            if !aurl.trim().is_empty() {
-                cfg.auth_base_url = aurl.trim().to_string();
-            }
-        }
-        if let Ok(repo) = std::env::var("TEAMS_GITHUB_REPO") {
-            if !repo.trim().is_empty() {
-                cfg.github_repo = repo.trim().to_string();
-            }
-        }
-        if let Ok(tf) = std::env::var("TEAMS_TOKEN_FILE") {
-            if !tf.trim().is_empty() {
-                cfg.token_file = tf.trim().to_string();
-            }
-        }
-        if let Ok(rcmd) = std::env::var("TEAMS_TOKEN_REFRESH_CMD") {
-            if !rcmd.trim().is_empty() {
-                cfg.token_refresh_cmd = rcmd.trim().to_string();
-            }
-        }
-        if let Ok(rmins) = std::env::var("TEAMS_TOKEN_REFRESH_MINS") {
-            if let Ok(parsed) = rmins.trim().parse::<u64>() {
-                cfg.token_refresh_mins = parsed;
-            }
-        }
-        if let Ok(ttl) = std::env::var("TEAMS_CLI_CACHE_SECS") {
-            if let Ok(parsed) = ttl.trim().parse::<u64>() {
-                cfg.cli_cache_ttl_secs = parsed;
-            }
-        }
-        if let Ok(ad) = std::env::var("TEAMS_AUTO_DAEMON") {
-            if let Some(parsed) = parse_env_bool(&ad) {
-                cfg.auto_daemon = parsed;
-            }
-        }
-        if let Ok(proto) = std::env::var("TEAMS_IMAGE_PROTOCOL") {
-            if !proto.trim().is_empty() {
-                if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
-                    cfg.image_protocol = parsed;
-                }
-            }
-        }
+        apply_env_overrides(&mut cfg);
         cfg
     }
 
@@ -342,14 +333,62 @@ impl AppConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
+    /// Writes the config file. Values that only come from a `TEAMS_*` variable of this process
+    /// are not made permanent: see [`AppConfig::persistable`].
     pub fn save(&self) -> Result<()> {
-        self.save_to(&config_file_path())
+        let path = config_file_path();
+        self.persistable(&path).save_to(&path)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         ensure_parent(path)?;
         let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
         write_atomic(path, raw.as_bytes())
+    }
+
+    /// The config as it should be written to `path`. A field whose value is still the one an
+    /// environment variable supplied keeps what the file holds (the built-in default when the
+    /// file has no value for it); a field changed in this process (`login --tenant-id`, say)
+    /// is written. Without overrides this is `self` unchanged.
+    fn persistable(&self, path: &Path) -> Self {
+        let mut from_env = Self::builtin();
+        let overridden = apply_env_overrides(&mut from_env);
+        if overridden.is_empty() {
+            return self.clone();
+        }
+        let raw = fs::read_to_string(path).ok();
+        let file_keys = raw.as_deref().and_then(|r| r.parse::<toml::Table>().ok());
+        let on_disk = raw.as_deref().and_then(|r| toml::from_str::<Self>(r).ok());
+        let builtin = Self::builtin();
+        let mut out = self.clone();
+        macro_rules! keep_file_value {
+            ($field:ident) => {
+                if out.$field == from_env.$field {
+                    out.$field = match (&on_disk, &file_keys) {
+                        (Some(disk), Some(keys)) if keys.contains_key(stringify!($field)) => {
+                            disk.$field.clone()
+                        }
+                        _ => builtin.$field.clone(),
+                    };
+                }
+            };
+        }
+        for field in overridden {
+            match field {
+                EnvField::ClientId => keep_file_value!(client_id),
+                EnvField::TenantId => keep_file_value!(tenant_id),
+                EnvField::GraphBaseUrl => keep_file_value!(graph_base_url),
+                EnvField::AuthBaseUrl => keep_file_value!(auth_base_url),
+                EnvField::GithubRepo => keep_file_value!(github_repo),
+                EnvField::TokenFile => keep_file_value!(token_file),
+                EnvField::TokenRefreshCmd => keep_file_value!(token_refresh_cmd),
+                EnvField::TokenRefreshMins => keep_file_value!(token_refresh_mins),
+                EnvField::CliCacheTtlSecs => keep_file_value!(cli_cache_ttl_secs),
+                EnvField::AutoDaemon => keep_file_value!(auto_daemon),
+                EnvField::ImageProtocol => keep_file_value!(image_protocol),
+            }
+        }
+        out
     }
 
     pub fn effective_scopes(&self) -> Vec<String> {
@@ -394,6 +433,11 @@ pub fn config_dir() -> PathBuf {
             return PathBuf::from(override_dir.trim());
         }
     }
+    default_config_dir()
+}
+
+/// The config directory used when `TEAMS_CONFIG_DIR` is not set.
+pub fn default_config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_DIR_NAME)
@@ -624,6 +668,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every variable `apply_env_overrides` reads, so a test starts from a known environment.
+    const OVERRIDE_VARS: [&str; 13] = [
+        "TEAMS_CLIENT_ID",
+        "AZURE_CLIENT_ID",
+        "TEAMS_TENANT_ID",
+        "AZURE_TENANT_ID",
+        "TEAMS_GRAPH_BASE_URL",
+        "TEAMS_AUTH_BASE_URL",
+        "TEAMS_GITHUB_REPO",
+        "TEAMS_TOKEN_FILE",
+        "TEAMS_TOKEN_REFRESH_CMD",
+        "TEAMS_TOKEN_REFRESH_MINS",
+        "TEAMS_CLI_CACHE_SECS",
+        "TEAMS_AUTO_DAEMON",
+        "TEAMS_IMAGE_PROTOCOL",
+    ];
+
+    fn env_for(config_dir: &Path, set: &[(&'static str, &'static str)]) -> EnvVarGuard {
+        let dir: &'static str = Box::leak(config_dir.to_string_lossy().into_owned().into_boxed_str());
+        let mut vars: Vec<(&'static str, Option<&str>)> = OVERRIDE_VARS.iter().map(|k| (*k, None)).collect();
+        vars.push(("TEAMS_CONFIG_DIR", Some(dir)));
+        for &(k, v) in set {
+            vars.retain(|(name, _)| *name != k);
+            vars.push((k, Some(v)));
+        }
+        EnvVarGuard::set(&vars)
+    }
+
+    // TEAMS-15: a one-off TEAMS_* override is not written to config.toml.
+    #[test]
+    fn regression_teams_15_env_override_is_not_persisted() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut on_disk = AppConfig::builtin();
+        on_disk.graph_base_url = "https://graph.file.example/v1.0".to_string();
+        on_disk.token_refresh_mins = 9;
+        on_disk.save_to(&path).unwrap();
+
+        {
+            let _env = env_for(
+                dir.path(),
+                &[
+                    ("TEAMS_GRAPH_BASE_URL", "http://127.0.0.1:9/v1.0"),
+                    ("TEAMS_TOKEN_REFRESH_MINS", "1"),
+                    ("TEAMS_AUTO_DAEMON", "1"),
+                ],
+            );
+            let mut cfg = AppConfig::load();
+            assert_eq!(cfg.graph_base_url, "http://127.0.0.1:9/v1.0");
+            assert_eq!(cfg.token_refresh_mins, 1);
+            assert!(cfg.auto_daemon);
+            cfg.density = DensityMode::Compact; // e.g. a TUI toggle
+            cfg.save().unwrap();
+        }
+
+        let saved = AppConfig::load_from(&path).unwrap();
+        assert_eq!(saved.graph_base_url, "https://graph.file.example/v1.0");
+        assert_eq!(saved.token_refresh_mins, 9);
+        assert!(!saved.auto_daemon, "absent from the file: built-in default");
+        assert_eq!(saved.density, DensityMode::Compact);
+    }
+
+    #[test]
+    fn regression_teams_15_explicit_change_is_persisted_despite_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        AppConfig::builtin().save_to(&path).unwrap();
+        {
+            let _env = env_for(dir.path(), &[("TEAMS_TENANT_ID", "tenant-from-env")]);
+            let mut cfg = AppConfig::load();
+            assert_eq!(cfg.tenant_id, "tenant-from-env");
+            cfg.tenant_id = "tenant-from-login".to_string(); // `login --tenant-id`
+            cfg.save().unwrap();
+        }
+        assert_eq!(AppConfig::load_from(&path).unwrap().tenant_id, "tenant-from-login");
+    }
+
+    #[test]
+    fn regression_teams_15_save_is_unchanged_without_env_and_defaults_without_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // No overrides: what is saved is exactly the struct.
+        {
+            let _env = env_for(dir.path(), &[]);
+            let mut cfg = AppConfig::builtin();
+            cfg.graph_base_url = "https://graph.custom.example/v1.0".to_string();
+            cfg.auto_daemon = true;
+            assert_eq!(cfg.persistable(&path), cfg);
+            cfg.save().unwrap();
+            let expected = toml::to_string_pretty(&cfg).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        }
+
+        // No file yet, override set: the built-in default is written, not the override.
+        fs::remove_file(&path).unwrap();
+        {
+            let _env = env_for(dir.path(), &[("TEAMS_GRAPH_BASE_URL", "http://127.0.0.1:9/v1.0")]);
+            let cfg = AppConfig::load();
+            assert_eq!(cfg.graph_base_url, "http://127.0.0.1:9/v1.0");
+            cfg.save().unwrap();
+        }
+        assert_eq!(AppConfig::load_from(&path).unwrap().graph_base_url, DEFAULT_GRAPH_BASE_URL);
     }
 
     #[test]
