@@ -120,6 +120,12 @@ struct MockState {
     share_contents: RwLock<HashMap<String, Vec<u8>>>,
     posted_chat_payloads: RwLock<Vec<Value>>,
     posted_reply_payloads: RwLock<Vec<Value>>,
+    /// Raw query strings of every small-file `PUT …:/content` upload, in arrival order.
+    upload_queries: RwLock<Vec<String>>,
+    /// Per-test switch: emulate Graph `conflictBehavior=rename` (a second PUT of a name
+    /// creates a new driveItem). Off by default so existing tests see identical responses.
+    emulate_upload_rename: RwLock<bool>,
+    upload_name_counts: RwLock<HashMap<String, usize>>,
 }
 
 fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
@@ -160,6 +166,28 @@ impl MockState {
     fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Response> {
         let expected = self.expected_token.read().unwrap().clone();
         check_bearer_header(headers, &expected)
+    }
+
+    /// Records the upload query and, when rename emulation is on and the request asked for
+    /// it, returns `(item ordinal, stored name)` the way Graph renames a conflicting upload.
+    fn record_small_upload(&self, scope: &str, file_name: &str, query: Option<String>) -> (usize, String) {
+        let query = query.unwrap_or_default();
+        let wants_rename = query.contains("@microsoft.graph.conflictBehavior=rename");
+        self.upload_queries.write().unwrap().push(query);
+        if !*self.emulate_upload_rename.read().unwrap() || !wants_rename {
+            return (1, file_name.to_string());
+        }
+        let mut counts = self.upload_name_counts.write().unwrap();
+        let seen = counts.entry(format!("{scope}/{file_name}")).or_insert(0);
+        *seen += 1;
+        if *seen == 1 {
+            return (1, file_name.to_string());
+        }
+        let renamed = match file_name.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem} {}.{ext}", *seen - 1),
+            None => format!("{file_name} {}", *seen - 1),
+        };
+        (*seen, renamed)
     }
 }
 
@@ -627,6 +655,7 @@ async fn chat_drive_upload_handler(
     State(state): State<Arc<MockState>>,
     headers: HeaderMap,
     Path(rest): Path<String>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
     if let Err(resp) = state.check_bearer(&headers) {
@@ -638,7 +667,8 @@ async fn chat_drive_upload_handler(
         .next()
         .unwrap_or("uploaded.bin")
         .to_string();
-    let item_id = "drive-item-chat-1".to_string();
+    let (ordinal, file_name) = state.record_small_upload("chat", &file_name, query);
+    let item_id = format!("drive-item-chat-{ordinal}");
     let share_url = format!("https://contoso.sharepoint.com/personal/tester/Documents/Microsoft%20Teams%20Chat%20Files/{file_name}");
 
     state
@@ -709,6 +739,7 @@ async fn sp_drive_upload_handler(
     State(state): State<Arc<MockState>>,
     headers: HeaderMap,
     Path((drive_id, rest)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
     if let Err(resp) = state.check_bearer(&headers) {
@@ -720,7 +751,8 @@ async fn sp_drive_upload_handler(
         .next()
         .unwrap_or("channel_file.bin")
         .to_string();
-    let item_id = format!("sp-item-{drive_id}-1");
+    let (ordinal, file_name) = state.record_small_upload(&drive_id, &file_name, query);
+    let item_id = format!("sp-item-{drive_id}-{ordinal}");
     let web_url = format!("https://contoso.sharepoint.com/sites/dev/Shared%20Documents/{file_name}");
 
     state
@@ -7736,6 +7768,137 @@ async fn regression_teams_bug_20_compact_default_and_full() {
     )
     .unwrap();
     assert!(msf_json["message"].get("body_html").is_some(), "{msf_json}");
+
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------------------
+// v0.9.1 regression tests
+// ---------------------------------------------------------------------------------------
+
+/// Serves `app` on an ephemeral loopback port and returns `http://127.0.0.1:PORT`.
+async fn spawn_test_router(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test router");
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn regression_teams_28_small_upload_renames_on_conflict() {
+    ensure_isolated_env();
+    let (base_url, state) = spawn_mock_graph_server("tok-28").await;
+    *state.emulate_upload_rename.write().unwrap() = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (_cfg, graph) = build_direct_graph_client(&base_url, dir.path(), "tok-28");
+
+    let local = dir.path().join("report.pdf");
+    let chat = ConversationTarget::Chat { chat_id: "19:chat-28@thread.v2".to_string() };
+    let channel = ConversationTarget::Channel {
+        team_id: "team-dev".to_string(),
+        channel_id: "19:deploy@thread.tacv2".to_string(),
+    };
+
+    for (target, first_id) in [(&chat, "drive-item-chat-1"), (&channel, "sp-item-drive-sp-dev-1")] {
+        std::fs::write(&local, b"first version").unwrap();
+        let first = graph.upload_reference_file(target, &local).await.unwrap();
+        std::fs::write(&local, b"second, different version").unwrap();
+        let second = graph.upload_reference_file(target, &local).await.unwrap();
+
+        assert_eq!(first.drive_item_id.as_deref(), Some(first_id));
+        assert_ne!(first.drive_item_id, second.drive_item_id, "second upload must be a new driveItem");
+        assert_eq!(first.name, "report.pdf");
+        assert_eq!(second.name, "report 1.pdf", "attachment name follows Graph's rename");
+        // The earlier item is untouched by the second upload.
+        assert_eq!(
+            state.uploaded_files.read().unwrap().get(first_id).map(Vec::as_slice),
+            Some(&b"first version"[..])
+        );
+    }
+
+    let queries = state.upload_queries.read().unwrap().clone();
+    assert_eq!(queries.len(), 4);
+    for q in &queries {
+        assert_eq!(q, "@microsoft.graph.conflictBehavior=rename", "PUT must carry the literal conflict query");
+    }
+}
+
+#[tokio::test]
+async fn regression_teams_28_post_not_retried_on_gateway_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    ensure_isolated_env();
+
+    let gateway_posts = Arc::new(AtomicUsize::new(0));
+    let throttled_posts = Arc::new(AtomicUsize::new(0));
+    let flaky_gets = Arc::new(AtomicUsize::new(0));
+    let (gp, tp, fg) = (gateway_posts.clone(), throttled_posts.clone(), flaky_gets.clone());
+
+    let app = Router::new()
+        .route(
+            "/v1.0/chats/gateway/messages",
+            post(move || {
+                let calls = gp.clone();
+                async move {
+                    // The first attempt "times out at the gateway" after Graph may have applied it.
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error": {"code": "GatewayTimeout", "message": "upstream timeout"}})))
+                    } else {
+                        (StatusCode::CREATED, Json(json!({"id": "duplicate"})))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1.0/chats/throttled/messages",
+            post(move || {
+                let calls = tp.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::TOO_MANY_REQUESTS, [("Retry-After", "1")], Json(json!({"error": {"code": "TooManyRequests"}})))
+                    } else {
+                        (StatusCode::CREATED, [("Retry-After", "0")], Json(json!({"id": "sent-after-throttle"})))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1.0/flaky-read",
+            get(move || {
+                let calls = fg.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::BAD_GATEWAY, [("Retry-After", "1")], Json(json!({"error": {"code": "BadGateway"}})))
+                    } else {
+                        (StatusCode::OK, [("Retry-After", "0")], Json(json!({"ok": true})))
+                    }
+                }
+            }),
+        );
+    let (base_url, server) = spawn_test_router(app).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_cfg, graph) = build_direct_graph_client(&base_url, dir.path(), "tok");
+    let body = json!({"body": {"contentType": "html", "content": "<p>hi</p>"}});
+
+    // 504 on a write surfaces as an error after exactly one attempt.
+    let err = graph
+        .post_json::<_, Value>("/chats/gateway/messages", &body)
+        .await
+        .expect_err("a 504 on POST must not be replayed");
+    assert_eq!(gateway_posts.load(Ordering::SeqCst), 1);
+    let msg = err.to_string();
+    assert!(msg.contains("): 504"), "status stays parseable: {msg}");
+
+    // 429 is a pre-processing rejection: still retried.
+    let sent: Value = graph.post_json("/chats/throttled/messages", &body).await.unwrap();
+    assert_eq!(sent["id"], "sent-after-throttle");
+    assert_eq!(throttled_posts.load(Ordering::SeqCst), 2);
+
+    // Reads keep the gateway retry.
+    let read: Value = graph.get_json("/flaky-read").await.unwrap();
+    assert_eq!(read["ok"], true);
+    assert_eq!(flaky_gets.load(Ordering::SeqCst), 2);
 
     server.abort();
 }

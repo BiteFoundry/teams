@@ -67,6 +67,29 @@ pub(crate) struct GraphDeltaPage<T> {
     pub delta_link: Option<String>,
 }
 
+/// Whether a request may be replayed after a gateway failure.
+///
+/// `502`/`504` mean an intermediary gave up, not that Graph rejected the request, so a
+/// non-idempotent write may already have been applied; replaying it could post twice.
+/// `429`/`503` are throttling responses issued before processing and are always safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryClass {
+    /// GET / PUT / PATCH / DELETE and read-only `$batch`: retry 429, 502, 503 and 504.
+    Idempotent,
+    /// Plain POST writes (send, reply, create chat, createLink…): retry 429 and 503 only.
+    NonIdempotent,
+}
+
+impl RetryClass {
+    fn retries_status(self, status: StatusCode) -> bool {
+        match status {
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => true,
+            StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => self == RetryClass::Idempotent,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum RequestBody {
     Empty,
@@ -151,6 +174,7 @@ impl GraphClient {
                 &[],
                 true,
                 STANDARD_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
@@ -173,6 +197,7 @@ impl GraphClient {
                 &[],
                 true,
                 STANDARD_REQUEST_TIMEOUT,
+                RetryClass::NonIdempotent,
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
@@ -194,6 +219,7 @@ impl GraphClient {
             &[],
             true,
             STANDARD_REQUEST_TIMEOUT,
+            RetryClass::NonIdempotent,
         )
         .await?;
         Ok(())
@@ -223,6 +249,7 @@ impl GraphClient {
             headers,
             true,
             STANDARD_REQUEST_TIMEOUT,
+            RetryClass::Idempotent,
         )
         .await
     }
@@ -236,6 +263,7 @@ impl GraphClient {
             &[],
             true,
             STANDARD_REQUEST_TIMEOUT,
+            RetryClass::NonIdempotent,
         )
         .await?;
         Ok(())
@@ -250,6 +278,7 @@ impl GraphClient {
             &[],
             true,
             STANDARD_REQUEST_TIMEOUT,
+            RetryClass::Idempotent,
         )
         .await?;
         Ok(())
@@ -273,6 +302,7 @@ impl GraphClient {
                 &[],
                 true,
                 MEDIA_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
         let resp_bytes = resp.bytes().await.context("Failed to read Graph PUT response body")?;
@@ -307,6 +337,7 @@ impl GraphClient {
                 &headers,
                 false,
                 MEDIA_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
         let status = resp.status();
@@ -329,6 +360,7 @@ impl GraphClient {
                 &[],
                 true,
                 MEDIA_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph binary response")?;
@@ -350,6 +382,7 @@ impl GraphClient {
                 &[],
                 use_bearer,
                 MEDIA_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
         if let Some(len) = resp.content_length() {
@@ -389,6 +422,7 @@ impl GraphClient {
                 &[],
                 use_bearer,
                 MEDIA_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
 
@@ -434,6 +468,7 @@ impl GraphClient {
                 &[],
                 true,
                 STANDARD_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
             )
             .await?;
         resp.text().await.context("Failed to read Graph text response")
@@ -457,6 +492,7 @@ impl GraphClient {
                 &[],
                 true,
                 STANDARD_REQUEST_TIMEOUT,
+                RetryClass::NonIdempotent,
             )
             .await?;
         let resp_bytes = resp.bytes().await.context("Failed to read Graph POST response body")?;
@@ -481,6 +517,7 @@ impl GraphClient {
             &[],
             true,
             STANDARD_REQUEST_TIMEOUT,
+            RetryClass::Idempotent,
         )
         .await?;
         Ok(())
@@ -491,10 +528,30 @@ impl GraphClient {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        // Every sub-request issued today is a GET, which is what makes replaying the whole
+        // `$batch` POST after a 502/504 safe. A write sub-request must not ride on this path.
+        debug_assert!(
+            requests.iter().all(|r| r.method.eq_ignore_ascii_case("GET")),
+            "$batch is retried as idempotent; only GET sub-requests are allowed"
+        );
+        let url = self.resolve_url("/$batch");
         let mut all = Vec::with_capacity(requests.len());
         for chunk in requests.chunks(MAX_BATCH_SIZE) {
             let payload = serde_json::json!({ "requests": chunk });
-            let env: BatchResponseEnvelope = self.post_json("/$batch", &payload).await?;
+            let resp = self
+                .execute_with_retry(
+                    Method::POST,
+                    &url,
+                    RequestBody::Json(payload),
+                    &[],
+                    true,
+                    STANDARD_REQUEST_TIMEOUT,
+                    RetryClass::Idempotent,
+                )
+                .await?;
+            let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
+            let env: BatchResponseEnvelope = serde_json::from_slice(&bytes)
+                .with_context(|| format!("Failed to deserialize Graph JSON ({url})"))?;
             all.extend(env.responses);
         }
         Ok(all)
@@ -508,6 +565,7 @@ impl GraphClient {
         extra_headers: &[(&str, String)],
         use_bearer: bool,
         timeout: Duration,
+        retry: RetryClass,
     ) -> Result<reqwest::Response> {
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
@@ -571,14 +629,7 @@ impl GraphClient {
                 }
             }
 
-            if matches!(
-                status,
-                StatusCode::TOO_MANY_REQUESTS
-                    | StatusCode::SERVICE_UNAVAILABLE
-                    | StatusCode::BAD_GATEWAY
-                    | StatusCode::GATEWAY_TIMEOUT
-            ) && throttle_attempt < MAX_THROTTLE_RETRIES
-            {
+            if retry.retries_status(status) && throttle_attempt < MAX_THROTTLE_RETRIES {
                 let delay_secs = parse_retry_after_secs(resp.headers(), throttle_attempt);
                 throttle_attempt += 1;
                 let jitter_ms: u64 = rand::thread_rng().gen_range(0..=250);
@@ -1390,6 +1441,22 @@ mod tests {
         let batch_resps = client.batch(&sub_reqs).await.unwrap();
         assert_eq!(batch_resps.len(), 25);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_retry_class_never_replays_writes_after_gateway_errors() {
+        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(RetryClass::Idempotent.retries_status(status));
+            assert!(RetryClass::NonIdempotent.retries_status(status));
+        }
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::GATEWAY_TIMEOUT] {
+            assert!(RetryClass::Idempotent.retries_status(status));
+            assert!(!RetryClass::NonIdempotent.retries_status(status));
+        }
+        for status in [StatusCode::INTERNAL_SERVER_ERROR, StatusCode::NOT_FOUND] {
+            assert!(!RetryClass::Idempotent.retries_status(status));
+            assert!(!RetryClass::NonIdempotent.retries_status(status));
+        }
     }
 
     #[test]

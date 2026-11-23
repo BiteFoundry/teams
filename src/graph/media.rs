@@ -89,9 +89,7 @@ impl GraphClient {
 
         match target {
             ConversationTarget::Chat { .. } => {
-                let content_path = format!(
-                    "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/{encoded_name}:/content"
-                );
+                let content_path = chat_upload_content_path(&file_name);
                 let session_path = format!(
                     "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/{encoded_name}:/createUploadSession"
                 );
@@ -147,11 +145,7 @@ impl GraphClient {
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| anyhow!("Missing driveId on channel filesFolder."))?;
 
-                let content_path = format!(
-                    "/drives/{}/items/{}:/{encoded_name}:/content",
-                    urlencoding::encode(&drive_id),
-                    urlencoding::encode(&folder.id)
-                );
+                let content_path = channel_upload_content_path(&drive_id, &folder.id, &file_name);
                 let session_path = format!(
                     "/drives/{}/items/{}:/{encoded_name}:/createUploadSession",
                     urlencoding::encode(&drive_id),
@@ -402,6 +396,31 @@ impl GraphClient {
         };
         Ok((raw_name, attachment.content_type.clone(), bytes))
     }
+}
+
+/// Query appended to small-file `PUT …:/content` uploads so a second upload of the same
+/// name creates a new driveItem instead of silently replacing the earlier file (the
+/// large-file upload session already sends `"rename"` in its body).
+const UPLOAD_CONFLICT_QUERY: &str = "?@microsoft.graph.conflictBehavior=rename";
+
+pub(crate) fn chat_upload_content_path(file_name: &str) -> String {
+    format!(
+        "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/{}:/content{UPLOAD_CONFLICT_QUERY}",
+        urlencoding::encode(file_name)
+    )
+}
+
+pub(crate) fn channel_upload_content_path(
+    drive_id: &str,
+    folder_id: &str,
+    file_name: &str,
+) -> String {
+    format!(
+        "/drives/{}/items/{}:/{}:/content{UPLOAD_CONFLICT_QUERY}",
+        urlencoding::encode(drive_id),
+        urlencoding::encode(folder_id),
+        urlencoding::encode(file_name)
+    )
 }
 
 pub(crate) fn should_send_bearer(graph_base_url: &str, target_url: &str) -> bool {
@@ -738,6 +757,29 @@ mod tests {
 
         let third = deduplicate_dest_path(dir.path(), "report.pdf");
         assert_eq!(third.file_name().unwrap(), "report (2).pdf");
+    }
+
+    #[test]
+    fn test_small_upload_content_paths_request_rename_on_conflict() {
+        const SUFFIX: &str = ":/content?@microsoft.graph.conflictBehavior=rename";
+        for name in ["report.pdf", "Q3 report #2.pdf", "보고서 최종.pdf"] {
+            let chat = chat_upload_content_path(name);
+            assert!(chat.ends_with(SUFFIX), "chat path: {chat}");
+            assert!(chat.starts_with("/me/drive/root:/Microsoft%20Teams%20Chat%20Files/"));
+            let channel = channel_upload_content_path("b!drive", "folder-1", name);
+            assert!(channel.ends_with(SUFFIX), "channel path: {channel}");
+            assert!(channel.starts_with("/drives/b%21drive/items/folder-1:/"));
+            // The file name itself never leaks a raw '#', '?' or space into the path.
+            for path in [&chat, &channel] {
+                let before_query = path.split('?').next().unwrap();
+                assert!(!before_query.contains('#') && !before_query.contains(' '));
+                assert_eq!(path.matches('?').count(), 1);
+            }
+        }
+        assert_eq!(
+            chat_upload_content_path("a b.txt"),
+            "/me/drive/root:/Microsoft%20Teams%20Chat%20Files/a%20b.txt:/content?@microsoft.graph.conflictBehavior=rename"
+        );
     }
 
     #[test]
