@@ -1035,10 +1035,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     app.select_conversation(ui, target);
                     if let Some(root) = hit.parent_msg_id {
                         app.open_thread_by_id(ui, root);
-                    } else if let Some(idx) =
-                        app.messages.iter().position(|m| m.msg_id == hit.msg_id)
-                    {
-                        ui.chat_scroll.selected_idx = Some(idx);
+                    } else {
+                        app.reveal_message(ui, &hit.msg_id, &hit.created_at);
                     }
                 }
             }
@@ -2606,6 +2604,102 @@ mod tests {
         let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
         let ui = UiState::from_config(&cfg);
         (app, ui)
+    }
+
+    // TEAMS-25: a search hit that is cached but older than the 80-row window.
+    #[tokio::test]
+    async fn regression_teams_25_jump_to_search_hit_outside_window() {
+        let (mut app, mut ui) = test_app_and_ui();
+        let base = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z").unwrap();
+        let ts = |i: usize| {
+            (base + chrono::Duration::minutes(i as i64))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let id = |i: usize| format!("m{i:04}");
+        let seed = |app: &AppState, conv: &str, count: usize| {
+            let msgs: Vec<crate::models::MessageItem> = (0..count)
+                .map(|i| crate::models::MessageItem {
+                    msg_key: crate::models::MessageItem::make_msg_key(conv, &id(i)),
+                    conv_key: conv.to_string(),
+                    msg_id: id(i),
+                    parent_msg_id: None,
+                    reply_to_id: None,
+                    reply_to_author: None,
+                    reply_to_preview: None,
+                    subject: None,
+                    author_id: Some("u2".to_string()),
+                    author_name: "Alice".to_string(),
+                    is_me: false,
+                    created_at: ts(i),
+                    last_modified_at: None,
+                    deleted: false,
+                    importance: "normal".to_string(),
+                    message_type: "message".to_string(),
+                    body_html: "<p>body</p>".to_string(),
+                    body_plain: "body".to_string(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    reactions: Vec::new(),
+                    reply_count: 0,
+                    web_url: None,
+                })
+                .collect();
+            app.storage.upsert_messages(&msgs).unwrap();
+        };
+        let hit = |conv: &str, msg_id: String, created_at: String| crate::models::SearchHit {
+            conv_key: conv.to_string(),
+            conv_title: "Chat".to_string(),
+            kind: crate::models::ConversationKind::OneOnOne,
+            msg_id,
+            parent_msg_id: None,
+            author_name: "Alice".to_string(),
+            created_at,
+            snippet: "body".to_string(),
+        };
+        seed(&app, "chat:c1", 300);
+        seed(&app, "chat:deep", 700);
+        app.search_results = vec![
+            hit("chat:c1", id(290), ts(290)),
+            hit("chat:c1", id(10), ts(10)),
+            hit("chat:deep", id(5), ts(5)),
+            hit("chat:deep", "not-cached".to_string(), ts(3)),
+        ];
+
+        // In-window hit: selected in place, window untouched.
+        dispatch(Action::JumpToSearchHit(0), &mut app, &mut ui);
+        assert_eq!(app.messages.len(), 80);
+        assert_eq!(ui.chat_scroll.selected_idx, Some(70));
+        assert!(ui.pending_reveal_selection);
+
+        // Out-of-window hit: the cached span down to the hit is loaded and the hit selected.
+        dispatch(Action::JumpToSearchHit(1), &mut app, &mut ui);
+        assert_eq!(app.messages.len(), 290);
+        assert_eq!(app.messages[0].msg_id, id(10));
+        assert_eq!(ui.chat_scroll.selected_idx, Some(0));
+        assert!(app.messages.windows(2).all(|w| w[0].created_at < w[1].created_at));
+        assert!(ui.pending_reveal_selection);
+
+        // Beyond the span cap: nothing is loaded, the user is told what to do.
+        ui.toasts.clear();
+        dispatch(Action::JumpToSearchHit(2), &mut app, &mut ui);
+        assert_eq!(app.active_conv_key.as_deref(), Some("chat:deep"));
+        assert_eq!(app.messages.len(), 80);
+        assert_eq!(ui.chat_scroll.selected_idx, None);
+        assert!(ui
+            .toasts
+            .current()
+            .is_some_and(|t| t.message.contains("outside the loaded history")));
+
+        // A hit whose row is not in the cache: same message, no panic.
+        ui.toasts.clear();
+        dispatch(Action::JumpToSearchHit(3), &mut app, &mut ui);
+        assert_eq!(app.messages.len(), 80);
+        assert!(ui
+            .toasts
+            .current()
+            .is_some_and(|t| t.message.contains("outside the loaded history")));
+
+        app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }
 
     #[tokio::test]

@@ -220,6 +220,11 @@ pub enum UiMsg {
         root_msg_id: String,
         thread: ThreadView,
     },
+    ThreadLoadFailed {
+        conv_key: String,
+        root_msg_id: String,
+        error: String,
+    },
     MessageSent {
         conv_key: String,
         parent_msg_id: Option<String>,
@@ -334,6 +339,9 @@ pub struct UiState {
     pub pending_prepend_anchor: Option<(usize, usize)>,
     /// `old_offset` recorded right before appending new messages at the bottom while scrolled up.
     pub pending_append_anchor: Option<usize>,
+    /// Scroll the selected chat message into view on the next render (line ranges are only
+    /// known after layout, so a jump cannot do it itself).
+    pub pending_reveal_selection: bool,
     pub attach_index: usize,
     pub show_nav_rail: bool,
     pub auto_thread_pane: bool,
@@ -404,6 +412,7 @@ impl UiState {
             thread_scroll: ScrollState::default(),
             pending_prepend_anchor: None,
             pending_append_anchor: None,
+            pending_reveal_selection: false,
             attach_index: 0,
             show_nav_rail: true,
             auto_thread_pane: true,
@@ -530,6 +539,9 @@ pub struct AppState {
     pub loading_messages: bool,
     pub loading_older: bool,
     pub loading_thread: bool,
+    /// `(conv_key, root_msg_id)` of the thread fetch in flight. The drawer can be open on a
+    /// root that is not cached yet, so `active_thread` alone cannot match the answer.
+    pub pending_thread: Option<(String, String)>,
     pub loading_older_chats: bool,
     pub chats_oldest_reached: bool,
     pub syncing: bool,
@@ -601,6 +613,7 @@ impl AppState {
             loading_messages: false,
             loading_older: false,
             loading_thread: false,
+            pending_thread: None,
             loading_older_chats: false,
             chats_oldest_reached: false,
             syncing: false,
@@ -1038,14 +1051,10 @@ impl AppState {
         self.active_target = Some(target.clone());
         self.tail_message_updated = false;
         self.active_thread = None;
+        self.pending_thread = None;
+        self.loading_thread = false;
         self.loading_older = false;
         self.history_error = None;
-        self.oldest_reached = self
-            .storage
-            .get_sync_cursor(&SyncCursor::history_scope(&new_key))
-            .ok()
-            .flatten()
-            .is_some_and(|c| c.is_history_eof());
         ui.thread_drawer_open = false;
         ui.composer_target_thread = false;
         ui.show_subject = false;
@@ -1053,11 +1062,15 @@ impl AppState {
         ui.thread_scroll = ScrollState::default();
         ui.pending_prepend_anchor = None;
         ui.pending_append_anchor = None;
+        ui.pending_reveal_selection = false;
 
         self.messages = self
             .storage
             .list_root_messages(&new_key, 80, None)
             .unwrap_or_default();
+        // Decided after the window is loaded: an EOF cursor only says Graph has no older page,
+        // while the cache can hold more rows than the 80 shown.
+        self.oldest_reached = self.cached_history_exhausted(&new_key);
         if prev_unread > 0 && ui.unread_anchor.is_none() {
             let unread_n = prev_unread as usize;
             if self.messages.len() > unread_n {
@@ -1274,6 +1287,7 @@ impl AppState {
 
         self.stash_and_reset_draft(ui);
         self.loading_thread = true;
+        self.pending_thread = Some((conv_key.clone(), root_msg_id.clone()));
         if let Ok(Some(cached)) = self.storage.get_thread(&conv_key, &root_msg_id, 200) {
             self.active_thread = Some(cached);
         } else if let Some(root) = self
@@ -1287,6 +1301,9 @@ impl AppState {
                 root,
                 replies: Vec::new(),
             });
+        } else {
+            // Nothing cached for this root: do not keep showing the previously open thread.
+            self.active_thread = None;
         }
         ui.thread_drawer_open = true;
         ui.composer_target_thread = true;
@@ -1305,20 +1322,29 @@ impl AppState {
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            if let Ok((thread, complete)) = graph
+            match graph
                 .get_thread_with_coverage(&team_id, &channel_id, &root_msg_id, 200)
                 .await
             {
-                let cached = thread.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = storage.save_fetched_thread(&cached, complete);
-                })
-                .await;
-                let _ = tx.send(UiMsg::ThreadLoaded {
-                    conv_key,
-                    root_msg_id,
-                    thread,
-                });
+                Ok((thread, complete)) => {
+                    let cached = thread.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = storage.save_fetched_thread(&cached, complete);
+                    })
+                    .await;
+                    let _ = tx.send(UiMsg::ThreadLoaded {
+                        conv_key,
+                        root_msg_id,
+                        thread,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(UiMsg::ThreadLoadFailed {
+                        conv_key,
+                        root_msg_id,
+                        error: err.to_string(),
+                    });
+                }
             }
         });
     }
@@ -1342,6 +1368,7 @@ impl AppState {
         }
 
         self.loading_thread = true;
+        self.pending_thread = Some((conv_key.clone(), root_msg_id.clone()));
         let task_label = "Sync thread replies".to_string();
         ui.tasks.begin(task_label.clone());
 
@@ -1382,10 +1409,16 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    // The failure handler reports the error and ends the loading state.
+                    let _ = tx.send(UiMsg::ThreadLoadFailed {
+                        conv_key,
+                        root_msg_id,
+                        error: err.to_string(),
+                    });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("Thread sync failed: {err}"), ToastKind::Error)),
+                        toast: None,
                     });
                 }
             }
@@ -1397,6 +1430,8 @@ impl AppState {
         ui.thread_drawer_open = false;
         ui.composer_target_thread = false;
         self.active_thread = None;
+        self.pending_thread = None;
+        self.loading_thread = false;
         ui.narrow_pane = NarrowPane::Chat;
         self.sync_ctrl.set_focus(self.active_target.clone(), None);
         self.restore_draft(ui);
@@ -1640,9 +1675,19 @@ impl AppState {
                 // Revalidate the cached older window against Graph online so edits, soft-deletes,
                 // and reactions on older history pages appear when re-opening them. Fall back to
                 // the cached local rows if offline or if the network request fails.
+                // The walk starts at the newest page, so it is capped: a window deep in the
+                // history is served from the cache instead of costing up to 15 requests.
+                // An explicit history sync keeps the full budget.
+                const REVALIDATE_MAX_PAGES: usize = 2;
                 let refreshed_older = if !local_older.is_empty() || explicit {
                     match graph
-                        .fetch_older_messages(&target, None, oldest_ts.as_deref(), batch_size)
+                        .fetch_older_messages_bounded(
+                            &target,
+                            None,
+                            oldest_ts.as_deref(),
+                            batch_size,
+                            REVALIDATE_MAX_PAGES,
+                        )
                         .await
                     {
                         Ok((fetched_msgs, _)) if !fetched_msgs.is_empty() => {
@@ -2689,6 +2734,95 @@ impl AppState {
         });
     }
 
+    /// True when a thread answer belongs to the fetch in flight or to the thread on screen.
+    fn thread_msg_is_current(&self, conv_key: &str, root_msg_id: &str) -> bool {
+        if self.active_conv_key.as_deref() != Some(conv_key) {
+            return false;
+        }
+        self.pending_thread
+            .as_ref()
+            .is_some_and(|(c, r)| c == conv_key && r == root_msg_id)
+            || self
+                .active_thread
+                .as_ref()
+                .is_some_and(|t| t.root.msg_id == root_msg_id)
+    }
+
+    /// True when the history cursor says Graph has no older page *and* no cached root message
+    /// precedes the loaded window. An empty window with an EOF cursor counts as exhausted.
+    fn cached_history_exhausted(&self, conv_key: &str) -> bool {
+        let cursor_eof = self
+            .storage
+            .get_sync_cursor(&SyncCursor::history_scope(conv_key))
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.is_history_eof());
+        cursor_eof
+            && self
+                .messages
+                .iter()
+                .find(|m| !m.msg_id.starts_with("optimistic-"))
+                .is_none_or(|first| {
+                    self.storage
+                        .list_older_root_messages(conv_key, 1, &first.created_at, Some(&first.msg_id))
+                        .map(|older| older.is_empty())
+                        .unwrap_or(true)
+                })
+    }
+
+    /// Selects a root message of the active conversation. When it is cached but older than
+    /// the loaded window, the cached rows between it and the window are loaded first.
+    pub fn reveal_message(&mut self, ui: &mut UiState, msg_id: &str, created_at: &str) {
+        /// Longest cached span loaded in one jump; beyond it the user pages with `o`.
+        const REVEAL_SPAN_CAP: usize = 500;
+        const OUTSIDE: &str =
+            "Message is outside the loaded history — press o to load older messages.";
+
+        if let Some(idx) = self.messages.iter().position(|m| m.msg_id == msg_id) {
+            ui.chat_scroll.selected_idx = Some(idx);
+            ui.pending_reveal_selection = true;
+            return;
+        }
+        let Some(conv_key) = self.active_conv_key.clone() else {
+            return;
+        };
+        let window_start = self
+            .messages
+            .iter()
+            .find(|m| !m.msg_id.starts_with("optimistic-"))
+            .map(|m| (m.created_at.clone(), m.msg_id.clone()));
+        if window_start
+            .as_ref()
+            .is_some_and(|(ts, id)| (created_at, msg_id) >= (ts.as_str(), id.as_str()))
+        {
+            // Not older than the window, yet not in it: nothing the cache span can add.
+            ui.info(OUTSIDE);
+            return;
+        }
+        let span = self
+            .storage
+            .list_root_messages_from(&conv_key, created_at, msg_id, REVEAL_SPAN_CAP + 1)
+            .unwrap_or_default();
+        if span.first().map(|m| m.msg_id.as_str()) != Some(msg_id) {
+            ui.info(OUTSIDE);
+            return;
+        }
+        let older: Vec<MessageItem> = span
+            .into_iter()
+            .take_while(|m| window_start.as_ref().is_none_or(|(_, id)| m.msg_id != *id))
+            .collect();
+        if older.len() > REVEAL_SPAN_CAP {
+            ui.info(OUTSIDE);
+            return;
+        }
+        self.prepend_older_messages(ui, older);
+        self.oldest_reached = self.cached_history_exhausted(&conv_key);
+        if let Some(idx) = self.messages.iter().position(|m| m.msg_id == msg_id) {
+            ui.chat_scroll.selected_idx = Some(idx);
+            ui.pending_reveal_selection = true;
+        }
+    }
+
     fn prepend_older_messages(&mut self, ui: &mut UiState, messages: Vec<MessageItem>) -> usize {
         if messages.is_empty() {
             return 0;
@@ -3170,14 +3304,31 @@ impl AppState {
                 root_msg_id,
                 thread,
             } => {
-                if self.active_conv_key.as_deref() == Some(&conv_key)
-                    && self
+                // Accepted for the fetch in flight (the root may not have been cached when the
+                // drawer opened) or for the thread on screen; anything else is a stale answer.
+                if self.thread_msg_is_current(&conv_key, &root_msg_id) {
+                    self.loading_thread = false;
+                    self.pending_thread = None;
+                    self.active_thread = Some(thread);
+                }
+            }
+            UiMsg::ThreadLoadFailed {
+                conv_key,
+                root_msg_id,
+                error,
+            } => {
+                if self.thread_msg_is_current(&conv_key, &root_msg_id) {
+                    self.loading_thread = false;
+                    self.pending_thread = None;
+                    let has_cached = self
                         .active_thread
                         .as_ref()
-                        .is_some_and(|t| t.root.msg_id == root_msg_id)
-                {
-                    self.loading_thread = false;
-                    self.active_thread = Some(thread);
+                        .is_some_and(|t| t.root.msg_id == root_msg_id);
+                    if !has_cached {
+                        // Nothing to show: an empty drawer would look like it is still loading.
+                        self.close_thread(ui);
+                    }
+                    ui.error(format!("Thread sync failed: {error}"));
                 }
             }
             UiMsg::MessageSent {
@@ -3901,6 +4052,155 @@ pub(super) mod tests {
         assert!(app.image_cache.is_empty());
         assert!(app.image_cache_order.is_empty());
         assert_eq!(app.image_cache_bytes, 0);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    fn seed_root_messages(app: &AppState, conv: &str, count: usize) {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z").unwrap();
+        let msgs: Vec<MessageItem> = (0..count)
+            .map(|i| {
+                let ts = (base + chrono::Duration::minutes(i as i64))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                make_test_msg(conv, &format!("m{i:04}"), &ts, "body")
+            })
+            .collect();
+        app.storage.upsert_messages(&msgs).unwrap();
+    }
+
+    fn save_history_eof(app: &AppState, conv: &str) {
+        app.storage
+            .save_sync_cursor(&SyncCursor {
+                scope_key: SyncCursor::history_scope(conv),
+                delta_link: None,
+                oldest_msg_ts: Some(SyncCursor::HISTORY_EOF.to_string()),
+                synced_at: "2026-11-20T00:00:00Z".to_string(),
+            })
+            .unwrap();
+    }
+
+    // TEAMS-04: an EOF cursor means Graph has no older page, not that the 80-row window
+    // shows everything that is cached.
+    #[tokio::test]
+    async fn regression_teams_04_oldest_reached_needs_exhausted_cache() {
+        let (mut app, mut ui) = make_test_app();
+        let chat = |id: &str| ConversationTarget::Chat {
+            chat_id: id.to_string(),
+        };
+        seed_root_messages(&app, "chat:big", 200);
+        save_history_eof(&app, "chat:big");
+        seed_root_messages(&app, "chat:small", 50);
+        save_history_eof(&app, "chat:small");
+        seed_root_messages(&app, "chat:open", 200);
+
+        app.select_conversation(&mut ui, chat("big"));
+        assert_eq!(app.messages.len(), 80);
+        assert!(!app.oldest_reached, "120 older rows are still in the cache");
+
+        app.select_conversation(&mut ui, chat("small"));
+        assert_eq!(app.messages.len(), 50);
+        assert!(app.oldest_reached);
+
+        app.select_conversation(&mut ui, chat("open"));
+        assert_eq!(app.messages.len(), 80);
+        assert!(!app.oldest_reached, "no EOF cursor: unchanged");
+
+        // An empty window with an EOF cursor stays "reached".
+        save_history_eof(&app, "chat:empty");
+        app.messages.clear();
+        assert!(app.cached_history_exhausted("chat:empty"));
+        assert!(!app.cached_history_exhausted("chat:never-synced"));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    // TEAMS-11: the drawer must leave "loading" whether the fetch answers or fails, also
+    // when the root was not cached when it opened.
+    #[tokio::test]
+    async fn regression_teams_11_thread_drawer_leaves_loading_state() {
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chan:t1:ch1";
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(ConversationTarget::Channel {
+            team_id: "t1".to_string(),
+            channel_id: "ch1".to_string(),
+        });
+        let thread = |root_id: &str| {
+            let mut reply = make_test_msg(conv, &format!("{root_id}-r1"), "2026-11-18T01:01:00Z", "reply");
+            reply.parent_msg_id = Some(root_id.to_string());
+            ThreadView {
+                conv_key: conv.to_string(),
+                root: make_test_msg(conv, root_id, "2026-11-18T01:00:00Z", "root"),
+                replies: vec![reply],
+            }
+        };
+        let loaded = |root_id: &str| UiMsg::ThreadLoaded {
+            conv_key: conv.to_string(),
+            root_msg_id: root_id.to_string(),
+            thread: thread(root_id),
+        };
+        let failed = |root_id: &str| UiMsg::ThreadLoadFailed {
+            conv_key: conv.to_string(),
+            root_msg_id: root_id.to_string(),
+            error: "503 Service Unavailable".to_string(),
+        };
+        let shown = |app: &AppState| app.active_thread.as_ref().map(|t| t.root.msg_id.clone());
+
+        // 1) Uncached root, then the answer arrives.
+        app.open_thread_by_id(&mut ui, "root-a".to_string());
+        assert!(app.loading_thread);
+        assert!(app.active_thread.is_none());
+        assert_eq!(app.pending_thread, Some((conv.to_string(), "root-a".to_string())));
+        app.handle_ui_msg(&mut ui, loaded("root-a"));
+        assert!(!app.loading_thread);
+        assert!(app.pending_thread.is_none());
+        assert_eq!(shown(&app).as_deref(), Some("root-a"));
+
+        // 2) Another uncached root: the previous thread is not shown under it, and a late
+        //    answer for the thread the user left is dropped.
+        app.open_thread_by_id(&mut ui, "root-b".to_string());
+        assert!(app.active_thread.is_none());
+        app.handle_ui_msg(&mut ui, loaded("root-a"));
+        assert!(app.active_thread.is_none());
+        assert!(app.loading_thread);
+
+        // 3) The fetch fails with nothing to show: loading ends, drawer closes, error shown.
+        app.handle_ui_msg(&mut ui, failed("root-b"));
+        assert!(!app.loading_thread);
+        assert!(app.pending_thread.is_none());
+        assert!(app.active_thread.is_none());
+        assert!(!ui.thread_drawer_open);
+        assert!(ui
+            .toasts
+            .current()
+            .is_some_and(|t| t.message.contains("Thread sync failed")));
+
+        // 4) The fetch fails while a cached thread is on screen: it stays.
+        let cached = thread("root-c");
+        let mut rows = vec![cached.root.clone()];
+        rows.extend(cached.replies.clone());
+        app.storage.upsert_messages(&rows).unwrap();
+        app.open_thread_by_id(&mut ui, "root-c".to_string());
+        assert_eq!(shown(&app).as_deref(), Some("root-c"));
+        app.handle_ui_msg(&mut ui, failed("root-c"));
+        assert!(!app.loading_thread);
+        assert!(ui.thread_drawer_open);
+        assert_eq!(shown(&app).as_deref(), Some("root-c"));
+
+        // 5) Switching conversation drops the answer of the fetch in flight.
+        app.close_thread(&mut ui);
+        app.open_thread_by_id(&mut ui, "root-d".to_string());
+        seed_root_messages(&app, "chat:other", 3);
+        app.select_conversation(
+            &mut ui,
+            ConversationTarget::Chat {
+                chat_id: "other".to_string(),
+            },
+        );
+        assert!(app.pending_thread.is_none());
+        assert!(!app.loading_thread);
+        app.handle_ui_msg(&mut ui, loaded("root-d"));
+        assert!(app.active_thread.is_none());
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

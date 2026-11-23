@@ -818,6 +818,37 @@ pub fn list_root_messages(
     Ok(out)
 }
 
+/// Lists root messages from `(from_created_at, from_msg_id)` on (inclusive), oldest first.
+pub fn list_root_messages_from(
+    conn: &Connection,
+    conv_key: &str,
+    from_created_at: &str,
+    from_msg_id: &str,
+    limit: usize,
+) -> Result<Vec<MessageItem>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let from_sort = crate::storage::db::normalize_timestamp_sort_key(from_created_at);
+    let mut stmt = conn.prepare_cached(
+        "
+        SELECT
+            msg_key, conv_key, msg_id, parent_msg_id, reply_to_id, reply_to_author, reply_to_preview,
+            subject, author_id, author_name, is_me, created_at, last_modified_at, deleted,
+            importance, message_type, body_html, body_plain, attachments_json, mentions_json,
+            reactions_json, reply_count, web_url
+        FROM messages
+        WHERE parent_msg_id IS NULL
+          AND conv_key = ?1
+          AND (created_at_sort, msg_id) >= (?2, ?3)
+        ORDER BY created_at_sort ASC, msg_id ASC
+        LIMIT ?4
+        ",
+    )?;
+    let rows = stmt.query_map(params![conv_key, from_sort, from_msg_id, limit as i64], map_message_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Lists older root messages strictly preceding `(before_created_at, before_msg_id)` in chronological order (oldest first).
 pub fn list_older_root_messages(
     conn: &Connection,
@@ -1346,6 +1377,36 @@ pub fn save_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> {
         cursor.synced_at,
     ])?;
     Ok(())
+}
+
+/// Saves a history cursor unless the stored one is at least as deep:
+/// - no stored cursor, or the new one is EOF: save;
+/// - the stored cursor is EOF, or its oldest timestamp is not newer than the new one: keep it.
+///
+/// Timestamps are compared as sort keys, because writers store them raw or normalised.
+pub(crate) fn save_history_cursor_if_deeper(conn: &mut Connection, cursor: &SyncCursor) -> Result<bool> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let keep_existing = match get_sync_cursor(&tx, &cursor.scope_key)? {
+        None => false,
+        Some(_) if cursor.is_history_eof() => false,
+        Some(existing) if existing.is_history_eof() => true,
+        Some(existing) => {
+            let sort_key = |ts: &Option<String>| {
+                ts.as_deref()
+                    .map(crate::storage::db::normalize_timestamp_sort_key)
+                    .filter(|key| !key.is_empty())
+            };
+            match (sort_key(&existing.oldest_msg_ts), sort_key(&cursor.oldest_msg_ts)) {
+                (Some(old), Some(new)) => old <= new,
+                _ => false,
+            }
+        }
+    };
+    if !keep_existing {
+        save_sync_cursor(&tx, cursor)?;
+        tx.commit()?;
+    }
+    Ok(!keep_existing)
 }
 
 pub(crate) fn apply_channel_delta(

@@ -1456,8 +1456,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_bearer_is_refused_for_hosts_outside_the_graph_origin() {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = "https://graph.microsoft.com/v1.0".to_string();
+        let cfg = AppConfig {
+            graph_base_url: "https://graph.microsoft.com/v1.0".to_string(),
+            ..AppConfig::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "secret-token".into(),
             refresh_token: None,

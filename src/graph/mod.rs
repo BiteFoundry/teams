@@ -204,6 +204,26 @@ impl GraphClient {
         min_count: usize,
     ) -> Result<(Vec<MessageItem>, Option<String>)> {
         const MAX_PAGES_PER_FETCH: usize = 15;
+        self.fetch_older_messages_bounded(
+            target,
+            saved_next_link,
+            older_than_ts,
+            min_count,
+            MAX_PAGES_PER_FETCH,
+        )
+        .await
+    }
+
+    /// [`Self::fetch_older_messages`] with an explicit page budget: at most `max_pages` Graph
+    /// requests are made, and the returned link is the page the walk stopped before.
+    pub async fn fetch_older_messages_bounded(
+        &self,
+        target: &ConversationTarget,
+        saved_next_link: Option<&str>,
+        older_than_ts: Option<&str>,
+        min_count: usize,
+        max_pages: usize,
+    ) -> Result<(Vec<MessageItem>, Option<String>)> {
         let desired = min_count.max(1);
         let older_than_ts = older_than_ts.map(str::trim).filter(|s| !s.is_empty());
         let initial_cursor = saved_next_link.map(str::trim).filter(|s| !s.is_empty());
@@ -213,7 +233,7 @@ impl GraphClient {
         let mut older_root_count = 0usize;
         let mut current_link: Option<String> = None;
 
-        for page_idx in 0..MAX_PAGES_PER_FETCH {
+        for page_idx in 0..max_pages.max(1) {
             let (page_msgs, next_link) = if page_idx == 0 {
                 if let Some(link) = initial_cursor {
                     match self.list_messages_page(target, 50, Some(link)).await {
@@ -470,5 +490,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    // TEAMS-27: the page budget is a hard cap, and the returned link is where the walk stopped.
+    #[tokio::test]
+    async fn fetch_older_messages_bounded_stops_after_max_pages() {
+        use axum::{extract::RawQuery, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let route_hits = Arc::clone(&hits);
+        let route_base = base.clone();
+
+        // Ten pages of one message each, newest first: page N holds the message of 10:(60-N).
+        let app = Router::new().route(
+            "/v1.0/chats/c-deep/messages",
+            get(move |RawQuery(q): RawQuery| {
+                let hits = Arc::clone(&route_hits);
+                let base = route_base.clone();
+                async move {
+                    hits.fetch_add(1, AtomicOrdering::SeqCst);
+                    let query = q.unwrap_or_default();
+                    let page = query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("$skiptoken=page"))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(1);
+                    let mut body = serde_json::json!({
+                        "value": [{
+                            "id": format!("m{page}"),
+                            "messageType": "message",
+                            "createdDateTime": format!("2026-11-18T10:{:02}:00Z", 60 - page),
+                            "from": { "user": { "id": "u1", "displayName": "A" } },
+                            "body": { "contentType": "text", "content": "x" }
+                        }]
+                    });
+                    if page < 10 {
+                        body["@odata.nextLink"] = serde_json::Value::String(format!(
+                            "{base}/chats/c-deep/messages?$skiptoken=page{}",
+                            page + 1
+                        ));
+                    }
+                    Json(body)
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cfg = AppConfig {
+            graph_base_url: base.clone(),
+            ..AppConfig::default()
+        };
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            client_id: cfg.client_id.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "pkce".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+        let target = ConversationTarget::Chat {
+            chat_id: "c-deep".to_string(),
+        };
+
+        // Pages 1 and 2 hold nothing older than the window, so the budget runs out first.
+        let (msgs, link) = graph
+            .fetch_older_messages_bounded(&target, None, Some("2026-11-18T10:57:00Z"), 5, 2)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 2, "at most max_pages requests");
+        assert!(msgs.is_empty(), "nothing older than the window was reached: {msgs:?}");
+        assert_eq!(
+            link.as_deref(),
+            Some(format!("{base}/chats/c-deep/messages?$skiptoken=page3").as_str())
+        );
+
+        // The unbounded entry point keeps its larger budget: it walks until five messages
+        // strictly older than the window are found (pages 4..=8) and keeps the boundary one.
+        hits.store(0, AtomicOrdering::SeqCst);
+        let (msgs, link) = graph
+            .fetch_older_messages(&target, None, Some("2026-11-18T10:57:00Z"), 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 8);
+        let ids: Vec<&str> = msgs.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, ["m8", "m7", "m6", "m5", "m4", "m3"]);
+        assert_eq!(
+            link.as_deref(),
+            Some(format!("{base}/chats/c-deep/messages?$skiptoken=page9").as_str())
+        );
     }
 }

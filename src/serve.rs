@@ -542,7 +542,7 @@ fn origin_allowed(origin: &str, request_host: Option<&str>, cors_origins: &[Stri
     let Some(origin) = normalize_origin(origin) else {
         return false;
     };
-    if cors_origins.iter().any(|allowed| *allowed == origin) {
+    if cors_origins.contains(&origin) {
         return true;
     }
     request_host
@@ -2300,8 +2300,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = root.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.download_dir = root.path().join("downloads").to_string_lossy().to_string();
+        let cfg = AppConfig {
+            download_dir: root.path().join("downloads").to_string_lossy().to_string(),
+            ..AppConfig::default()
+        };
         let auth = AuthManager::new(cfg.clone()).unwrap();
         let graph = GraphClient::new(cfg.clone(), auth).unwrap().with_my_user_id("me-123");
         let router = spawn_router(build_router(cfg, graph, Storage::open_in_memory().unwrap(), None)).await;

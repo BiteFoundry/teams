@@ -4250,6 +4250,47 @@ async fn regression_teams_bug_03_history_cursor_no_gap() {
         "must not repeat latest page without skiptoken when cursor connects: {reqs:?}"
     );
 
+    // TEAMS-27: a plain read sees only the newest page. It must not pull a cursor that a
+    // `--before` walk already moved deeper back up to that page, nor undo EOF.
+    let history_cursor = |tmp: &TempDir| {
+        let st = Storage::open(&tmp.path().join("data").join("me-user-1").join("cache.db")).unwrap();
+        st.get_sync_cursor("history:chat:19:pag@thread.v2").unwrap().unwrap()
+    };
+    // tmp2 read m13..m15 (pages of 3) and walked `--before m13` once: the cursor is at m07.
+    let deep = history_cursor(&tmp2);
+    assert!(
+        deep.delta_link.as_deref().is_some_and(|l| l.contains("$skiptoken=after:m07")),
+        "unexpected mid-history cursor: {deep:?}"
+    );
+    assert_eq!(
+        parse_ids(&run_cli(&tmp2, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m13", "m14", "m15"]
+    );
+    let after_plain = history_cursor(&tmp2);
+    assert_eq!(after_plain.delta_link, deep.delta_link, "plain read replaced a deeper cursor");
+    assert_eq!(after_plain.oldest_msg_ts, deep.oldest_msg_ts);
+
+    // The walk resumes at the deep cursor instead of re-walking from the newest page.
+    state.requests.write().unwrap().clear();
+    assert_eq!(
+        parse_ids(&run_cli(&tmp2, &["read", "PagChat", "--before", "m07", "--limit", "5", "--json"]).await),
+        vec!["m02", "m03", "m04", "m05", "m06"]
+    );
+    let reqs = state.requests.read().unwrap().clone();
+    assert!(
+        reqs.first().is_some_and(|q| q.contains("$skiptoken=after:m07"))
+            && reqs.iter().all(|q| q.contains("$skiptoken=") && !q.contains("after:m13")),
+        "walk must resume at the deep cursor: {reqs:?}"
+    );
+
+    // That walk reached the end. Reading the newest page again leaves EOF in place.
+    assert!(history_cursor(&tmp2).is_history_eof());
+    assert_eq!(
+        parse_ids(&run_cli(&tmp2, &["read", "PagChat", "--limit", "3", "--json"]).await),
+        vec!["m13", "m14", "m15"]
+    );
+    assert!(history_cursor(&tmp2).is_history_eof(), "plain read undid EOF");
+
     server.abort();
 }
 

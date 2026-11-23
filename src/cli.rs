@@ -4712,7 +4712,9 @@ pub(crate) async fn read_conversation_messages(
                     .min()
             };
             if oldest_ts.is_some() {
-                let _ = storage.save_sync_cursor(&SyncCursor {
+                // A plain read only sees the newest page: it must not replace a cursor that
+                // an earlier `--before` walk or the TUI already moved deeper (or to EOF).
+                let _ = storage.save_history_cursor_if_deeper(&SyncCursor {
                     scope_key: scope_key.clone(),
                     delta_link: next_link.clone(),
                     oldest_msg_ts: oldest_ts,

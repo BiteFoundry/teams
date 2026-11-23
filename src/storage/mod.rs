@@ -452,6 +452,18 @@ impl Storage {
         search::search_messages(&conn, query, conv_key_filter, limit)
     }
 
+    /// Lists root messages from `(from_created_at, from_msg_id)` on (inclusive), oldest first.
+    pub fn list_root_messages_from(
+        &self,
+        conv_key: &str,
+        from_created_at: &str,
+        from_msg_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageItem>> {
+        let conn = self.read_conn()?;
+        repo::list_root_messages_from(&conn, conv_key, from_created_at, from_msg_id, limit)
+    }
+
     /// Lists older root messages strictly preceding `(before_created_at, before_msg_id)` in chronological order (oldest first).
     pub fn list_older_root_messages(
         &self,
@@ -462,6 +474,13 @@ impl Storage {
     ) -> Result<Vec<MessageItem>> {
         let conn = self.read_conn()?;
         repo::list_older_root_messages(&conn, conv_key, limit, before_created_at, before_msg_id)
+    }
+
+    /// Saves a history cursor unless the stored one already reaches at least as far back.
+    /// Returns whether the cursor was written.
+    pub fn save_history_cursor_if_deeper(&self, cursor: &SyncCursor) -> Result<bool> {
+        let mut conn = self.lock_conn()?;
+        repo::save_history_cursor_if_deeper(&mut conn, cursor)
     }
 
     pub fn get_sync_cursor(&self, scope_key: &str) -> Result<Option<SyncCursor>> {
@@ -1490,6 +1509,38 @@ mod tests {
         let (te, cove) = storage.get_fetched_thread(conv_key, "m1", 50).unwrap().unwrap();
         assert!(te.replies.is_empty());
         assert_eq!(cove, ThreadCoverage { has_more: false, reply_total: Some(0) });
+    }
+
+    // TEAMS-27: a shallow cursor must not replace a deeper one.
+    #[test]
+    fn regression_teams_27_history_cursor_is_only_replaced_by_a_deeper_one() {
+        let storage = Storage::open_in_memory().unwrap();
+        let scope = SyncCursor::history_scope("chat:c1");
+        let cursor = |link: Option<&str>, oldest: &str| SyncCursor {
+            scope_key: scope.clone(),
+            delta_link: link.map(str::to_string),
+            oldest_msg_ts: Some(oldest.to_string()),
+            synced_at: "2026-11-20T00:00:00Z".to_string(),
+        };
+        let stored = |st: &Storage| st.get_sync_cursor(&scope).unwrap().unwrap();
+
+        // No cursor yet: saved.
+        assert!(storage.save_history_cursor_if_deeper(&cursor(Some("page2"), "2026-11-20T10:00:00Z")).unwrap());
+        // Deeper: saved. Timestamps are compared as instants, whatever their spelling.
+        assert!(storage
+            .save_history_cursor_if_deeper(&cursor(Some("page5"), "2026-11-18T10:00:00.000000000Z"))
+            .unwrap());
+        // Shallower or equally deep: the stored cursor stays.
+        assert!(!storage.save_history_cursor_if_deeper(&cursor(Some("page2"), "2026-11-20T10:00:00Z")).unwrap());
+        assert!(!storage.save_history_cursor_if_deeper(&cursor(Some("page5b"), "2026-11-18T10:00:00Z")).unwrap());
+        assert_eq!(stored(&storage).delta_link.as_deref(), Some("page5"));
+
+        // EOF always wins, and is never replaced by a page cursor.
+        assert!(storage.save_history_cursor_if_deeper(&cursor(None, SyncCursor::HISTORY_EOF)).unwrap());
+        assert!(stored(&storage).is_history_eof());
+        assert!(!storage.save_history_cursor_if_deeper(&cursor(Some("page2"), "2026-11-20T10:00:00Z")).unwrap());
+        assert!(!storage.save_history_cursor_if_deeper(&cursor(Some("page9"), "2026-11-01T10:00:00Z")).unwrap());
+        assert!(stored(&storage).is_history_eof());
     }
 
     // TEAMS-38: sync writes Graph-derived summaries, which always carry `pinned: false`.
