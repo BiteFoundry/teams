@@ -15,7 +15,7 @@ use crate::{
     models::{MessageItem, RichBlock},
     parser,
     ui::{
-        action::Action,
+        action::{is_openable_url, Action},
         app::UiState,
         hitmap::{HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
@@ -248,17 +248,6 @@ pub fn extract_links_from_messages(msgs: &[&MessageItem]) -> Vec<ExtractedLink> 
         }
     }
     out
-}
-
-fn is_openable_url(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    (lower.starts_with("https://") && trimmed.len() > "https://".len())
-        || (lower.starts_with("http://") && trimmed.len() > "http://".len())
-        || (lower.starts_with("mailto:") && trimmed.len() > "mailto:".len())
 }
 
 fn push_unique_link(out: &mut Vec<ExtractedLink>, raw_label: &str, raw_url: &str) {

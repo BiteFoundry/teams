@@ -3690,6 +3690,10 @@ async fn cmd_export(
     }
 
     let mut threads_by_root: HashMap<String, Vec<MessageItem>> = HashMap::new();
+    // Roots whose replies could not be fetched: (root_msg_id, error). Their cached replies
+    // are exported instead, and the command reports the export as incomplete.
+    let mut incomplete_threads: Vec<(String, String)> = Vec::new();
+    let mut thread_roots_total = 0usize;
     if include_threads {
         if let ConversationTarget::Channel {
             ref team_id,
@@ -3701,6 +3705,7 @@ async fn cmd_export(
                 .filter(|m| m.reply_count > 0)
                 .map(|m| m.msg_id.as_str())
                 .collect();
+            thread_roots_total = root_ids.len();
 
             if offline {
                 for msg_id in root_ids {
@@ -3710,17 +3715,18 @@ async fn cmd_export(
                     }
                 }
             } else {
-                let fetched: Vec<(String, Vec<MessageItem>)> = stream::iter(root_ids)
+                let fetched: Vec<(String, Result<Vec<MessageItem>>)> = stream::iter(root_ids)
                     .map(|msg_id| {
                         let graph = &graph;
                         let storage = &storage;
                         async move {
                             let r = graph
                                 .list_thread_replies(team_id, channel_id, msg_id, limit)
-                                .await
-                                .unwrap_or_default();
-                            if !r.is_empty() {
-                                let _ = storage.upsert_messages(&r);
+                                .await;
+                            if let Ok(replies) = &r {
+                                if !replies.is_empty() {
+                                    let _ = storage.upsert_messages(replies);
+                                }
                             }
                             (msg_id.to_string(), r)
                         }
@@ -3729,11 +3735,22 @@ async fn cmd_export(
                     .collect()
                     .await;
 
-                for (msg_id, replies) in fetched {
+                for (msg_id, result) in fetched {
+                    let replies = match result {
+                        Ok(replies) => replies,
+                        Err(err) => {
+                            incomplete_threads.push((msg_id.clone(), format!("{err:#}")));
+                            storage
+                                .list_thread_replies(&conv.conv_key, &msg_id, limit)
+                                .unwrap_or_default()
+                        }
+                    };
                     if !replies.is_empty() {
                         threads_by_root.insert(msg_id, replies);
                     }
                 }
+                // Deterministic report order regardless of fetch completion order.
+                incomplete_threads.sort();
             }
         }
     }
@@ -3759,10 +3776,20 @@ async fn cmd_export(
                         })
                     })
                     .collect();
-                serde_json::to_string_pretty(&json!({
+                let mut doc = json!({
                     "conversation": conv,
                     "items": entries,
-                }))?
+                });
+                // Present only for a partial export, so a clean one is byte-identical.
+                if !incomplete_threads.is_empty() {
+                    doc["incomplete_threads"] = incomplete_threads
+                        .iter()
+                        .map(|(root_msg_id, error)| {
+                            json!({ "root_msg_id": root_msg_id, "error": error })
+                        })
+                        .collect();
+                }
+                serde_json::to_string_pretty(&doc)?
             } else {
                 serde_json::to_string_pretty(&json!({
                     "conversation": conv,
@@ -3858,6 +3885,18 @@ async fn cmd_export(
             println!("Exported: {}", path.display());
         }
         None => print!("{body}"),
+    }
+
+    // The (partial) export is already written; now make the gap impossible to miss.
+    if !incomplete_threads.is_empty() {
+        for (root_msg_id, error) in &incomplete_threads {
+            eprintln!("warning: thread {root_msg_id}: replies could not be fetched: {error}");
+        }
+        bail!(
+            "export incomplete: {} of {} threads could not be fetched",
+            incomplete_threads.len(),
+            thread_roots_total
+        );
     }
     Ok(())
 }
@@ -4408,7 +4447,8 @@ impl std::error::Error for DetailedError {}
 
 fn is_forbidden_message(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("403")
+    // The parsed response status, not a "403" substring: URLs and message ids contain digits.
+    extract_graph_http_status(msg) == Some(403)
         || lower.contains("forbidden")
         || lower.contains("authorization_requestdenied")
         || lower.contains("insufficient privileges")
@@ -4422,23 +4462,7 @@ pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
     is_forbidden_message(&format!("{err:#}"))
 }
 
-pub(crate) fn extract_graph_http_status(msg: &str) -> Option<u16> {
-    let start = msg.find(crate::graph::GRAPH_API_ERROR_PREFIX)?;
-    let rest = &msg[start..];
-    let (_, after) = rest.split_once("): ")?;
-    let bytes = after.as_bytes();
-    if bytes.len() < 3
-        || !bytes[0].is_ascii_digit()
-        || !bytes[1].is_ascii_digit()
-        || !bytes[2].is_ascii_digit()
-    {
-        return None;
-    }
-    if bytes.len() > 3 && bytes[3].is_ascii_digit() {
-        return None;
-    }
-    after[..3].parse::<u16>().ok()
-}
+pub(crate) use crate::graph::extract_graph_http_status;
 
 pub(crate) fn error_code_for_message(msg: &str) -> &'static str {
     if msg.contains("Conversation/channel not found") {
@@ -6941,6 +6965,29 @@ mod tests {
         ));
         assert_eq!(not_found["error"]["code"], "not_found");
         assert_eq!(not_found["error"]["http_status"], 404);
+
+        // TEAMS-19: a "403" inside the URL / message id must not turn a 404 or 500 into
+        // permission_denied; only the parsed response status (or a permission keyword) does.
+        let id_with_403 = error_json(&anyhow::anyhow!(
+            "Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages/1700000403123): 404 Not Found [NotFound] message 1700000403123 does not exist"
+        ));
+        assert_eq!(id_with_403["error"]["code"], "not_found");
+        assert_eq!(id_with_403["error"]["http_status"], 404);
+        let server_error = error_json(&anyhow::anyhow!(
+            "Graph API error (GET https://graph.microsoft.com/v1.0/chats/19:403abc/messages): 500 Internal Server Error"
+        ));
+        assert_eq!(server_error["error"]["code"], "error");
+        assert_eq!(server_error["error"]["http_status"], 500);
+        assert_eq!(
+            error_code_for_message(
+                "Graph API error (GET https://graph.microsoft.com/v1.0/me/joinedTeams): 403 Forbidden [Forbidden] Missing scope"
+            ),
+            "permission_denied"
+        );
+        assert_eq!(
+            error_code_for_message("Authorization_RequestDenied: Insufficient privileges to complete the operation."),
+            "permission_denied"
+        );
 
         let target_missing = error_json(&anyhow::anyhow!(
             "Conversation/channel not found: NonExistentRoom"

@@ -997,9 +997,12 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenLinks => {
             open_links_overlay(app, ui);
         }
-        Action::OpenUrl(url) => match open::that_detached(&url) {
-            Ok(()) => ui.info(format!("Opened link: {url}")),
-            Err(err) => ui.error(format!("Failed to open link: {err}")),
+        Action::OpenUrl(url) => match open_url_decision(&url) {
+            Err(reason) => ui.error(reason),
+            Ok(()) => match open::that_detached(url.trim()) {
+                Ok(()) => ui.info(format!("Opened link: {url}")),
+                Err(err) => ui.error(format!("Failed to open link: {err}")),
+            },
         },
         Action::ToggleShowHrefs => {
             ui.show_hrefs = !ui.show_hrefs;
@@ -1262,6 +1265,46 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     }
 
     false
+}
+
+/// True for the only link kinds the TUI will hand to the OS: `http`, `https` and `mailto`
+/// with a non-empty target. Shared by the link extractor and the `OpenUrl` sink.
+pub(crate) fn is_openable_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // The literal prefix is checked as well as the parsed scheme: URL parsing drops
+    // embedded tabs/newlines, and the raw string is what the OS opener receives.
+    let Some(scheme) = ["https", "http", "mailto"]
+        .into_iter()
+        .find(|s| lower.strip_prefix(s).is_some_and(|rest| rest.starts_with(':')))
+    else {
+        return false;
+    };
+    if trimmed.chars().any(char::is_control) {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    if parsed.scheme() != scheme {
+        return false;
+    }
+    match scheme {
+        "mailto" => !parsed.path().trim().is_empty(),
+        _ => lower[scheme.len()..].starts_with("://")
+            && parsed.host_str().is_some_and(|h| !h.is_empty()),
+    }
+}
+
+/// Decides whether `Action::OpenUrl` may launch `url`. Every overlay dispatches through
+/// this sink, so `file:`, `javascript:`, `ms-*:`, UNC and local paths are refused here
+/// regardless of where the link came from.
+pub(crate) fn open_url_decision(url: &str) -> Result<(), &'static str> {
+    if is_openable_url(url) {
+        Ok(())
+    } else {
+        Err("Blocked link with unsupported scheme")
+    }
 }
 
 fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
@@ -2475,6 +2518,49 @@ fn emit_osc52(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_url_sink_allows_only_http_https_and_mailto() {
+        for ok in [
+            "https://x",
+            "HTTP://x",
+            "https://example.com/docs?q=1#frag",
+            "  https://example.com  ",
+            "mailto:a@b",
+            "MAILTO:team@example.com?subject=hi",
+        ] {
+            assert!(is_openable_url(ok), "{ok:?} should open");
+            assert_eq!(open_url_decision(ok), Ok(()));
+        }
+        for blocked in [
+            "file:///c:/x",
+            "javascript:alert(1)",
+            "ms-msdt:/id PCWDiagnostic",
+            "search-ms:query=x",
+            "vscode://file/c:/x",
+            r"\\srv\share\a.exe",
+            r"C:\a.exe",
+            "/usr/bin/true",
+            "",
+            "   ",
+            "https://",
+            "http://",
+            "https:",
+            "https:/x",
+            "https:x",
+            "mailto:",
+            "example.com",
+            "httpsx://example.com",
+            "ht\ttps://example.com",
+            "https://exa\nmple.com",
+        ] {
+            assert!(!is_openable_url(blocked), "{blocked:?} must be blocked");
+            assert_eq!(
+                open_url_decision(blocked),
+                Err("Blocked link with unsupported scheme")
+            );
+        }
+    }
 
     #[test]
     fn encode_base64_matches_rfc4648_vectors() {

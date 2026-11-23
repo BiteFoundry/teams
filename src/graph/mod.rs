@@ -24,6 +24,28 @@ use crate::{
 /// Canonical prefix emitted by `GraphClient` HTTP errors; kept as a shared constant for safe parsing.
 pub const GRAPH_API_ERROR_PREFIX: &str = "Graph API error (";
 
+/// HTTP status of a `GraphClient` error message (`Graph API error (METHOD URL): 404 …`).
+///
+/// Only the three digits right after `): ` count, so a status-looking number inside the
+/// URL, a message id or the error body is never mistaken for the response status.
+pub(crate) fn extract_graph_http_status(msg: &str) -> Option<u16> {
+    let start = msg.find(GRAPH_API_ERROR_PREFIX)?;
+    let rest = &msg[start..];
+    let (_, after) = rest.split_once("): ")?;
+    let bytes = after.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_digit()
+        || !bytes[1].is_ascii_digit()
+        || !bytes[2].is_ascii_digit()
+    {
+        return None;
+    }
+    if bytes.len() > 3 && bytes[3].is_ascii_digit() {
+        return None;
+    }
+    after[..3].parse::<u16>().ok()
+}
+
 #[derive(Clone)]
 pub struct GraphClient {
     auth: AuthManager,

@@ -342,7 +342,7 @@ impl GraphClient {
         let mut members_json = vec![serde_json::json!({
             "@odata.type": "#microsoft.graph.aadUserConversationMember",
             "roles": ["owner"],
-            "user@odata.bind": format!("https://graph.microsoft.com/v1.0/users('{}')", my_id)
+            "user@odata.bind": user_bind_url(&my_id)
         })];
 
         for peer in &peers {
@@ -352,7 +352,7 @@ impl GraphClient {
             members_json.push(serde_json::json!({
                 "@odata.type": "#microsoft.graph.aadUserConversationMember",
                 "roles": ["owner"],
-                "user@odata.bind": format!("https://graph.microsoft.com/v1.0/users('{}')", peer)
+                "user@odata.bind": user_bind_url(peer)
             }));
         }
 
@@ -762,9 +762,54 @@ fn map_graph_chat_detailed(chat: GraphChat, my_user_id: Option<&str>) -> (Conver
     )
 }
 
+/// `user@odata.bind` URL for a chat member given as an object id or a UPN/email.
+///
+/// The key is an OData string literal inside a URL: a single quote is doubled (`'` → `''`)
+/// and the characters that would end or re-shape the URL are percent-encoded, so
+/// `o'brien@contoso.com` and guest UPNs (`user_ext.com#EXT#@tenant.onmicrosoft.com`) bind
+/// correctly. GUIDs and ordinary addresses come out unchanged.
+pub(crate) fn user_bind_url(id_or_upn: &str) -> String {
+    let mut key = String::with_capacity(id_or_upn.len());
+    for c in id_or_upn.chars() {
+        match c {
+            '\'' => key.push_str("''"),
+            '%' => key.push_str("%25"),
+            '#' => key.push_str("%23"),
+            '?' => key.push_str("%3F"),
+            '/' => key.push_str("%2F"),
+            ' ' => key.push_str("%20"),
+            other => key.push(other),
+        }
+    }
+    format!("https://graph.microsoft.com/v1.0/users('{key}')")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_bind_url_escapes_odata_key_and_keeps_plain_ids() {
+        // GUIDs and ordinary addresses are byte-identical to the previous format!() output.
+        for plain in ["0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0", "alice@contoso.com", "first.last_x-y@sub.contoso.com"] {
+            assert_eq!(
+                user_bind_url(plain),
+                format!("https://graph.microsoft.com/v1.0/users('{plain}')")
+            );
+        }
+        assert_eq!(
+            user_bind_url("o'brien@contoso.com"),
+            "https://graph.microsoft.com/v1.0/users('o''brien@contoso.com')"
+        );
+        assert_eq!(
+            user_bind_url("user_ext.com#EXT#@tenant.onmicrosoft.com"),
+            "https://graph.microsoft.com/v1.0/users('user_ext.com%23EXT%23@tenant.onmicrosoft.com')"
+        );
+        assert_eq!(
+            user_bind_url("a b/c?d%e"),
+            "https://graph.microsoft.com/v1.0/users('a%20b%2Fc%3Fd%25e')"
+        );
+    }
 
     #[test]
     fn test_chat_title_and_unread_derivation_one_on_one() {

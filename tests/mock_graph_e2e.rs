@@ -7902,3 +7902,280 @@ async fn regression_teams_28_post_not_retried_on_gateway_error() {
 
     server.abort();
 }
+
+/// Environment for driving the built `teams` binary against a mock Graph listener.
+struct CliEnv {
+    graph_base: String,
+    auth_base: String,
+    jwt: String,
+    cfg_dir: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    _tmp: TempDir,
+}
+
+impl CliEnv {
+    fn new(base_url: &str) -> Self {
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(
+            json!({
+                "oid": "me-user-1",
+                "name": "Me (Tester)",
+                "upn": "tester@contoso.com",
+                "exp": 4_102_444_800_i64
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        Self {
+            graph_base: format!("{base_url}/v1.0"),
+            auth_base: base_url.to_string(),
+            jwt: format!("{header_b64}.{payload_b64}.sig"),
+            cfg_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+            _tmp: tmp,
+        }
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self._tmp.path().join(name)
+    }
+
+    async fn run(&self, args: &[&str]) -> std::process::Output {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_teams"))
+            .args(args)
+            .env("TEAMS_GRAPH_BASE_URL", &self.graph_base)
+            .env("TEAMS_AUTH_BASE_URL", &self.auth_base)
+            .env("TEAMS_ACCESS_TOKEN", &self.jwt)
+            .env("TEAMS_DISABLE_KEYRING", "1")
+            .env("TEAMS_CONFIG_DIR", &self.cfg_dir)
+            .env("TEAMS_DATA_DIR", &self.data_dir)
+            .env("TEAMS_AUTO_DAEMON", "0")
+            .env_remove("TEAMS_TOKEN_FILE")
+            .env_remove("TEAMS_TOKEN_REFRESH_CMD")
+            .env_remove("TEAMS_EXTRA_CA_PEM")
+            .output()
+            .await
+            .expect("run teams CLI")
+    }
+}
+
+#[tokio::test]
+async fn regression_teams_01_bearer_not_sent_to_foreign_next_link() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    ensure_isolated_env();
+
+    // A second listener stands in for an attacker-controlled host named by a nextLink.
+    let foreign_hits = Arc::new(AtomicUsize::new(0));
+    let foreign_auth: Arc<RwLock<Vec<String>>> = Arc::new(RwLock::new(Vec::new()));
+    let (fh, fa) = (foreign_hits.clone(), foreign_auth.clone());
+    let foreign = Router::new().fallback(move |headers: HeaderMap| {
+        let (hits, seen) = (fh.clone(), fa.clone());
+        async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+                seen.write().unwrap().push(v.to_string());
+            }
+            Json(json!({ "value": [] }))
+        }
+    });
+    let (foreign_base, foreign_server) = spawn_test_router(foreign).await;
+
+    let next_link = format!("{foreign_base}/v1.0/me/chats?$skiptoken=page2");
+    let app = Router::new().route(
+        "/v1.0/me/chats",
+        get(move || {
+            let next_link = next_link.clone();
+            async move {
+                Json(json!({
+                    "value": [{ "id": "19:first@thread.v2", "chatType": "group", "topic": "First", "members": [] }],
+                    "@odata.nextLink": next_link
+                }))
+            }
+        }),
+    );
+    let (base_url, server) = spawn_test_router(app).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_cfg, graph) = build_direct_graph_client(&base_url, dir.path(), "tok-01");
+
+    let err = graph
+        .list_chats(100)
+        .await
+        .expect_err("the walk must stop instead of following the foreign link with a token");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("Refusing to send Graph credentials to an unexpected host: 127.0.0.1"), "{msg}");
+    assert!(!msg.contains("skiptoken"), "only the host is reported: {msg}");
+    assert_eq!(foreign_hits.load(Ordering::SeqCst), 0, "no request may reach the foreign host");
+    assert!(foreign_auth.read().unwrap().is_empty());
+
+    // The same guard covers a cursor handed in directly (e.g. one read back from SQLite).
+    let err = graph
+        .list_chats_page(50, Some(&format!("{foreign_base}/v1.0/me/chats")))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("Refusing to send Graph credentials"));
+    assert_eq!(foreign_hits.load(Ordering::SeqCst), 0);
+
+    server.abort();
+    foreign_server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_16_create_chat_escapes_quoted_and_guest_upn() {
+    ensure_isolated_env();
+    let bodies: Arc<RwLock<Vec<Value>>> = Arc::new(RwLock::new(Vec::new()));
+    let captured = bodies.clone();
+    let app = Router::new().route(
+        "/v1.0/chats",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.write().unwrap().push(body);
+                (
+                    StatusCode::CREATED,
+                    Json(json!({ "id": "19:new@unq.gbl.spaces", "chatType": "oneOnOne", "members": [] })),
+                )
+            }
+        }),
+    );
+    let (base_url, server) = spawn_test_router(app).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_cfg, graph) = build_direct_graph_client(&base_url, dir.path(), "tok-16");
+
+    graph.create_chat(&["o'brien@contoso.com".to_string()], None).await.unwrap();
+    graph
+        .create_chat(
+            &["guest_ext.com#EXT#@tenant.onmicrosoft.com".to_string(), "bob@contoso.com".to_string()],
+            Some("Guests"),
+        )
+        .await
+        .unwrap();
+
+    let bodies = bodies.read().unwrap();
+    let binds = |body: &Value| -> Vec<String> {
+        body["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["user@odata.bind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        binds(&bodies[0]),
+        [
+            "https://graph.microsoft.com/v1.0/users('me-user-1')",
+            "https://graph.microsoft.com/v1.0/users('o''brien@contoso.com')",
+        ]
+    );
+    assert_eq!(
+        binds(&bodies[1]),
+        [
+            "https://graph.microsoft.com/v1.0/users('me-user-1')",
+            "https://graph.microsoft.com/v1.0/users('guest_ext.com%23EXT%23@tenant.onmicrosoft.com')",
+            "https://graph.microsoft.com/v1.0/users('bob@contoso.com')",
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn regression_teams_21_export_include_threads_reports_failed_replies() {
+    let fail_replies = Arc::new(RwLock::new(true));
+    let fail = fail_replies.clone();
+
+    let app = Router::new()
+        .route(
+            "/v1.0/me",
+            get(|| async {
+                Json(json!({ "id": "me-user-1", "displayName": "Me (Tester)", "mail": "tester@contoso.com", "userPrincipalName": "tester@contoso.com" }))
+            }),
+        )
+        .route("/v1.0/me/chats", get(|| async { Json(json!({ "value": [] })) }))
+        .route(
+            "/v1.0/me/joinedTeams",
+            get(|| async { Json(json!({ "value": [{ "id": "t1", "displayName": "CoreEng" }] })) }),
+        )
+        .route(
+            "/v1.0/$batch",
+            post(|Json(payload): Json<Value>| async move {
+                let responses: Vec<Value> = payload["requests"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|req| json!({
+                        "id": req["id"].as_str().unwrap_or("0"),
+                        "status": 200,
+                        "body": { "value": [{ "id": "ch1", "displayName": "General", "membershipType": "standard" }] }
+                    }))
+                    .collect();
+                Json(json!({ "responses": responses }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages",
+            get(|| async {
+                Json(json!({ "value": [
+                    mock_graph_message("root-good", "2026-11-21T09:00:01.000Z", "good root", None,
+                        Some(vec![mock_graph_message("good-r1", "2026-11-21T09:01:00.000Z", "inline good reply", Some("root-good"), None)])),
+                    mock_graph_message("root-bad", "2026-11-21T09:00:02.000Z", "bad root", None,
+                        Some(vec![mock_graph_message("bad-r1", "2026-11-21T09:02:00.000Z", "inline bad reply", Some("root-bad"), None)])),
+                ] }))
+            }),
+        )
+        .route(
+            "/v1.0/teams/t1/channels/ch1/messages/{root_id}/replies",
+            get(move |Path(root_id): Path<String>| {
+                let fail = fail.clone();
+                async move {
+                    if root_id == "root-bad" && *fail.read().unwrap() {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": { "code": "generalException", "message": "replies backend down" } })),
+                        )
+                            .into_response();
+                    }
+                    let reply = mock_graph_message(
+                        &format!("{root_id}-fetched"),
+                        "2026-11-21T09:05:00.000Z",
+                        &format!("fetched reply of {root_id}"),
+                        Some(&root_id),
+                        None,
+                    );
+                    Json(json!({ "value": [reply] })).into_response()
+                }
+            }),
+        );
+    let (base_url, server) = spawn_test_router(app).await;
+    let cli = CliEnv::new(&base_url);
+
+    let out_path = cli.path("partial.json");
+    let out = cli
+        .run(&["export", "CoreEng/General", "--format", "json", "--include-threads", "--out", out_path.to_str().unwrap()])
+        .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "a partial export must not exit 0; stderr={stderr}");
+    assert!(stderr.contains("root-bad"), "stderr names the failed root: {stderr}");
+    assert!(stderr.contains("export incomplete: 1 of 2 threads could not be fetched"), "{stderr}");
+    // The partial export is still written, with the healthy thread and an explicit gap list.
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let text = doc.to_string();
+    assert!(text.contains("fetched reply of root-good"), "{text}");
+    let incomplete = doc["incomplete_threads"].as_array().expect("incomplete_threads present");
+    assert_eq!(incomplete.len(), 1, "{incomplete:?}");
+    assert_eq!(incomplete[0]["root_msg_id"], "root-bad");
+    assert!(incomplete[0]["error"].as_str().unwrap().contains("500"), "{incomplete:?}");
+
+    // Control: with every thread fetched the export is clean — exit 0 and no extra key.
+    *fail_replies.write().unwrap() = false;
+    let ok_path = cli.path("complete.json");
+    let ok = cli
+        .run(&["export", "CoreEng/General", "--format", "json", "--include-threads", "--out", ok_path.to_str().unwrap()])
+        .await;
+    assert!(ok.status.success(), "stderr={}", String::from_utf8_lossy(&ok.stderr));
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&ok_path).unwrap()).unwrap();
+    assert!(doc.get("incomplete_threads").is_none(), "{doc}");
+    assert!(doc.to_string().contains("fetched reply of root-bad"));
+
+    server.abort();
+}

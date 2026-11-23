@@ -154,11 +154,17 @@ fn extract_error_detail_for_status(lower: &str) -> &str {
 }
 
 pub(crate) fn classify_sync_error(err: &anyhow::Error) -> SyncErrorKind {
-    let lower = format!("{err:#}").to_ascii_lowercase();
-    let detail = extract_error_detail_for_status(&lower);
+    let full = format!("{err:#}");
+    // The parsed response status decides first; a "403"/"401" inside an id, a URL or the
+    // error body must not change the class of a different response.
+    match crate::graph::extract_graph_http_status(&full) {
+        Some(403) => return SyncErrorKind::Forbidden403,
+        Some(401) => return SyncErrorKind::Unauthorized401,
+        _ => {}
+    }
+    let lower = full.to_ascii_lowercase();
 
-    if detail.contains("403")
-        || lower.contains("forbidden")
+    if lower.contains("forbidden")
         || lower.contains("authorization_requestdenied")
         || lower.contains("insufficient")
         || lower.contains("aclcheckfailed")
@@ -166,10 +172,7 @@ pub(crate) fn classify_sync_error(err: &anyhow::Error) -> SyncErrorKind {
         return SyncErrorKind::Forbidden403;
     }
 
-    if detail.contains("401")
-        || lower.contains("unauthorized")
-        || lower.contains("token expired")
-    {
+    if lower.contains("unauthorized") || lower.contains("token expired") {
         return SyncErrorKind::Unauthorized401;
     }
 
@@ -2785,6 +2788,23 @@ mod tests {
         assert_eq!(
             classify_sync_error(&anyhow::anyhow!("request timed out")),
             SyncErrorKind::Transient
+        );
+        // A "403"/"401" in the error body or a message id does not reclassify another status.
+        assert_eq!(
+            classify_sync_error(&anyhow::anyhow!(
+                "Graph API error (GET https://graph.microsoft.com/v1.0/chats/c1/messages/1700000403123): 500 Internal Server Error [generalException] request 403401 failed"
+            )),
+            SyncErrorKind::Transient
+        );
+        // Context added in front of the Graph error keeps the status parseable.
+        assert_eq!(
+            classify_sync_error(
+                &anyhow::anyhow!(
+                    "Graph API error (GET https://graph.microsoft.com/v1.0/me/chats): 403 Forbidden"
+                )
+                .context("refresh failed")
+            ),
+            SyncErrorKind::Forbidden403
         );
 
         assert!(is_expired_delta_error(&anyhow::anyhow!(

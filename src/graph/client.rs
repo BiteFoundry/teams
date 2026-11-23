@@ -567,6 +567,17 @@ impl GraphClient {
         timeout: Duration,
         retry: RetryClass,
     ) -> Result<reqwest::Response> {
+        // One central origin check for every helper, including `@odata.nextLink` values
+        // taken from responses or from the SQLite cursor table: the Graph token only ever
+        // goes to the configured Graph host (or the hosts `should_send_bearer` allows).
+        if use_bearer && !super::media::should_send_bearer(&self.config.graph_base_url, url) {
+            let host = url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "<unparseable URL>".to_string());
+            bail!("Refusing to send Graph credentials to an unexpected host: {host}");
+        }
+
         let mut unauthorized_retried = false;
         let mut throttle_attempt = 0usize;
         let mut transport_retried = false;
@@ -1441,6 +1452,50 @@ mod tests {
         let batch_resps = client.batch(&sub_reqs).await.unwrap();
         assert_eq!(batch_resps.len(), 25);
         assert_eq!(batch_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_is_refused_for_hosts_outside_the_graph_origin() {
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = "https://graph.microsoft.com/v1.0".to_string();
+        let tok = crate::auth::StoredTokens {
+            access_token: "secret-token".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let client = GraphClient::new(cfg.clone(), AuthManager::from_tokens(cfg, tok)).unwrap();
+
+        // Refused before any connection: the error names the host only, never the query.
+        for url in [
+            "https://evil.example/v1.0/me/chats?$skiptoken=SECRETCURSOR",
+            "http://graph.microsoft.com/v1.0/me",
+            "https://graph.microsoft.com.evil.example/v1.0/me",
+        ] {
+            let err = client
+                .get_json::<serde_json::Value>(url)
+                .await
+                .expect_err("credentials must not leave the Graph origin");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.starts_with("Refusing to send Graph credentials to an unexpected host: "),
+                "{msg}"
+            );
+            assert!(!msg.contains("SECRETCURSOR") && !msg.contains("secret-token"), "{msg}");
+        }
+        let err = client
+            .post_json::<_, serde_json::Value>("https://evil.example/collect", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to send Graph credentials to an unexpected host: evil.example"
+        );
     }
 
     #[test]
