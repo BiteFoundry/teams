@@ -3,6 +3,10 @@
 //!
 //! Run with:
 //!   cargo run --example demo_capture
+//!
+//! The renderer is not part of this repository. Point `DEMO_RENDERER_SCRIPT` at
+//! `render_tui_gif.py` (default: `scripts/render_tui_gif.py`) and, optionally,
+//! `DEMO_PREVIEW_DIR` at a directory for preview PNGs (default: `target/demo-previews/teams`).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -45,8 +49,25 @@ use teams_cli::{
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 34;
 
-const RENDERER_SCRIPT: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\render_tui_gif.py";
-const PREVIEW_DIR: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\gif-previews\teams";
+/// A non-empty environment variable as a path.
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The GIF renderer script: `DEMO_RENDERER_SCRIPT`, else `scripts/render_tui_gif.py`
+/// relative to the working directory (`cargo run --example` runs from the repo root).
+fn renderer_script() -> PathBuf {
+    env_path("DEMO_RENDERER_SCRIPT")
+        .unwrap_or_else(|| PathBuf::from("scripts").join("render_tui_gif.py"))
+}
+
+/// Where preview PNGs are written: `DEMO_PREVIEW_DIR`, else `target/demo-previews/teams`.
+fn preview_dir() -> PathBuf {
+    env_path("DEMO_PREVIEW_DIR")
+        .unwrap_or_else(|| PathBuf::from("target").join("demo-previews").join("teams"))
+}
 
 fn color_to_json(c: Color) -> Value {
     match c {
@@ -1015,12 +1036,21 @@ async fn main() {
         .join("assets")
         .join("demo.gif");
 
+    let renderer = renderer_script();
+    assert!(
+        renderer.is_file(),
+        "renderer script not found at {}; set DEMO_RENDERER_SCRIPT",
+        renderer.display()
+    );
+    let previews = preview_dir();
+    std::fs::create_dir_all(&previews).expect("create preview dir");
+
     let status = Command::new("python")
-        .arg(RENDERER_SCRIPT)
+        .arg(&renderer)
         .arg(&tmp_json)
         .arg(&out_gif)
         .arg("--preview-png")
-        .arg(PREVIEW_DIR)
+        .arg(&previews)
         .status()
         .expect("failed to invoke python render_tui_gif.py");
     assert!(status.success(), "render_tui_gif.py exited with {status}");
