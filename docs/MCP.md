@@ -128,6 +128,23 @@ args = ["mcp"]
 
 `mentions` accepts either `"user_id:DisplayName"` strings or `{ "id"?: 0, "user_id": "...", "display_name": "..." }` objects. Each mentioned user's `@DisplayName` must appear in `markdown` or the call fails before sending. Duplicate display names are assigned in `mentions` order. Set `important: true` to mark the message with high importance.
 
+### Request cost
+
+Tool descriptions state what a call costs, so an agent can prefer cached reads. The counts below are Microsoft Graph requests per call.
+
+| Tool | Cost |
+| --- | --- |
+| `list_chats` | No request when the cache covers `limit`; `refresh: true` or a short cache costs about 1 request per 50 chats. |
+| `list_teams_channels` | No request for a cached read or a `cursor` page; `refresh: true` or an empty cache lists teams (1+ requests), then channels (1 `$batch` per 20 teams). |
+| `get_messages` | Online by default: about 1 request per 50 messages; `offline: true` makes none. |
+| `get_thread` | Online: 1+ requests (50 replies each); `offline: true` makes none. |
+| `list_members` | Fetches the member list first (1+ requests) unless `cursor` or `offline` is set. |
+| `send_file` | Time grows with file size: one upload request up to 4 MiB, 3.2 MiB chunks above, then the message post. |
+| `download_attachment` | Time grows with attachment size. |
+| `search_messages` | No request: local FTS5 over cached messages only. |
+| `search_users` | 1 request (2 when the tenant rejects `$filter`). |
+| `get_presence` | 1 request (per 650 user IDs). |
+
 ### Compact and offline reads
 
 `get_messages` and `get_thread` default to `compact: true`. Set `compact: false` for full conversation and message objects. Compact output returns `conversation: { conv_key, title }`, fixed message fields (`msg_id`, `author_id`, `author_name`, `created_at`, `body_plain`), reply/edit links when present (`last_modified_at`, `parent_msg_id`, `reply_to_id`), non-`messageReference` attachments as `{ id, name }`, and the following conditional keys when non-default:

@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod graph;
+pub(crate) mod http;
 pub mod img_preview;
 pub mod mcp;
 pub mod models;

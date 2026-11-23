@@ -30,3 +30,22 @@ teams doctor --probe
 For SSH, add `--device-code` to the login command. To use the same registration for subsequent sign-ins, set `TEAMS_CLIENT_ID` and `TEAMS_TENANT_ID`. Match the sign-in event’s **Application ID** with your registered client ID in **Entra ID → Monitoring & health → Sign-in logs**. Review consent under the corresponding Enterprise application.
 
 Without an override, Teams uses the public **Microsoft Graph Command Line Tools** client. The optional Azure CLI broker uses the identity already signed in to Azure CLI. Your tenant’s policy and the scopes on its issued token determine which Graph operations succeed. [Microsoft application IDs](https://learn.microsoft.com/en-us/troubleshoot/azure/entra/entra-id/governance/verify-first-party-apps-sign-in) · [Azure CLI Graph tokens](https://learn.microsoft.com/en-us/cli/azure/account#az-account-get-access-token)
+
+## Corporate proxy and custom root CA
+
+Teams verifies every TLS connection against the bundled Mozilla roots and the operating system's certificate store, so a corporate root CA installed in Windows, macOS or Linux is trusted without further setup. Verification cannot be turned off.
+
+If a TLS-inspecting proxy re-signs traffic with a CA that is not in the OS store, commands fail with the error code `tls_untrusted_certificate` and the message `TLS certificate was not trusted (unknown issuer)`. Export the proxy's root CA as a PEM file (several certificates in one file are fine) and point Teams at it:
+
+```sh
+export TEAMS_EXTRA_CA_PEM=/path/to/corporate-root-ca.pem   # PowerShell: $env:TEAMS_EXTRA_CA_PEM = "C:\path\corporate-root-ca.pem"
+teams doctor --probe
+```
+
+| Variable | Handling |
+| --- | --- |
+| `TEAMS_EXTRA_CA_PEM` | Added to the trusted roots. A missing file or one without a PEM certificate stops the command with an error naming the variable. |
+| `SSL_CERT_FILE` | Added to the trusted roots; a bad value is skipped with one warning. When it (or `SSL_CERT_DIR`) is set, the OS store is read from that location instead of the platform store. |
+| `NODE_EXTRA_CA_CERTS` | Added to the trusted roots; a bad value is skipped with one warning. |
+
+All variables that are set are combined. `teams doctor` lists each source and how many certificates it loaded (`tls_extra_ca`, or `tls.extra_ca` with `--json`).

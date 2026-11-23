@@ -46,6 +46,7 @@ Environment Variables:
   TEAMS_CLI_CACHE_SECS=<SECS>           Local cache TTL in seconds for CLI read commands [default: 0; --cached/--fast prefers cache]
   TEAMS_AUTO_DAEMON=1                   Auto-start/connect to background sync daemon (config.toml: auto_daemon = true) [default: false]
   TEAMS_IMAGE_PROTOCOL=<PROTO>          Terminal image protocol (auto, kitty, iterm2, sixel, halfblock)
+  TEAMS_EXTRA_CA_PEM=<PATH>             Extra trusted root CAs (PEM) for TLS-inspecting proxies; SSL_CERT_FILE and NODE_EXTRA_CA_CERTS are also read
 
 Background Sync Daemon:
   teams daemon start | status | stop | restart";
@@ -2000,6 +2001,14 @@ async fn cmd_doctor(
         .await
         .unwrap_or_default();
     let graphics_caps = img_preview::detect_graphics_caps(cfg.image_protocol);
+    // Extra trust roots on top of the bundled and OS stores (corporate TLS-inspecting proxies).
+    let extra_ca: Vec<serde_json::Value> = crate::http::ca_sources()
+        .into_iter()
+        .map(|s| match s.outcome {
+            Ok(certs) => json!({ "var": s.var, "path": s.path, "certificates": certs.len() }),
+            Err(err) => json!({ "var": s.var, "path": s.path, "error": err }),
+        })
+        .collect();
 
     let mut probe_me: Option<serde_json::Value> = None;
     let mut probe_presence: Option<serde_json::Value> = None;
@@ -2074,6 +2083,10 @@ async fn cmd_doctor(
                 "image_protocol": graphics_caps.protocol.as_str(),
                 "image_protocol_preference": cfg.image_protocol.as_str(),
                 "cell_px": [graphics_caps.cell_px.0, graphics_caps.cell_px.1],
+                "tls": {
+                    "roots": ["bundled", "os"],
+                    "extra_ca": extra_ca,
+                },
                 "probe": if probe {
                     Some(json!({
                         "ok": probe_error.is_none(),
@@ -2170,6 +2183,20 @@ async fn cmd_doctor(
             graphics_caps.cell_px.1,
             cell_suffix,
         );
+        if extra_ca.is_empty() {
+            println!("tls_extra_ca: (none; bundled + OS roots)");
+        }
+        for source in &extra_ca {
+            let var = source["var"].as_str().unwrap_or("-");
+            let path = source["path"].as_str().unwrap_or("-");
+            match source.get("certificates") {
+                Some(n) => println!("tls_extra_ca: {var}={path} ({n} certificates)"),
+                None => println!(
+                    "tls_extra_ca: {var}={path} (not loaded: {})",
+                    source["error"].as_str().unwrap_or("-")
+                ),
+            }
+        }
         if probe {
             if let Some(err) = probe_error {
                 println!("probe: failed ({err})");
@@ -4484,7 +4511,9 @@ pub(crate) fn is_forbidden_error(err: &anyhow::Error) -> bool {
 pub(crate) use crate::graph::extract_graph_http_status;
 
 pub(crate) fn error_code_for_message(msg: &str) -> &'static str {
-    if msg.contains("Conversation/channel not found") {
+    if msg.contains(crate::http::TLS_UNTRUSTED_MARKER) {
+        "tls_untrusted_certificate"
+    } else if msg.contains("Conversation/channel not found") {
         "target_not_found"
     } else if msg.contains("Sign-in required") {
         "not_signed_in"
@@ -7009,6 +7038,12 @@ mod tests {
             error_code_for_message("Authorization_RequestDenied: Insufficient privileges to complete the operation."),
             "permission_denied"
         );
+        let untrusted = error_json(&anyhow::anyhow!(
+            "Graph HTTP request failed (GET https://graph.microsoft.com/v1.0/me). {} (unknown issuer). If your network uses a TLS-inspecting proxy, ...: error sending request",
+            crate::http::TLS_UNTRUSTED_MARKER
+        ));
+        assert_eq!(untrusted["error"]["code"], "tls_untrusted_certificate");
+        assert!(untrusted["error"].get("http_status").is_none());
 
         let target_missing = error_json(&anyhow::anyhow!(
             "Conversation/channel not found: NonExistentRoom"

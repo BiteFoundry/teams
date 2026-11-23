@@ -841,7 +841,10 @@ impl AuthManager {
             .form(&[("client_id", client_id), ("scope", scope.as_str())])
             .send()
             .await
-            .context("Failed to send Device Code request")?;
+            .map_err(|e| {
+                let context = crate::http::request_context("Failed to send Device Code request".into(), &e);
+                anyhow::Error::new(e).context(context)
+            })?;
 
         let status = res.status();
         let body_text = res.text().await.unwrap_or_default();
@@ -886,7 +889,10 @@ impl AuthManager {
                 ])
                 .send()
                 .await
-                .context("Failed to poll Device Code token")?;
+                .map_err(|e| {
+                    let context = crate::http::request_context("Failed to poll Device Code token".into(), &e);
+                    anyhow::Error::new(e).context(context)
+                })?;
 
             let poll_status = poll_res.status();
             let poll_text = poll_res.text().await.unwrap_or_default();
@@ -1041,7 +1047,10 @@ impl AuthManager {
         let res = req
             .send()
             .await
-            .context("Failed to send OAuth token request")?;
+            .map_err(|e| {
+                let context = crate::http::request_context("Failed to send OAuth token request".into(), &e);
+                anyhow::Error::new(e).context(context)
+            })?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -1244,8 +1253,7 @@ fn generate_random_b64(num_bytes: usize) -> String {
 }
 
 fn build_auth_http_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(concat!("teams-cli/", env!("CARGO_PKG_VERSION")))
+    crate::http::client_builder()?
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to initialize HTTP client")

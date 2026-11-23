@@ -1009,11 +1009,11 @@ fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
             "name": "list_chats",
-            "description": "List 1:1, group, and meeting chats. Set refresh=true to sync from Microsoft Graph first.",
+            "description": "List 1:1, group, and meeting chats. Reads the local cache when it covers limit (no Graph request); refresh=true or a short cache costs about 1 Graph request per 50 chats.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync chats from Microsoft Graph before returning." },
+                    "refresh": { "type": "boolean", "description": "Sync chats from Microsoft Graph before returning (about 1 request per 50 chats)." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
                 },
                 "additionalProperties": false
@@ -1052,11 +1052,11 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_teams_channels",
-            "description": "List joined Microsoft Teams and their channels. Set refresh=true to sync from Microsoft Graph first.",
+            "description": "List joined Microsoft Teams and their channels. Cached reads make no Graph request; refresh=true or an empty cache lists teams (1+ requests) then channels (1 $batch per 20 teams).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync teams and channels from Microsoft Graph before returning." },
+                    "refresh": { "type": "boolean", "description": "Sync teams and channels from Microsoft Graph before returning (1+ requests for teams, plus 1 $batch per 20 teams)." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "cursor": { "type": "string", "description": "next_cursor from the previous page; reads the next page from the local cache without calling Microsoft Graph." }
                 },
@@ -1065,14 +1065,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_messages",
-            "description": "Read messages from a chat or team channel, oldest first. Use before and limit to page through older history.",
+            "description": "Read messages from a chat or team channel, oldest first. Use before and limit to page through older history. Online by default: about 1 Graph request per 50 messages; offline=true makes none.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
                     "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to read older messages preceding it." },
-                    "offline": { "type": "boolean", "default": false, "description": "Read from the local SQLite cache." },
+                    "offline": { "type": "boolean", "default": false, "description": "Read from the local SQLite cache only (no Graph request)." },
                     "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target"],
@@ -1081,14 +1081,14 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_thread",
-            "description": "Read a channel root post and up to limit replies, oldest first. The root is included separately.",
+            "description": "Read a channel root post and up to limit replies, oldest first. The root is included separately. Online: 1+ Graph requests (50 replies each); offline=true makes none.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": { "type": "string", "description": "Channel conv_key, \"Team/Channel\", or unique channel title." },
                     "root_msg_id": { "type": "string", "minLength": 1 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "offline": { "type": "boolean", "default": false, "description": "Read verified replies from the local SQLite cache. A cache miss or insufficient reply coverage returns an error." },
+                    "offline": { "type": "boolean", "default": false, "description": "Read verified replies from the local SQLite cache (no Graph request). A cache miss or insufficient reply coverage returns an error." },
                     "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
                 },
                 "required": ["target", "root_msg_id"],
@@ -1131,7 +1131,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "send_file",
-            "description": "Upload a local file (from the host running teams) to OneDrive/SharePoint and post a reference attachment (or inline image when inline=true).",
+            "description": "Upload a local file (from the host running teams) to OneDrive/SharePoint and post a reference attachment (or inline image when inline=true). Time grows with file size: one upload request up to 4 MiB, 3.2 MiB chunks above.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1148,7 +1148,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "download_attachment",
-            "description": "Download a file attachment or inline Teams screenshot (hostedContents) from a message to local disk. Returns structured JSON { ok, path (absolute), file_name, mime_type, size_bytes, is_image } so multimodal agents can inspect images and files directly.",
+            "description": "Download a file attachment or inline Teams screenshot (hostedContents) from a message to local disk. Returns structured JSON { ok, path (absolute), file_name, mime_type, size_bytes, is_image } so multimodal agents can inspect images and files directly. Time grows with attachment size.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1218,7 +1218,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_messages",
-            "description": "Search cached messages using local SQLite FTS5.",
+            "description": "Search cached messages using local SQLite FTS5. No Graph request; only messages already in the cache are found.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1232,7 +1232,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_members",
-            "description": "List members of a chat or team channel.",
+            "description": "List members of a chat or team channel. Fetches the member list from Microsoft Graph first (1+ requests) unless cursor or offline is set, which read the cache only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1247,7 +1247,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_users",
-            "description": "Search directory users by display name or email prefix.",
+            "description": "Search directory users by display name or email prefix. 1 Graph request (2 when the tenant rejects $filter).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1272,7 +1272,7 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_presence",
-            "description": "Get presence for the current user or a list of user IDs.",
+            "description": "Get presence for the current user or a list of user IDs. 1 Graph request (per 650 user IDs).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1751,6 +1751,51 @@ fn format_error(error: anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Tool descriptions are read by agents before every call: state what a call costs, and keep
+    // them short because each one is paid for in every agent context.
+    #[test]
+    fn tool_descriptions_state_request_cost_and_stay_short() {
+        const BUDGET: usize = 400;
+        for tool in tool_catalog() {
+            let name = tool["name"].as_str().unwrap();
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.len() <= BUDGET, "{name}: {} chars", description.len());
+            let props = &tool["inputSchema"]["properties"];
+            if let Some(refresh) = props.get("refresh") {
+                let d = refresh["description"].as_str().unwrap_or("");
+                assert!(d.contains("Graph") && d.contains("request"), "{name}.refresh: {d}");
+            }
+            if let Some(offline) = props.get("offline") {
+                let d = offline["description"].as_str().unwrap_or("");
+                assert!(
+                    d.contains("no Graph request") || d.contains("without calling Microsoft Graph"),
+                    "{name}.offline: {d}"
+                );
+            }
+        }
+        let cost_stated = |name: &str| {
+            tool_catalog()
+                .into_iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["description"].as_str().map(str::to_string))
+                .is_some_and(|d| d.contains("request") || d.contains("size"))
+        };
+        for name in [
+            "list_chats",
+            "list_teams_channels",
+            "get_messages",
+            "get_thread",
+            "list_members",
+            "send_file",
+            "download_attachment",
+            "search_messages",
+            "search_users",
+            "get_presence",
+        ] {
+            assert!(cost_stated(name), "{name} has no cost hint");
+        }
+    }
     use crate::auth::AuthManager;
 
     fn test_ctx() -> (AppConfig, GraphClient, Storage) {

@@ -26,7 +26,7 @@
 | **Minimal-Chrome TUI** | 3-tier responsive `ratatui` layout (`Wide` / `Medium` / `Narrow`), Composer-First workflow, side-by-side Thread Drawer, Link Extractor (`u`), `zoxide` File Picker (`Ctrl+F`), Unified `Ctrl+K` Omni-Switcher, Cozy/Compact density (`Ctrl+D`), and multi-depth themes (`Midnight Dark`, `Daylight Light`, `ANSI 256/16`, `NO_COLOR`). |
 | **High-Res Terminal Images** | Native inline rendering for attachments & pasted `hostedContents` screenshots across **Kitty**, **iTerm2 (`OSC 1337`)**, **Sixel (`DCS q`)**, and **24-bit Half-Blocks (`▀`)** universal fallback with live zoom (`+`/`-`/`0`) and protocol switching (`p`). |
 | **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with `@odata.nextLink` deep history cursors, offline hybrid search (`teams search`), and cached CLI reads via `teams daemon`. |
-| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 18 tools)**. |
+| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 19 tools)**. |
 
 ---
 
@@ -54,6 +54,8 @@ IT administrators can register the app, select delegated permissions and verify 
 Update a global npm install with `npm install -g @bitefoundry/teams@latest`. For a standalone binary from [GitHub Releases](https://github.com/BiteFoundry/teams/releases), use `teams update`. To build from source, run `cargo build --release --locked`.
 
 > **External Token Brokers & Custom Entra ID Apps:** Supports `TEAMS_ACCESS_TOKEN`, `TEAMS_TOKEN_FILE`, `TEAMS_TOKEN_REFRESH_CMD` (including `az account get-access-token`), and custom `--client-id` / `--tenant-id`. Run `teams whoami` or `teams doctor --probe` for instant JWT scope diagnostics.
+>
+> **Corporate TLS-inspecting proxies:** Teams trusts the bundled Mozilla roots and the OS certificate store. If requests still fail with `tls_untrusted_certificate`, export the corporate root CA as PEM and set `TEAMS_EXTRA_CA_PEM=<path>` (`SSL_CERT_FILE` and `NODE_EXTRA_CA_CERTS` are also read). See [docs/ENTERPRISE.md](docs/ENTERPRISE.md#corporate-proxy-and-custom-root-ca).
 
 ---
 

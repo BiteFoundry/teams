@@ -621,8 +621,11 @@ impl GraphClient {
                         tokio::time::sleep(Duration::from_millis(100 + jitter_ms)).await;
                         continue;
                     }
-                    return Err(err)
-                        .with_context(|| format!("Graph HTTP request failed ({method} {url})"));
+                    let context = crate::http::request_context(
+                        format!("Graph HTTP request failed ({method} {url})"),
+                        &err,
+                    );
+                    return Err(anyhow::Error::new(err).context(context));
                 }
             };
             let status = resp.status();
