@@ -1286,7 +1286,7 @@ fn keyring_account_for(config_dir: &Path, default_config_dir: &Path) -> String {
 /// One spelling per directory: absolute, without trailing separators, and on Windows with
 /// backslashes and in lowercase. The directory does not need to exist.
 fn normalize_profile_dir(dir: &Path) -> String {
-    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let abs = crate::config::canonicalize_existing_ancestor(dir);
     #[allow(unused_mut)]
     let mut s = abs.to_string_lossy().into_owned();
     #[cfg(windows)]
@@ -2155,6 +2155,47 @@ mod tests {
             let upper = work.to_string_lossy().to_uppercase().replace('\\', "/");
             assert_eq!(keyring_account_for(Path::new(&upper), &default_dir), a);
         }
+
+        // Non-existent multi-level tail under existing root remains stable and distinct.
+        let nested_a = root.path().join("not-yet").join("profile-a");
+        let nested_b = root.path().join("not-yet").join("profile-b");
+        assert_eq!(
+            keyring_account_for(&nested_a, &nested_a),
+            KEYRING_DEFAULT_ACCOUNT
+        );
+        assert_ne!(
+            keyring_account_for(&nested_a, &default_dir),
+            keyring_account_for(&nested_b, &default_dir)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_keyring_account_symlinked_and_canonical_paths_match() {
+        let root = tempdir().unwrap();
+        let real_home = root.path().join("real-home");
+        std::fs::create_dir_all(real_home.join(".config/teams-cli")).unwrap();
+        let sym_home = root.path().join("sym-home");
+        std::os::unix::fs::symlink(&real_home, &sym_home).unwrap();
+
+        let sym_default = sym_home.join(".config/teams-cli");
+        let real_default = real_home.join(".config/teams-cli");
+        assert_eq!(
+            keyring_account_for(&real_default, &sym_default),
+            KEYRING_DEFAULT_ACCOUNT
+        );
+        assert_eq!(
+            keyring_account_for(&sym_default, &real_default),
+            KEYRING_DEFAULT_ACCOUNT
+        );
+
+        // Non-existent tail under symlinked vs canonical home produces the exact same profile hash.
+        let sym_profile = sym_home.join("profiles/work-not-created-yet");
+        let real_profile = real_home.join("profiles/work-not-created-yet");
+        assert_eq!(
+            keyring_account_for(&sym_profile, &real_default),
+            keyring_account_for(&real_profile, &sym_default)
+        );
     }
 
     #[test]

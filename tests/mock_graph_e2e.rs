@@ -7739,7 +7739,7 @@ async fn regression_teams_bug_20_compact_default_and_full() {
     assert_eq!(m6["reply_to_id"], "c-msg-1");
 
     assert!(j["hint"].as_str().unwrap().ends_with("--json --full --limit 30"));
-    assert_eq!(j["omitted"]["fields"].as_array().unwrap().len(), 25);
+    assert_eq!(j["omitted"]["fields"].as_array().unwrap().len(), 24);
 
     // --json --full returns full objects without omitted/hint and preserves messageReference attachment
     let full_out = run_cli(&tmp, &["read", "Release Room", "--json", "--full"]).await;

@@ -2419,4 +2419,112 @@ mod tests {
         )
         .is_err());
     }
+
+    #[tokio::test]
+    async fn compact_get_messages_includes_non_empty_attachment_content_type() {
+        use crate::models::{AttachmentInfo, ConversationKind, MessageItem};
+
+        let (cfg, graph, storage) = test_ctx();
+        storage
+            .upsert_conversations(&[ConversationSummary {
+                conv_key: "chat:19:cards".to_string(),
+                target: ConversationTarget::Chat {
+                    chat_id: "19:cards".to_string(),
+                },
+                kind: ConversationKind::Group,
+                team_id: None,
+                team_name: None,
+                title: "Alerts Bot".to_string(),
+                topic: None,
+                unread_count: 0,
+                last_read_at: None,
+                last_msg_id: Some("msg-card".to_string()),
+                last_msg_author: Some("AlertBot".to_string()),
+                last_msg_preview: Some("Deploy alert".to_string()),
+                last_updated_at: Some("2026-11-20T09:00:00Z".to_string()),
+                pinned: false,
+                peer_user_id: None,
+                web_url: None,
+            }])
+            .unwrap();
+        storage
+            .upsert_messages(&[MessageItem {
+                msg_key: "chat:19:cards|msg-card".to_string(),
+                conv_key: "chat:19:cards".to_string(),
+                msg_id: "msg-card".to_string(),
+                parent_msg_id: None,
+                reply_to_id: None,
+                reply_to_author: None,
+                reply_to_preview: None,
+                subject: None,
+                author_id: Some("bot-1".to_string()),
+                author_name: "AlertBot".to_string(),
+                is_me: false,
+                created_at: "2026-11-20T09:00:00Z".to_string(),
+                last_modified_at: None,
+                deleted: false,
+                importance: "normal".to_string(),
+                message_type: "message".to_string(),
+                body_html: String::new(),
+                body_plain: "Deploy alert".to_string(),
+                attachments: vec![
+                    AttachmentInfo {
+                        id: "card-att-1".to_string(),
+                        content_type: "application/vnd.microsoft.card.adaptive".to_string(),
+                        content_url: None,
+                        name: None,
+                        content_json: Some(r#"{"type":"AdaptiveCard"}"#.to_string()),
+                        thumbnail_url: None,
+                    },
+                    AttachmentInfo {
+                        id: "unnamed-att-2".to_string(),
+                        content_type: String::new(),
+                        content_url: None,
+                        name: None,
+                        content_json: None,
+                        thumbnail_url: None,
+                    },
+                ],
+                mentions: vec![],
+                reactions: vec![],
+                reply_count: 0,
+                web_url: None,
+            }])
+            .unwrap();
+
+        let resp = handle_rpc_line(
+            &cfg,
+            &graph,
+            &storage,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_messages",
+                    "arguments": { "target": "chat:19:cards", "offline": true }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], false, "{resp}");
+        let payload: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            payload["messages"][0]["attachments"],
+            json!([
+                {
+                    "id": "card-att-1",
+                    "name": null,
+                    "content_type": "application/vnd.microsoft.card.adaptive"
+                },
+                {
+                    "id": "unnamed-att-2",
+                    "name": null
+                }
+            ])
+        );
+    }
 }

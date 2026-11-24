@@ -4216,7 +4216,6 @@ const COMPACT_OMITTED_FIELDS: &[&str] = &[
     "is_me",
     "body_html",
     "web_url",
-    "attachments.content_type",
     "attachments.content_url",
     "attachments.content_json",
     "attachments.thumbnail_url",
@@ -4235,6 +4234,15 @@ const COMPACT_OMITTED_FIELDS: &[&str] = &[
     "conversation.peer_user_id",
     "conversation.web_url",
 ];
+
+fn compact_attachment(att: &crate::models::AttachmentInfo) -> serde_json::Value {
+    let mut stub = json!({ "id": att.id, "name": att.name });
+    let content_type = att.content_type.trim();
+    if !content_type.is_empty() {
+        stub["content_type"] = json!(content_type);
+    }
+    stub
+}
 
 fn compact_conversation(conv: &ConversationSummary) -> serde_json::Value {
     json!({ "conv_key": conv.conv_key, "title": conv.title })
@@ -4276,7 +4284,7 @@ fn compact_message(msg: &MessageItem) -> serde_json::Value {
         .attachments
         .iter()
         .filter(|att| !att.is_message_reference())
-        .map(|att| json!({ "id": att.id, "name": att.name }))
+        .map(compact_attachment)
         .collect();
     if !attachments.is_empty() {
         value["attachments"] = serde_json::Value::Array(attachments);
@@ -4323,7 +4331,7 @@ pub(crate) fn sent_ack_json(
         .attachments
         .iter()
         .filter(|att| !att.is_message_reference())
-        .map(|att| json!({ "id": att.id, "name": att.name }))
+        .map(compact_attachment)
         .collect();
     if !attachments.is_empty() {
         msg_val["attachments"] = serde_json::Value::Array(attachments);
@@ -6851,8 +6859,36 @@ mod tests {
                 .to_string();
         m6.body_plain = "See https://docs.example.com/bare".to_string();
 
+        let mut m7 = base_msg("m7");
+        m7.attachments = vec![
+            AttachmentInfo {
+                id: "card-1".to_string(),
+                content_type: "application/vnd.microsoft.card.adaptive".to_string(),
+                content_url: None,
+                name: None,
+                content_json: Some(r#"{"type":"AdaptiveCard"}"#.to_string()),
+                thumbnail_url: None,
+            },
+            AttachmentInfo {
+                id: "file-1".to_string(),
+                content_type: "reference".to_string(),
+                content_url: Some("https://contoso.sharepoint.com/report.pdf".to_string()),
+                name: Some("report.pdf".to_string()),
+                content_json: None,
+                thumbnail_url: None,
+            },
+            AttachmentInfo {
+                id: "empty-ct".to_string(),
+                content_type: "   ".to_string(),
+                content_url: None,
+                name: None,
+                content_json: None,
+                thumbnail_url: None,
+            },
+        ];
+
         let res = ReadMessagesResult {
-            messages: vec![m1.clone(), m2, m3, m4, m5, m6],
+            messages: vec![m1.clone(), m2, m3, m4, m5, m6, m7.clone()],
             has_more: false,
             next_before: Some("m1".to_string()),
         };
@@ -6860,7 +6896,14 @@ mod tests {
         let compact = read_messages_json(&conv, &res, Some("H"));
         assert_eq!(compact["omitted"]["mentions"], 2);
         assert_eq!(compact["omitted"]["reactions"], 1);
-        assert_eq!(compact["omitted"]["fields"].as_array().unwrap().len(), 25);
+        assert_eq!(compact["omitted"]["fields"].as_array().unwrap().len(), 24);
+        assert!(
+            !compact["omitted"]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "attachments.content_type")
+        );
         assert_eq!(compact["hint"], "H");
         let msgs = compact["messages"].as_array().unwrap();
         assert!(msgs[0].get("deleted").is_none());
@@ -6877,6 +6920,27 @@ mod tests {
             json!([{ "text": "Incident Runbook", "url": "https://docs.example.com/runbook-42" }])
         );
         assert!(msgs[5].get("links").is_none(), "bare URL already in body_plain must not add links");
+        assert_eq!(
+            msgs[6]["attachments"],
+            json!([
+                {
+                    "id": "card-1",
+                    "name": null,
+                    "content_type": "application/vnd.microsoft.card.adaptive"
+                },
+                {
+                    "id": "file-1",
+                    "name": "report.pdf",
+                    "content_type": "reference"
+                },
+                {
+                    "id": "empty-ct",
+                    "name": null
+                }
+            ])
+        );
+        let ack = sent_ack_json(&conv, &m7);
+        assert_eq!(ack["message"]["attachments"], msgs[6]["attachments"]);
 
         let full = read_messages_json(&conv, &res, None);
         assert!(full.get("omitted").is_none());

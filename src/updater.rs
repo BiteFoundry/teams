@@ -32,9 +32,25 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+/// Resolves a symlinked executable path to its real target so self-updates
+/// replace the target binary without severing the symlink.
+fn resolve_target_executable(path: &Path) -> PathBuf {
+    if path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return canonical;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Silently cleans up any `<current_exe>.old` left behind by a previous self-update.
 pub fn cleanup_stale_old_binary() {
     if let Ok(exe) = std::env::current_exe() {
+        let exe = resolve_target_executable(&exe);
         let old_path = append_ext_suffix(&exe, ".old");
         if old_path.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&old_path);
@@ -58,8 +74,9 @@ pub async fn check_or_apply_update_with_api_base(
     check_only: bool,
     force: bool,
 ) -> Result<UpdateCheckResult> {
-    let binary_path =
+    let current_exe =
         std::env::current_exe().context("Unable to determine current executable path")?;
+    let binary_path = resolve_target_executable(&current_exe);
     let token = discover_github_token(api_base_url).await;
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
@@ -968,5 +985,68 @@ mod tests {
         assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
 
         server.abort();
+    }
+
+    #[test]
+    fn test_resolve_target_executable_preserves_symlink_and_refuses_new_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("cellar");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let real_exe = real_dir.join(if cfg!(windows) { "teams.exe" } else { "teams" });
+        std::fs::write(&real_exe, b"OLD-BIN").unwrap();
+        assert_eq!(resolve_target_executable(&real_exe), real_exe);
+
+        let link_exe = bin_dir.join(if cfg!(windows) { "teams.exe" } else { "teams" });
+        let symlink_created = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_exe, &link_exe).unwrap();
+                true
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_file(&real_exe, &link_exe) {
+                    Ok(()) => true,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::PermissionDenied
+                            || err.raw_os_error() == Some(1314) =>
+                    {
+                        false
+                    }
+                    Err(err) => panic!("unexpected symlink_file error: {err}"),
+                }
+            }
+        };
+        if !symlink_created {
+            return;
+        }
+
+        let resolved = resolve_target_executable(&link_exe);
+        assert_eq!(resolved, std::fs::canonicalize(&real_exe).unwrap());
+
+        replace_executable_at(&resolved, b"NEW-BIN").unwrap();
+        assert!(link_exe.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&real_exe).unwrap(), b"NEW-BIN");
+        assert_eq!(std::fs::read(&link_exe).unwrap(), b"NEW-BIN");
+
+        // `.new` symlink refusal must remain intact.
+        let decoy = tmp.path().join("decoy");
+        std::fs::write(&decoy, b"DECOY").unwrap();
+        let new_path = append_ext_suffix(&resolved, ".new");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&decoy, &new_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&decoy, &new_path).unwrap();
+
+        let err = replace_executable_at(&resolved, b"TAMPER").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Refusing to write update binary through symlink"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"DECOY");
     }
 }

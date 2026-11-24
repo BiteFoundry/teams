@@ -512,6 +512,11 @@ fn cleanup_owned_files(paths: &DaemonPaths, our_secret: &str, sock_path: Option<
 
 #[cfg(unix)]
 fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
+    select_unix_socket_path_with_xdg(config_dir, std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+}
+
+#[cfg(unix)]
+fn select_unix_socket_path_with_xdg(config_dir: &Path, xdg_runtime_dir: Option<&str>) -> PathBuf {
     use sha2::{Digest, Sha256};
     use std::os::unix::ffi::OsStrExt;
 
@@ -520,20 +525,21 @@ fn select_unix_socket_path(config_dir: &Path) -> PathBuf {
         return candidate;
     }
 
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            let xdg_candidate = PathBuf::from(trimmed).join("teams-cli").join("daemon.sock");
-            if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
-                return xdg_candidate;
-            }
+    let canonical = crate::config::canonicalize_existing_ancestor(config_dir);
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_os_str().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    let short_hash = &digest[..12];
+
+    if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let xdg_candidate = PathBuf::from(trimmed)
+            .join("teams-cli")
+            .join(format!("daemon-{short_hash}.sock"));
+        if xdg_candidate.as_os_str().as_bytes().len() <= 90 {
+            return xdg_candidate;
         }
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(config_dir.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    let short_hash = &digest[..12];
     PathBuf::from(format!("/tmp/teams-cli-{short_hash}/daemon.sock"))
 }
 
@@ -1921,5 +1927,44 @@ mod tests {
             }
             other => panic!("unexpected frame: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_unix_socket_path_symlink_hash_consistency_and_xdg_profile_isolation() {
+        let root = tempfile::tempdir().unwrap();
+        let real_home = root.path().join("real-home");
+        let sym_home = root.path().join("sym-home");
+        let long_seg = "very-long-profile-directory-segment-for-uds-fallback-threshold-check";
+        let real_profile_a = real_home.join(long_seg).join("profile-alpha");
+        let sym_profile_a = sym_home.join(long_seg).join("profile-alpha");
+        let real_profile_b = real_home.join(long_seg).join("profile-beta");
+        fs::create_dir_all(&real_profile_a).unwrap();
+        std::os::unix::fs::symlink(&real_home, &sym_home).unwrap();
+
+        let xdg = Some("/run/user/1000");
+        let sock_real_a = select_unix_socket_path_with_xdg(&real_profile_a, xdg);
+        let sock_sym_a = select_unix_socket_path_with_xdg(&sym_profile_a, xdg);
+        assert_eq!(sock_real_a, sock_sym_a);
+        assert!(sock_real_a.starts_with("/run/user/1000/teams-cli/daemon-"));
+
+        // Non-existent tail under symlinked vs canonical parent also hashes identically.
+        let sym_profile_b = sym_home.join(long_seg).join("profile-beta");
+        let sock_real_b = select_unix_socket_path_with_xdg(&real_profile_b, xdg);
+        let sock_sym_b = select_unix_socket_path_with_xdg(&sym_profile_b, xdg);
+        assert_eq!(sock_real_b, sock_sym_b);
+
+        // Two different long-path profiles must get distinct sockets in XDG_RUNTIME_DIR.
+        assert_ne!(sock_real_a, sock_real_b);
+
+        // /tmp fallback without XDG_RUNTIME_DIR also matches across symlink and isolates profiles.
+        assert_eq!(
+            select_unix_socket_path_with_xdg(&real_profile_a, None),
+            select_unix_socket_path_with_xdg(&sym_profile_a, None)
+        );
+        assert_ne!(
+            select_unix_socket_path_with_xdg(&real_profile_a, None),
+            select_unix_socket_path_with_xdg(&real_profile_b, None)
+        );
     }
 }

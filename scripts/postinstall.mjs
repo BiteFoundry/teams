@@ -256,7 +256,18 @@ export function runPostinstall(options = {}) {
   return { skipped: false, platform, linked };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function resolveCanonical(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+if (
+  process.argv[1] &&
+  resolveCanonical(process.argv[1]) === resolveCanonical(fileURLToPath(import.meta.url))
+) {
   try {
     runPostinstall();
   } catch {
