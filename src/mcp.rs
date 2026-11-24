@@ -17,7 +17,7 @@ use crate::{
     cli,
     config::AppConfig,
     graph::GraphClient,
-    models::{ConversationSummary, ConversationTarget, MentionInfo},
+    models::{ConversationSummary, MentionInfo},
     parser, resolver,
     storage::Storage,
 };
@@ -656,52 +656,6 @@ async fn call_tool(
             }))
         }
 
-        "react_message" => {
-            let target = args.required_str("target")?;
-            let msg_id = args.required_str("msg_id")?;
-            let reaction = cli::normalize_reaction(&args.required_str("reaction")?)
-                .map_err(format_error)?;
-            let enable = args.optional_bool("enable")?.unwrap_or(true);
-            let thread_root_id = args.optional_str("thread_root_id")?;
-
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-            map_graph_result(
-                graph,
-                graph
-                    .set_reaction(
-                        &conv.target,
-                        &msg_id,
-                        thread_root_id.as_deref(),
-                        &reaction,
-                        enable,
-                    )
-                    .await,
-            )
-            .await?;
-
-            let my_name = graph
-                .auth()
-                .current_tokens()
-                .await
-                .and_then(|t| t.user_display_name);
-            let ck = conv.conv_key.clone();
-            let mid = msg_id.clone();
-            let rx = reaction.clone();
-            let _ = with_storage(storage, move |s| {
-                s.apply_local_reaction(&ck, &mid, &rx, enable, my_name.as_deref())
-                    .map(|_| ())
-            })
-            .await;
-
-            Ok(json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "msg_id": msg_id,
-                "reaction": reaction,
-                "enable": enable,
-            }))
-        }
-
         "edit_message" => {
             let target = args.required_str("target")?;
             let msg_id = args.required_str("msg_id")?;
@@ -818,29 +772,6 @@ async fn call_tool(
             Ok(cli::users_search_json(&users))
         }
 
-        "mark_read" => {
-            let target = args.required_str("target")?;
-            let conv = resolve_target_mcp(storage, graph, &target, false).await?;
-
-            let scope = if let ConversationTarget::Chat { ref chat_id } = conv.target {
-                map_graph_result(graph, graph.mark_chat_read(chat_id).await).await?;
-                "server_and_local_cache"
-            } else {
-                "local_cache"
-            };
-            let now = chrono::Utc::now().to_rfc3339();
-            let conv_key = conv.conv_key.clone();
-            with_storage(storage, move |s| s.mark_conversation_read(&conv_key, &now))
-                .await
-                .map_err(format_error)?;
-
-            Ok(json!({
-                "ok": true,
-                "conv_key": conv.conv_key,
-                "scope": scope,
-            }))
-        }
-
         "get_presence" => {
             let user_ids = args.optional_str_array("user_ids")?;
             if let Some(ids) = user_ids {
@@ -851,41 +782,6 @@ async fn call_tool(
                 let presence = map_graph_result(graph, graph.get_my_presence().await).await?;
                 Ok(json!({ "presence": presence }))
             }
-        }
-
-        "set_presence" => {
-            let availability =
-                cli::normalize_presence_availability(&args.required_str("availability")?)
-                    .map_err(format_error)?;
-            let activity = args
-                .optional_str("activity")?
-                .unwrap_or_else(|| availability.clone());
-            let expiration_mins = args.optional_u32("expiration_mins")?;
-
-            map_graph_result(
-                graph,
-                graph
-                    .set_my_presence(&availability, &activity, expiration_mins)
-                    .await,
-            )
-            .await?;
-
-            let (latest, to_cache) =
-                cli::fetch_presence_after_set(graph, &availability, &activity).await;
-            if let Some(status) = to_cache {
-                let _ = with_storage(storage, move |s| {
-                    s.upsert_presences(std::slice::from_ref(&status))
-                })
-                .await;
-            }
-
-            Ok(json!({
-                "ok": true,
-                "availability": availability,
-                "activity": activity,
-                "expiration_mins": expiration_mins,
-                "presence": latest,
-            }))
         }
 
         other => Err(format!("unknown tool: {other}")),
@@ -980,22 +876,22 @@ fn initialize_result(message: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tool catalog (19 Teams tools)
+// Tool catalog (16 Teams tools)
 // ---------------------------------------------------------------------------
 
 fn mentions_schema() -> Value {
     json!({
         "type": "array",
-        "description": "Mentions as \"user_id:DisplayName\" strings or {user_id, display_name} objects.",
+        "description": "Users to @-mention, as \"user_id:DisplayName\" strings or {user_id, display_name} objects. Each mentioned user's @DisplayName must appear in markdown or the call fails before sending.",
         "items": {
             "oneOf": [
                 { "type": "string" },
                 {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "integer", "minimum": 0 },
-                        "user_id": { "type": "string", "minLength": 1 },
-                        "display_name": { "type": "string", "minLength": 1 }
+                        "id": { "type": "integer", "minimum": 0, "description": "Optional 0-based mention placeholder index." },
+                        "user_id": { "type": "string", "minLength": 1, "description": "Microsoft Entra user ID." },
+                        "display_name": { "type": "string", "minLength": 1, "description": "Display name matching @DisplayName in markdown." }
                     },
                     "required": ["user_id", "display_name"],
                     "additionalProperties": false
@@ -1009,19 +905,33 @@ fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
             "name": "list_chats",
-            "description": "List 1:1, group, and meeting chats. Reads the local cache when it covers limit (no Graph request); refresh=true or a short cache costs about 1 Graph request per 50 chats.",
+            "description": "List 1:1, group, and meeting chats (use list_teams_channels for team channels). Reads the local SQLite cache with no Graph request when the cache covers limit; set refresh=true to sync live from Microsoft Graph (about 1 request per 50 chats). Requires delegated Chat.Read. Returns { chats }.",
+            "annotations": {
+                "title": "List Chats",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync chats from Microsoft Graph before returning (about 1 request per 50 chats)." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
+                    "refresh": { "type": "boolean", "default": false, "description": "Sync chats live from Microsoft Graph before returning (about 1 request per 50 chats)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of chats to return (1..1000, default 50)." }
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "create_chat",
-            "description": "Create a new 1:1 (1 member) or group (2+ members) Microsoft Teams chat.",
+            "description": "Create a 1:1 chat (1 member; reuses an existing 1:1 chat if one exists) or a new group chat (2+ members). Use search_users first if you need peer Entra user IDs or email addresses. Requires delegated Chat.Create or Chat.ReadWrite. Writes to Microsoft Graph and caches the new conversation; returns { ok, conversation }.",
+            "annotations": {
+                "title": "Create Chat",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1029,9 +939,9 @@ fn tool_catalog() -> Vec<Value> {
                         "type": "array",
                         "minItems": 1,
                         "items": { "type": "string", "minLength": 1 },
-                        "description": "Peer Entra user IDs or email addresses."
+                        "description": "Peer Microsoft Entra user IDs or email addresses (1 item for a 1:1 chat, 2+ items for a group chat; the signed-in user is included automatically)."
                     },
-                    "topic": { "type": "string", "description": "Optional topic title for group chats." }
+                    "topic": { "type": "string", "description": "Optional topic title applied only when creating a group chat (2+ members)." }
                 },
                 "required": ["members"],
                 "additionalProperties": false
@@ -1039,12 +949,19 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "update_chat",
-            "description": "Change an existing group chat's topic. Requires delegated Chat.ReadWrite and access to the group chat.",
+            "description": "Rename an existing group chat's topic (not supported on 1:1 chats or team channels). Requires delegated Chat.ReadWrite and membership in the group chat. Updates Microsoft Graph and the local cache; returns { ok, conversation }.",
+            "annotations": {
+                "title": "Update Group Chat Topic",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Group chat conv_key, chat ID, or title." },
-                    "topic": { "type": "string", "minLength": 1, "maxLength": 250, "pattern": "^[^:]+$", "description": "New group chat topic." }
+                    "target": { "type": "string", "description": "Group chat conv_key (chat:...), raw chat ID, or unique chat title substring." },
+                    "topic": { "type": "string", "minLength": 1, "maxLength": 250, "pattern": "^[^:]+$", "description": "New group chat topic (1..250 characters; colons are disallowed)." }
                 },
                 "required": ["target", "topic"],
                 "additionalProperties": false
@@ -1052,28 +969,42 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_teams_channels",
-            "description": "List joined Microsoft Teams and their channels. Cached reads make no Graph request; refresh=true or an empty cache lists teams (1+ requests) then channels (1 $batch per 20 teams).",
+            "description": "List joined Microsoft Teams and their channels (use list_chats for 1:1/group chats). Cached reads and cursor pages make no Graph request; refresh=true or an empty cache calls Graph for teams (1+ requests) then channels (1 $batch per 20 teams). Requires Team.ReadBasic.All and Channel.ReadBasic.All. Returns paginated { teams, returned, has_more, next_cursor, total }.",
+            "annotations": {
+                "title": "List Teams and Channels",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "refresh": { "type": "boolean", "description": "Sync teams and channels from Microsoft Graph before returning (1+ requests for teams, plus 1 $batch per 20 teams)." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "cursor": { "type": "string", "description": "next_cursor from the previous page; reads the next page from the local cache without calling Microsoft Graph." }
+                    "refresh": { "type": "boolean", "default": false, "description": "Sync teams and channels live from Microsoft Graph before returning (1+ requests for teams, plus 1 $batch per 20 teams; cannot combine with cursor)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of teams to return per page (1..1000, default 50)." },
+                    "cursor": { "type": "string", "description": "Opaque next_cursor from a previous page; reads the next page from the local SQLite cache without calling Microsoft Graph." }
                 },
                 "additionalProperties": false
             }
         }),
         json!({
             "name": "get_messages",
-            "description": "Read messages from a chat or team channel, oldest first. Use before and limit to page through older history. Online by default: about 1 Graph request per 50 messages; offline=true makes none.",
+            "description": "Read messages from a chat or team channel, oldest first (use get_thread to read replies under a channel root post, or search_messages for full-text search across cached history). Fetches live from Microsoft Graph by default (about 1 request per 50 messages); set offline=true to read only the local SQLite cache. Returns { conversation, messages, has_more, next_before }.",
+            "annotations": {
+                "title": "Get Conversation Messages",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to read older messages preceding it." },
-                    "offline": { "type": "boolean", "default": false, "description": "Read from the local SQLite cache only (no Graph request)." },
-                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of messages to return (1..1000, default 50)." },
+                    "before": { "type": "string", "description": "Optional ISO-8601 timestamp, YYYY-MM-DD date, or cached msg_id to paginate older messages before that point." },
+                    "offline": { "type": "boolean", "default": false, "description": "When true, read only from the local SQLite cache without calling Microsoft Graph." },
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default true) omitting verbose metadata; set false for full conversation and message objects." }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -1081,15 +1012,22 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "get_thread",
-            "description": "Read a channel root post and up to limit replies, oldest first. The root is included separately. Online: 1+ Graph requests (50 replies each); offline=true makes none.",
+            "description": "Read a team channel root post and up to limit replies, oldest first (use get_messages for top-level channel posts or 1:1/group chats). Online by default (1+ Graph requests, 50 replies each); offline=true reads verified cached replies with no Graph call and errors on cache miss. Returns { conversation, thread: { root, replies, returned, has_more } }.",
+            "annotations": {
+                "title": "Get Channel Thread",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "Channel conv_key, \"Team/Channel\", or unique channel title." },
-                    "root_msg_id": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "offline": { "type": "boolean", "default": false, "description": "Read verified replies from the local SQLite cache (no Graph request). A cache miss or insufficient reply coverage returns an error." },
-                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
+                    "target": { "type": "string", "description": "Channel conv_key (chan:team:channel), \"Team/Channel\", or unique channel title substring." },
+                    "root_msg_id": { "type": "string", "minLength": 1, "description": "Message ID of the channel root post whose replies should be fetched." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of replies to return, excluding the root post (1..1000, default 50)." },
+                    "offline": { "type": "boolean", "default": false, "description": "Read verified replies from the local SQLite cache with no Graph request; returns an error if cached coverage is missing or incomplete." },
+                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default true); set false for full conversation and message objects." }
                 },
                 "required": ["target", "root_msg_id"],
                 "additionalProperties": false
@@ -1097,16 +1035,23 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "send_message",
-            "description": "Send a Markdown message to a chat or team channel. Irreversible side effect.",
+            "description": "Post a new Markdown message to a chat or a new root post to a team channel (use reply_message to reply inside a channel thread or quote-reply an existing chat message). Irreversible external side effect notifying conversation members. Requires ChatMessage.Send or ChannelMessage.Send. Returns compact acknowledgement { ok, conversation, message } by default.",
+            "annotations": {
+                "title": "Send Message",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "markdown": { "type": "string", "minLength": 1 },
-                    "subject": { "type": "string", "description": "Optional subject line for team channel root posts." },
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "markdown": { "type": "string", "minLength": 1, "description": "Non-empty Markdown message body to compile to Teams HTML and send." },
+                    "subject": { "type": "string", "description": "Optional plain-text subject line (applies to team channel root posts)." },
                     "mentions": mentions_schema(),
-                    "important": { "type": "boolean", "default": false },
-                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
+                    "important": { "type": "boolean", "default": false, "description": "When true, marks the sent message with high importance." },
+                    "compact": { "type": "boolean", "default": true, "description": "Return a compact receipt (default true); set false for full conversation and message objects." }
                 },
                 "required": ["target", "markdown"],
                 "additionalProperties": false
@@ -1114,16 +1059,23 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "reply_message",
-            "description": "Reply to a team channel thread root post or quote-reply a message in a 1:1/group chat.",
+            "description": "Reply to a team channel root post in its thread, or quote-reply a specific message in a 1:1/group chat (use send_message to start a new channel thread or unquoted chat post). Irreversible external side effect notifying participants. Requires ChatMessage.Send or ChannelMessage.Send. Returns { ok, conversation, reply_to, message }.",
+            "annotations": {
+                "title": "Reply to Message",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "markdown": { "type": "string", "minLength": 1 },
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "msg_id": { "type": "string", "minLength": 1, "description": "Channel thread root post ID to reply under, or chat message ID to quote-reply." },
+                    "markdown": { "type": "string", "minLength": 1, "description": "Non-empty Markdown reply body." },
                     "mentions": mentions_schema(),
-                    "important": { "type": "boolean", "default": false },
-                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
+                    "important": { "type": "boolean", "default": false, "description": "When true, marks the reply with high importance." },
+                    "compact": { "type": "boolean", "default": true, "description": "Return a compact receipt (default true); set false for full conversation and message objects." }
                 },
                 "required": ["target", "msg_id", "markdown"],
                 "additionalProperties": false
@@ -1131,16 +1083,23 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "send_file",
-            "description": "Upload a local file (from the host running teams) to OneDrive/SharePoint and post a reference attachment (or inline image when inline=true). Time grows with file size: one upload request up to 4 MiB, 3.2 MiB chunks above.",
+            "description": "Upload a local file from the host running teams to OneDrive/SharePoint and post it as a Teams message attachment (or inline image when inline=true). Irreversible external side effect. Latency scales with file size (single upload up to 4 MiB, 3.2 MiB chunks above). Requires Files.ReadWrite and message send permissions. Returns { ok, conversation, path, inline, message }.",
+            "annotations": {
+                "title": "Send File or Inline Image",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
-                    "path": { "type": "string", "minLength": 1, "description": "Local file path on the host running teams." },
-                    "caption": { "type": "string" },
-                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID." },
-                    "inline": { "type": "boolean", "default": false },
-                    "compact": { "type": "boolean", "default": true, "description": "Compact output (default). Set false for full conversation and message objects." }
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "path": { "type": "string", "minLength": 1, "description": "Readable local file path on the host running teams mcp." },
+                    "caption": { "type": "string", "description": "Optional Markdown caption posted alongside the file or inline image." },
+                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID when attaching to an existing channel thread." },
+                    "inline": { "type": "boolean", "default": false, "description": "When true, embeds a supported image directly as Teams hostedContents instead of a OneDrive/SharePoint file attachment." },
+                    "compact": { "type": "boolean", "default": true, "description": "Return a compact receipt (default true); set false for full conversation and message objects." }
                 },
                 "required": ["target", "path"],
                 "additionalProperties": false
@@ -1148,49 +1107,47 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "download_attachment",
-            "description": "Download a file attachment or inline Teams screenshot (hostedContents) from a message to local disk. Returns structured JSON { ok, path (absolute), file_name, mime_type, size_bytes, is_image } so multimodal agents can inspect images and files directly. Time grows with attachment size.",
+            "description": "Download a file attachment or inline Teams screenshot (hostedContents) from a message to local disk so an agent or user can inspect it. Writes a file to out_dir (or configured downloads folder); latency scales with attachment size. Returns { ok, path (absolute), file_name, mime_type, size_bytes, bytes_written, is_image }.",
+            "annotations": {
+                "title": "Download Attachment",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string", "description": "conv_key, \"Team/Channel\", or unique conversation title." },
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
                     "msg_id": { "type": "string", "minLength": 1, "description": "Message ID containing the attachment or inline image." },
-                    "index": { "type": "integer", "minimum": 0, "default": 0, "description": "0-based index into the message's attachments/hosted images." },
-                    "out_dir": { "type": "string", "description": "Optional output directory (defaults to configured downloads folder)." },
-                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID when msg_id is a thread reply." }
+                    "index": { "type": "integer", "minimum": 0, "default": 0, "description": "0-based index into the message's attachments/hosted images (default 0)." },
+                    "out_dir": { "type": "string", "description": "Optional local directory to save the downloaded file (defaults to configured downloads folder)." },
+                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID required when msg_id is a reply inside a channel thread." }
                 },
                 "required": ["target", "msg_id"],
                 "additionalProperties": false
             }
         }),
         json!({
-            "name": "react_message",
-            "description": "Set or unset a reaction (like, heart, laugh, surprised, sad, angry) on a message.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "reaction": { "type": "string", "minLength": 1, "description": "like, heart, laugh, surprised, sad, angry, or unicode emoji." },
-                    "enable": { "type": "boolean", "default": true },
-                    "thread_root_id": { "type": "string" }
-                },
-                "required": ["target", "msg_id", "reaction"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
             "name": "edit_message",
-            "description": "Edit a message you sent. Use markdown to replace the entire body, find and replace to change one phrase, or subject to change the title of a channel root post. Graph enforces delegated permissions and Teams messaging policy.",
+            "description": "Edit a message previously sent by the signed-in user. Choose exactly one mode: markdown (replace full body), find + replace (replace one unique literal phrase while preserving HTML), or subject (rename a channel root post title). Requires Chat.ReadWrite (chats) or ChannelMessage.ReadWrite (channels) and Teams policy allowing edits. Returns { ok, conv_key, msg_id }.",
+            "annotations": {
+                "title": "Edit Sent Message",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "markdown": { "type": "string", "minLength": 1, "description": "Markdown to replace the entire message body." },
-                    "find": { "type": "string", "minLength": 1, "description": "Exact phrase occurring once in a single editable text node." },
-                    "replace": { "type": "string", "description": "Literal replacement text. An empty string removes the phrase." },
-                    "subject": { "type": "string", "minLength": 1, "description": "New plain-text title for a channel root post you sent." },
-                    "thread_root_id": { "type": "string" }
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "msg_id": { "type": "string", "minLength": 1, "description": "ID of the message sent by the current user to edit." },
+                    "markdown": { "type": "string", "minLength": 1, "description": "Markdown to replace the entire message body (mutually exclusive with find/replace and subject)." },
+                    "find": { "type": "string", "minLength": 1, "description": "Exact phrase occurring once in a single editable text node (must be paired with replace)." },
+                    "replace": { "type": "string", "description": "Literal replacement text for find; pass an empty string to remove the matched phrase." },
+                    "subject": { "type": "string", "minLength": 1, "description": "New plain-text title for a channel root post you sent (mutually exclusive with body edits and thread_root_id)." },
+                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID required when editing a reply inside a channel thread." }
                 },
                 "required": ["target", "msg_id"],
                 "oneOf": [
@@ -1203,14 +1160,21 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "delete_message",
-            "description": "Soft-delete a message sent by the current user. Requires confirm=true.",
+            "description": "Soft-delete a message previously sent by the signed-in user (use edit_message instead to fix a typo). Destructive action requiring literal confirm=true; rejected during validation otherwise. Enforces Graph delegated permissions (Chat.ReadWrite or ChannelMessage.ReadWrite) and Teams delete policy. Updates Graph and local cache; returns { ok, conv_key, msg_id }.",
+            "annotations": {
+                "title": "Delete Sent Message",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string" },
-                    "msg_id": { "type": "string", "minLength": 1 },
-                    "confirm": { "const": true, "description": "Must be literal boolean true." },
-                    "thread_root_id": { "type": "string" }
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "msg_id": { "type": "string", "minLength": 1, "description": "ID of the message sent by the current user to soft-delete." },
+                    "confirm": { "const": true, "description": "Safety guard: must be literal JSON boolean true or the call fails before contacting Microsoft Graph." },
+                    "thread_root_id": { "type": "string", "description": "Optional channel thread root post ID required when deleting a reply inside a channel thread." }
                 },
                 "required": ["target", "msg_id", "confirm"],
                 "additionalProperties": false
@@ -1218,13 +1182,20 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_messages",
-            "description": "Search cached messages using local SQLite FTS5. No Graph request; only messages already in the cache are found.",
+            "description": "Full-text search cached messages locally using SQLite FTS5 (no Microsoft Graph request). Only finds messages already fetched into cache.db; call get_messages first if recent history is not cached yet. Returns { query, hits }.",
+            "annotations": {
+                "title": "Search Cached Messages",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "minLength": 1 },
-                    "target": { "type": "string", "description": "Optional conversation target to restrict search." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
+                    "query": { "type": "string", "minLength": 1, "description": "Full-text search query (matches cached message body, subject, and sender)." },
+                    "target": { "type": "string", "description": "Optional cached conversation conv_key, \"Team/Channel\", or unique title substring to scope the search." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of search hits to return (1..1000, default 50)." }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -1232,14 +1203,21 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "list_members",
-            "description": "List members of a chat or team channel. Fetches the member list from Microsoft Graph first (1+ requests) unless cursor or offline is set, which read the cache only.",
+            "description": "List members of a chat or channel with Entra user_id and display_name for @-mentions or get_presence (use search_users for directory lookup). Calls Graph (1+ requests) unless cursor or offline=true reads the local SQLite cache only. Returns paginated { conv_key, title, members, returned, has_more, next_cursor, total }.",
+            "annotations": {
+                "title": "List Conversation Members",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "target": { "type": "string" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 },
-                    "cursor": { "type": "string", "description": "next_cursor from the previous page; reads the next page from the local cache without calling Microsoft Graph." },
-                    "offline": { "type": "boolean", "default": false, "description": "Read cached members from the local SQLite cache without calling Microsoft Graph." }
+                    "target": { "type": "string", "description": "Conversation conv_key (chat:... or chan:team:channel), \"Team/Channel\", or unique conversation title substring." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50, "description": "Maximum number of members to return per page (1..1000, default 50)." },
+                    "cursor": { "type": "string", "description": "Opaque next_cursor from a previous page; reads the next page from the local SQLite cache without calling Microsoft Graph." },
+                    "offline": { "type": "boolean", "default": false, "description": "Read cached members from the local SQLite cache without calling Microsoft Graph (errors if members were never cached)." }
                 },
                 "required": ["target"],
                 "additionalProperties": false
@@ -1247,58 +1225,43 @@ fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "search_users",
-            "description": "Search directory users by display name or email prefix. 1 Graph request (2 when the tenant rejects $filter).",
+            "description": "Search Microsoft Entra directory users by case-insensitive display name, email, or UPN prefix (use list_members to list participants of a specific chat/channel). Costs 1 Graph request (2 if the tenant rejects $filter and falls back to $search). Requires delegated User.ReadBasic.All or User.Read.All. Returns { users: [{ user_id, display_name, email, user_principal_name }], returned }.",
+            "annotations": {
+                "title": "Search Directory Users",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "minLength": 1, "description": "Display name or email prefix to search for." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 10 }
+                    "query": { "type": "string", "minLength": 1, "description": "Case-insensitive prefix matched against displayName, mail, and userPrincipalName." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 10, "description": "Maximum number of matching directory users to return (1..1000, default 10)." }
                 },
                 "required": ["query"],
                 "additionalProperties": false
             }
         }),
         json!({
-            "name": "mark_read",
-            "description": "Mark a chat read on Graph and in the local cache. A channel updates the local cache.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": { "type": "string" }
-                },
-                "required": ["target"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
             "name": "get_presence",
-            "description": "Get presence for the current user or a list of user IDs. 1 Graph request (per 650 user IDs).",
+            "description": "Fetch current Microsoft Teams availability and activity status for the signed-in user or a batch of Entra user IDs (use search_users or list_members first to look up user IDs). Costs 1 Graph request per 650 user IDs. Requires delegated Presence.Read (self) or Presence.Read.All (others). Returns { presence } when user_ids is omitted, or { presences } when provided.",
+            "annotations": {
+                "title": "Get User Presence",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "user_ids": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1 },
-                        "description": "Optional Entra user IDs. Omit to fetch current user's presence."
+                        "description": "Optional list of Microsoft Entra user IDs to query in batch. Omit to fetch only the signed-in user's presence."
                     }
                 },
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "set_presence",
-            "description": "Set the current user's preferred Teams presence (Available, Busy, DoNotDisturb, BeRightBack, Away, Reset).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "availability": {
-                        "type": "string",
-                        "enum": ["Available", "Busy", "DoNotDisturb", "BeRightBack", "Away", "Reset"]
-                    },
-                    "activity": { "type": "string" },
-                    "expiration_mins": { "type": "integer", "minimum": 1, "maximum": 1440 }
-                },
-                "required": ["availability"],
                 "additionalProperties": false
             }
         }),
@@ -1469,14 +1432,6 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
             args.optional_str("out_dir")?;
             args.optional_str("thread_root_id")?;
         }
-        "react_message" => {
-            args.required_str("target")?;
-            args.required_str("msg_id")?;
-            let reaction = args.required_str("reaction")?;
-            cli::normalize_reaction(&reaction).map_err(format_error)?;
-            args.optional_bool("enable")?;
-            args.optional_str("thread_root_id")?;
-        }
         "edit_message" => {
             args.reject_unknown(&[
                 "target", "msg_id", "markdown", "find", "replace", "subject", "thread_root_id",
@@ -1523,19 +1478,8 @@ fn validate_tool_args(name: &str, arguments: &Value) -> Result<(), String> {
                 1_000,
             )?;
         }
-        "mark_read" => {
-            args.required_str("target")?;
-        }
         "get_presence" => {
             args.optional_str_array("user_ids")?;
-        }
-        "set_presence" => {
-            let avail = args.required_str("availability")?;
-            cli::normalize_presence_availability(&avail).map_err(format_error)?;
-            args.optional_str("activity")?;
-            if let Some(mins) = args.optional_u32("expiration_mins")? {
-                bounds("expiration_mins", mins as usize, 1, 1440)?;
-            }
         }
         other => return Err(format!("unknown tool: {other}")),
     }
@@ -1655,15 +1599,6 @@ impl<'a> Args<'a> {
         }
     }
 
-    fn optional_u32(&self, key: &str) -> Result<Option<u32>, String> {
-        match self.optional_i64(key)? {
-            None => Ok(None),
-            Some(v) => u32::try_from(v)
-                .map(Some)
-                .map_err(|_| format!("{key} must be a non-negative 32-bit integer")),
-        }
-    }
-
     fn optional_str_array(&self, key: &str) -> Result<Option<Vec<String>>, String> {
         match self.object()?.get(key) {
             None | Some(Value::Null) => Ok(None),
@@ -1751,6 +1686,7 @@ fn format_error(error: anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ConversationTarget;
 
     // Tool descriptions are read by agents before every call: state what a call costs, and keep
     // them short because each one is paid for in every agent context.
@@ -1900,15 +1836,12 @@ mod tests {
                 "reply_message",
                 "send_file",
                 "download_attachment",
-                "react_message",
                 "edit_message",
                 "delete_message",
                 "search_messages",
                 "list_members",
                 "search_users",
-                "mark_read",
                 "get_presence",
-                "set_presence",
             ]
         );
         for name in &names {
@@ -1924,8 +1857,28 @@ mod tests {
         }
 
         for tool in tools {
-            assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
-            assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()));
+            let tool_name = tool["name"].as_str().unwrap();
+            assert_eq!(tool["inputSchema"]["type"], "object", "{tool_name}");
+            assert!(tool["description"].as_str().is_some_and(|d| !d.is_empty()), "{tool_name}");
+            let ann = tool["annotations"]
+                .as_object()
+                .unwrap_or_else(|| panic!("missing annotations on {tool_name}"));
+            for key in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+                assert!(
+                    ann.get(key).is_some_and(Value::is_boolean),
+                    "missing boolean annotation {key} on {tool_name}"
+                );
+            }
+            if let Some(props) = tool["inputSchema"]["properties"].as_object() {
+                for (prop_name, prop_schema) in props {
+                    assert!(
+                        prop_schema["description"]
+                            .as_str()
+                            .is_some_and(|d| !d.is_empty()),
+                        "missing description on {tool_name}.{prop_name}"
+                    );
+                }
+            }
         }
 
         let get_msgs = tools.iter().find(|t| t["name"] == "get_messages").unwrap();
@@ -2001,32 +1954,12 @@ mod tests {
             validate_tool_args("create_chat", &json!({ "members": ["a@b.com"] })).is_ok()
         );
 
-        assert!(validate_tool_args(
-            "react_message",
-            &json!({ "target": "chat:1", "msg_id": "m1", "reaction": "like" })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "react_message",
-            &json!({ "target": "chat:1", "msg_id": "m1", "reaction": "invalid" })
-        )
-        .is_err());
-
-        assert!(validate_tool_args(
-            "set_presence",
-            &json!({ "availability": "Busy", "expiration_mins": 30 })
-        )
-        .is_ok());
-        assert!(validate_tool_args(
-            "set_presence",
-            &json!({ "availability": "Busy", "expiration_mins": 2000 })
-        )
-        .is_err());
-        assert!(validate_tool_args(
-            "set_presence",
-            &json!({ "availability": "Offline" })
-        )
-        .is_err());
+        for removed in ["react_message", "mark_read", "set_presence"] {
+            assert!(
+                validate_tool_args(removed, &json!({})).is_err(),
+                "{removed} should not be exposed as an MCP tool"
+            );
+        }
     }
 
     #[test]

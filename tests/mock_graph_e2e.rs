@@ -5985,16 +5985,9 @@ async fn regression_teams_bug_14_mcp_list_chats_schema_and_presence_reset() {
     assert_eq!(valid_resp["result"]["isError"], false, "{valid_resp}");
     assert_eq!(state.posted_messages.read().unwrap().len(), 1);
 
-    // Part C: MCP set_presence("Reset") and HTTP POST /presence ("Reset") cache actual Graph presence ("Busy")
+    // Part C: HTTP POST /presence ("Reset") caches actual Graph presence ("Busy"), while MCP rejects removed set_presence
     let mcp_reset = call_mcp("set_presence", json!({ "availability": "Reset" })).await;
-    assert_eq!(mcp_reset["result"]["isError"], false, "{mcp_reset}");
-    let cached_after_mcp = storage.get_presences().unwrap();
-    let p_mcp = cached_after_mcp.get("me-user-1").expect("presence cached after MCP reset");
-    assert_eq!(
-        p_mcp.availability, "Busy",
-        "MCP Reset must store actual Graph presence, not literal Reset: {p_mcp:?}"
-    );
-    assert_eq!(p_mcp.activity, "InACall");
+    assert_eq!(mcp_reset["result"]["isError"], true, "{mcp_reset}");
 
     let http_storage = Storage::open_in_memory().unwrap();
     let api_router = serve::build_router(

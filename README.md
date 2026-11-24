@@ -26,7 +26,7 @@
 | **Minimal-Chrome TUI** | 3-tier responsive `ratatui` layout (`Wide` / `Medium` / `Narrow`), Composer-First workflow, side-by-side Thread Drawer, Link Extractor (`u`), `zoxide` File Picker (`Ctrl+F`), Unified `Ctrl+K` Omni-Switcher, Cozy/Compact density (`Ctrl+D`), and multi-depth themes (`Midnight Dark`, `Daylight Light`, `ANSI 256/16`, `NO_COLOR`). |
 | **High-Res Terminal Images** | Native inline rendering for attachments & pasted `hostedContents` screenshots across **Kitty**, **iTerm2 (`OSC 1337`)**, **Sixel (`DCS q`)**, and **24-bit Half-Blocks (`▀`)** universal fallback with live zoom (`+`/`-`/`0`) and protocol switching (`p`). |
 | **Local SQLite FTS5 + IPC Daemon** | Bundled SQLite WAL + FTS5 cache (`cache.db`) with `@odata.nextLink` deep history cursors, offline hybrid search (`teams search`), and cached CLI reads via `teams daemon`. |
-| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 19 tools)**. |
+| **4-in-1 Agent Interface** | One static binary (Windows, macOS, Linux **GLIBC 2.28 / AlmaLinux 8+**) delivers **TUI**, scriptable **CLI (`--json`)**, **Axum HTTP REST API (`teams serve`)**, and **stdio MCP server (`teams mcp`, 16 tools)**. |
 
 ---
 
@@ -141,7 +141,7 @@ Full endpoint & schema docs: **[docs/API.md](docs/API.md)** · **[docs/openapi.y
 
 ### MCP Server (`teams mcp`)
 
-Exposes **19 Microsoft Teams tools** (`list_chats`, `create_chat`, `update_chat`, `list_teams_channels`, `get_messages`, `get_thread`, `send_message`, `reply_message`, `send_file`, `download_attachment`, `react_message`, `edit_message`, `delete_message`, `search_messages`, `list_members`, `search_users`, `mark_read`, `get_presence`, `set_presence`) over newline-delimited stdio JSON-RPC 2.0:
+Exposes **16 Microsoft Teams tools** (`list_chats`, `create_chat`, `update_chat`, `list_teams_channels`, `get_messages`, `get_thread`, `send_message`, `reply_message`, `send_file`, `download_attachment`, `edit_message`, `delete_message`, `search_messages`, `list_members`, `search_users`, `get_presence`) over newline-delimited stdio JSON-RPC 2.0:
 
 ```bash
 # Claude Code

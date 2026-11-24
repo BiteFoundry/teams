@@ -98,7 +98,7 @@ args = ["mcp"]
 | `not_found` | Graph `404` | `http_status: 404` |
 | `error` | Validation, missing confirmation, or other errors | `http_status` (when from Graph) |
 
-## Microsoft Teams Tools (19)
+## Microsoft Teams Tools (16)
 
 `target` arguments accept a canonical `conv_key` (`chat:...` or `chan:<team_id>:<channel_id>`), raw `chat_id`, `"Team/Channel"`, or a unique case-insensitive conversation title substring.
 
@@ -114,15 +114,12 @@ args = ["mcp"]
 | `reply_message` | `target`, `msg_id`, `markdown`, `mentions?`, `important?`, `compact?` (default `true`) | `{ "ok": true, "conversation": {...}, "reply_to": "...", "message": {...} }` (compact ack by default; set `compact: false` for full objects) |
 | `send_file` | `target`, `path`, `caption?`, `thread_root_id?`, `inline?`, `compact?` (default `true`) | `{ "ok": true, "conversation": {...}, "path": "...", "inline": bool, "message": {...} }` (compact ack by default; set `compact: false` for full objects) |
 | `download_attachment` | `target`, `msg_id`, `index?`, `out_dir?`, `thread_root_id?` | `{ "ok": true, "path": "...", "file_name": "...", "bytes_written": ... }` |
-| `react_message` | `target`, `msg_id`, `reaction`, `enable?` (default `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "...", "reaction": "...", "enable": ... }` |
 | `edit_message` | `target`, `msg_id`, and one mode. Body modes use `markdown` or both `find` and `replace`, with optional `thread_root_id`. The title mode uses `subject`. | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `delete_message` | `target`, `msg_id`, `confirm` (must be literal `true`), `thread_root_id?` | `{ "ok": true, "conv_key": "...", "msg_id": "..." }` |
 | `search_messages` | `query`, `target?`, `limit?` (1..1000) | `{ "query": "...", "hits": [...] }` |
 | `list_members` | `target`, `limit?` (1..1000, default `50`), `cursor?`, `offline?` (default `false`) | `{ "conv_key": "...", "title": "...", "members": [...], "returned": int, "has_more": bool \| null, "next_cursor": string \| null, "total": int \| null, "fetched_at": string \| null }` |
 | `search_users` | `query` (name or email prefix), `limit?` (1..1000, default `10`) | `{ "users": [{ "user_id", "display_name", "email", "user_principal_name" }], "returned": int }` |
-| `mark_read` | `target` | `{ "ok": true, "conv_key": "...", "scope": "server_and_local_cache" }` for chats, `"scope": "local_cache"` for channels |
 | `get_presence` | `user_ids?` (`string[]`) | `{ "presence": {...} }` or `{ "presences": [...] }` |
-| `set_presence` | `availability` (`Available\|Busy\|DoNotDisturb\|BeRightBack\|Away\|Reset`), `activity?`, `expiration_mins?` (1..1440) | `{ "ok": true, "availability": "...", "activity": "...", "expiration_mins": ... }` |
 
 ### Mentions and importance in `send_message` and `reply_message`
 
@@ -192,9 +189,8 @@ Channel edits require delegated `ChannelMessage.ReadWrite` or legacy `Group.Read
 {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_message","arguments":{"target":"Engineering/General","msg_id":"1700000000000","confirm":true}}}
 {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_thread","arguments":{"target":"Engineering/General","root_msg_id":"1700000000001","limit":2,"offline":true}}}
 {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","find":"STATE: STAGED","replace":"STATE: READY"}}}
-{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"set_presence","arguments":{"availability":"DoNotDisturb","expiration_mins":60}}}
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"update_chat","arguments":{"target":"Release handoff","topic":"Canary war room"}}}
-{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","subject":"Canary rollout"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"update_chat","arguments":{"target":"Release handoff","topic":"Canary war room"}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"edit_message","arguments":{"target":"Engineering/General","msg_id":"1700000000001","subject":"Canary rollout"}}}
 ```
 
 ## Notes and limitations
@@ -202,4 +198,4 @@ Channel edits require delegated `ChannelMessage.ReadWrite` or legacy `Group.Read
 - `send_file` reads `path` on the host running `teams mcp`, not on a remote MCP client.
 - `get_messages` with `before` automatically walks Microsoft Graph `@odata.nextLink` (`$skiptoken`) pages when `offline` is `false` (default) and caches fetched messages into `cache.db`.
 - `search_messages` queries the local SQLite FTS5 cache (`cache.db`); run `teams sync --depth 100` or `get_messages` first if local history is empty.
-- `react_message` supports `like`, `heart`, `laugh`, `surprised`, `sad`, `angry`, and unicode emoji.
+- Reactions, read receipts (`mark_read`), and presence changes (`set_presence`) remain available in the CLI, TUI, and local HTTP API, and are intentionally omitted from MCP to keep agent tool surfaces focused and prevent unintended unread-state or status changes.
