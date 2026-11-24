@@ -8,6 +8,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-565f89)](docs/NPM.md)
 [![Built with Rust & Ratatui](https://img.shields.io/badge/Rust-Ratatui-e0af68?logo=rust&logoColor=white)](https://ratatui.rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-9ece6a)](LICENSE)
+[![BiteFoundry/teams MCP server](https://glama.ai/mcp/servers/BiteFoundry/teams/badges/score.svg)](https://glama.ai/mcp/servers/BiteFoundry/teams)
 
 [BiteFoundry](https://bitefoundry.dev/#app-teams) · [Latest release notes](https://github.com/BiteFoundry/teams/releases/latest)
 
