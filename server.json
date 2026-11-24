@@ -1,0 +1,41 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/teams",
+  "title": "Microsoft Teams (TUI, CLI & MCP)",
+  "description": "Microsoft Teams MCP server, CLI, and TUI in Rust with local SQLite FTS5 cache.",
+  "version": "0.9.1",
+  "websiteUrl": "https://bitefoundry.dev/#app-teams",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/teams",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/teams:0.9.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "TEAMS_CLIENT_ID",
+          "description": "Microsoft Entra ID (Azure AD) desktop application client ID.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "TEAMS_TENANT_ID",
+          "description": "Microsoft Entra tenant ID or 'organizations' / 'common'.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "TEAMS_TOKEN_FILE",
+          "description": "Path to a file containing a Microsoft Graph bearer token (read live on demand).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

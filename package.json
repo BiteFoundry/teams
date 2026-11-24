@@ -1,6 +1,7 @@
 {
   "name": "@bitefoundry/teams",
   "version": "0.9.1",
+  "mcpName": "io.github.BiteFoundry/teams",
   "description": "Ultra-fast Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)",
   "repository": {
     "type": "git",

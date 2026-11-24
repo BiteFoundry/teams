@@ -1,0 +1,88 @@
+name: Docker image
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.9.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: find the release
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion != 'cancelled' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+      published: ${{ steps.find.outputs.published }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$RUN_TAG}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null)" = false ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No published release for $tag, so there is nothing to publish."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    name: build and push the image
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: meta
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          minor="${version%.*}"
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          build-args: TEAMS_VERSION=${{ steps.meta.outputs.version }}
+          annotations: |
+            index:org.opencontainers.image.description=Single Rust binary pairing a stdio MCP server, CLI, local HTTP API, and Ratatui TUI for Microsoft Teams over an embedded SQLite WAL + FTS5 cache.
+            index:org.opencontainers.image.source=https://github.com/BiteFoundry/teams
+            index:org.opencontainers.image.licenses=MIT
+            index:io.modelcontextprotocol.server.name=io.github.BiteFoundry/teams
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/teams:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/teams:${{ steps.meta.outputs.minor }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/teams:latest
