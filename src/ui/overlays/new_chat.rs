@@ -249,16 +249,34 @@ impl NewChatState {
             theme.muted_style()
         };
 
+        let input_viewport = (inner.width as usize).saturating_sub(3).max(1);
+        let render_input_line = |text: &str, style: Style| {
+            let win = bitefoundry_html::layout::windowed_single_line_input(
+                text,
+                text.len(),
+                input_viewport,
+            );
+            let mut spans = vec![Span::styled(" > ", style)];
+            if win.clipped_left {
+                spans.push(Span::styled("‹", theme.muted_style()));
+            }
+            spans.push(Span::raw(win.before_cursor));
+            spans.push(Span::styled("▏", style));
+            if !win.after_cursor.is_empty() {
+                spans.push(Span::raw(win.after_cursor));
+            }
+            if win.clipped_right {
+                spans.push(Span::styled("›", theme.muted_style()));
+            }
+            Line::from(spans)
+        };
+
         let mut lines = vec![
             Line::from(Span::styled(
                 " Recipients (comma-separated email/ID or search name):",
                 theme.muted_style(),
             )),
-            Line::from(vec![
-                Span::styled(" > ", peer_style),
-                Span::raw(self.peers_input.clone()),
-                Span::styled("▏", peer_style),
-            ]),
+            render_input_line(&self.peers_input, peer_style),
             Line::from(Span::styled(
                 if self.selected_peers.is_empty() {
                     " Selected: none".to_string()
@@ -271,11 +289,7 @@ impl NewChatState {
                 " Group topic (optional for 2+ recipients):",
                 theme.muted_style(),
             )),
-            Line::from(vec![
-                Span::styled(" > ", topic_style),
-                Span::raw(self.topic.clone()),
-                Span::styled("▏", topic_style),
-            ]),
+            render_input_line(&self.topic, topic_style),
         ];
 
         if let Some(err) = &self.error {

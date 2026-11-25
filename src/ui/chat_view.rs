@@ -14,7 +14,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -136,7 +136,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         ui.chat_scroll.total_lines = 0;
         frame.render_widget(
             Paragraph::new("Select a conversation from the sidebar (or press Ctrl+K)")
-                .style(ui.theme.muted_style()),
+                .style(ui.theme.muted_style())
+                .wrap(Wrap { trim: false }),
             message_area,
         );
         return;
@@ -146,7 +147,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         ui.chat_scroll.message_ranges = Arc::from([]);
         ui.chat_scroll.total_lines = 0;
         frame.render_widget(
-            Paragraph::new("Loading messages…").style(ui.theme.muted_style()),
+            Paragraph::new("Loading messages…")
+                .style(ui.theme.muted_style())
+                .wrap(Wrap { trim: false }),
             message_area,
         );
         return;
@@ -165,10 +168,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         ) {
             empty_lines.push(banner);
         }
-        empty_lines.push(RenderedLine::plain(Line::from(Span::styled(
-            "No messages yet — write the first message below.",
-            ui.theme.muted_style(),
-        ))));
+        let empty_wrapped = bitefoundry_html::layout::wrap_styled_spans(
+            &[Span::styled(
+                "No messages yet — write the first message below.",
+                ui.theme.muted_style(),
+            )],
+            (message_area.width as usize).max(12),
+            bitefoundry_html::layout::WrapPrefix::empty(),
+        );
+        for line in empty_wrapped {
+            empty_lines.push(RenderedLine::plain(line));
+        }
         let height = message_area.height as usize;
         ui.chat_scroll.total_lines = empty_lines.len();
         ui.chat_scroll.offset = 0;
@@ -1369,26 +1379,21 @@ fn render_message_cozy(
                 ("●", c)
             }
         };
-        let mut header_spans = vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("{dot} "),
-                if theme.no_color {
-                    Style::default()
-                } else {
-                    Style::default().fg(dot_color)
-                },
-            ),
-            Span::styled(msg.author_name.clone(), author_style),
-            Span::styled(format!("  {time}"), theme.muted_style()),
-        ];
+        let dot_prefix = format!("{dot} ");
+        let dot_style = if theme.no_color {
+            Style::default()
+        } else {
+            Style::default().fg(dot_color)
+        };
+
+        let mut suffix_spans = vec![Span::styled(format!("  {time}"), theme.muted_style())];
         if msg.importance.eq_ignore_ascii_case("urgent") {
-            header_spans.push(Span::styled(
+            suffix_spans.push(Span::styled(
                 " [URGENT]",
                 Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
             ));
         } else if msg.importance.eq_ignore_ascii_case("high") {
-            header_spans.push(Span::styled(
+            suffix_spans.push(Span::styled(
                 " [IMPORTANT]",
                 Style::default()
                     .fg(theme.warning)
@@ -1396,24 +1401,51 @@ fn render_message_cozy(
             ));
         }
         if msg.last_modified_at.is_some() && !msg.deleted {
-            header_spans.push(Span::styled(" (edited)", theme.muted_style()));
+            suffix_spans.push(Span::styled(" (edited)", theme.muted_style()));
         }
+
+        let prefix_w = 2 + UnicodeWidthStr::width(dot_prefix.as_str());
+        let suffix_w: usize = suffix_spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let author_budget = width.saturating_sub(prefix_w + suffix_w);
+        let author_display =
+            if UnicodeWidthStr::width(msg.author_name.as_str()) <= author_budget {
+                msg.author_name.clone()
+            } else if author_budget >= 2 {
+                format!("{}…", truncate(&msg.author_name, author_budget - 1))
+            } else {
+                truncate(&msg.author_name, author_budget)
+            };
+
+        let mut header_spans = vec![
+            Span::raw("  "),
+            Span::styled(dot_prefix, dot_style),
+            Span::styled(author_display, author_style),
+        ];
+        header_spans.extend(suffix_spans);
         out.push(RenderedLine::clickable(Line::from(header_spans), target));
     }
 
-    // Channel root post subject renders BELOW the author header (indented 4 cols)
+    // Channel root post subject renders BELOW the author header (indented 4 cols, wrapped losslessly)
     if let Some(subject) = msg.subject.as_deref().filter(|s| !s.trim().is_empty()) {
-        out.push(RenderedLine::clickable(
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("  ◆ ", theme.subject_style()),
-                Span::styled(
-                    truncate(subject, width.saturating_sub(6)),
-                    theme.subject_style(),
-                ),
-            ]),
-            target,
-        ));
+        let first_prefix = [
+            Span::raw("  "),
+            Span::styled("  ◆ ", theme.subject_style()),
+        ];
+        let cont_prefix = [Span::raw("  "), Span::raw("    ")];
+        let wrapped = bitefoundry_html::layout::wrap_styled_spans(
+            &[Span::styled(subject.to_string(), theme.subject_style())],
+            width,
+            bitefoundry_html::layout::WrapPrefix {
+                first: &first_prefix,
+                cont: &cont_prefix,
+            },
+        );
+        for line in wrapped {
+            out.push(RenderedLine::clickable(line, target));
+        }
     }
 
     // Quoted reply banner (indented 4 cols)
@@ -1427,7 +1459,8 @@ fn render_message_cozy(
         let prefix = format!("▎ {author}: \"");
         let prefix_w = UnicodeWidthStr::width(prefix.as_str());
         let avail = width.saturating_sub(4 + prefix_w + 1);
-        let banner = format!("  {prefix}{}\"", truncate(&preview, avail));
+        let raw_banner = format!("  {prefix}{}\"", truncate(&preview, avail));
+        let banner = truncate(&raw_banner, width.saturating_sub(2));
         out.push(RenderedLine::clickable(
             Line::from(vec![
                 Span::raw("  "),
@@ -1470,7 +1503,7 @@ fn render_message_cozy(
     };
     render_message_body_and_attachments(out, msg, &body_ctx);
 
-    // Reaction badges row (`    [👍 2] [❤️ 1]`)
+    // Reaction badges row(s) (`    [👍 2] [❤️ 1]`) — flow-wrapped across lines
     if !msg.reactions.is_empty() {
         let mut spans = vec![Span::raw("    ")];
         let mut inline_targets = Vec::new();
@@ -1479,27 +1512,45 @@ fn render_message_cozy(
             let emoji = reaction_emoji(&r.reaction_type);
             let badge = format!("[{emoji} {}]", r.count);
             let badge_w = UnicodeWidthStr::width(badge.as_str()) as u16;
-            if (col as usize) + (badge_w as usize) > width {
-                break;
+            let gap = if col > 4 { 1u16 } else { 0u16 };
+            if col > 4 && (col as usize) + (gap as usize) + (badge_w as usize) > width {
+                out.push(RenderedLine::with_inline(
+                    Line::from(std::mem::replace(&mut spans, vec![Span::raw("    ")])),
+                    Some(target),
+                    std::mem::take(&mut inline_targets),
+                ));
+                col = 4;
             }
-            spans.push(Span::styled(badge, theme.reaction_style(r.me_reacted)));
-            spans.push(Span::raw(" "));
+            if col > 4 {
+                spans.push(Span::raw(" "));
+                col += 1;
+            }
+            let max_badge_w = width.saturating_sub(col as usize);
+            let fitted = if (badge_w as usize) > max_badge_w && max_badge_w > 0 {
+                truncate(&badge, max_badge_w)
+            } else {
+                badge
+            };
+            let fitted_w = UnicodeWidthStr::width(fitted.as_str()) as u16;
+            spans.push(Span::styled(fitted, theme.reaction_style(r.me_reacted)));
             inline_targets.push((
                 col,
-                badge_w,
+                fitted_w,
                 HitTarget::Reaction {
                     scope: ctx.scope,
                     msg_index,
                     reaction_index: r_idx,
                 },
             ));
-            col += badge_w + 1;
+            col += fitted_w;
         }
-        out.push(RenderedLine::with_inline(
-            Line::from(spans),
-            Some(target),
-            inline_targets,
-        ));
+        if col > 4 {
+            out.push(RenderedLine::with_inline(
+                Line::from(spans),
+                Some(target),
+                inline_targets,
+            ));
+        }
     }
 
     // Quiet Thread Pill: render ONLY when reply_count > 0
@@ -1580,13 +1631,19 @@ fn render_message_compact(
         }
 
         if let Some(subject) = msg.subject.as_deref().filter(|s| !s.trim().is_empty()) {
-            content_lines.push(RenderedLine::plain(Line::from(vec![
-                Span::styled("◆ ", theme.subject_style()),
-                Span::styled(
-                    truncate(subject, content_w.saturating_sub(2)),
-                    theme.subject_style(),
-                ),
-            ])));
+            let first_prefix = [Span::styled("◆ ", theme.subject_style())];
+            let cont_prefix = [Span::raw("  ")];
+            let wrapped = bitefoundry_html::layout::wrap_styled_spans(
+                &[Span::styled(subject.to_string(), theme.subject_style())],
+                content_w,
+                bitefoundry_html::layout::WrapPrefix {
+                    first: &first_prefix,
+                    cont: &cont_prefix,
+                },
+            );
+            for line in wrapped {
+                content_lines.push(RenderedLine::plain(line));
+            }
             last_is_appendable = true;
         }
 
@@ -1652,33 +1709,48 @@ fn render_message_compact(
             }
         }
 
-        // Compact suffix: `[👍2] [❤️1] · ↳ 4`
-        let mut suffix_spans: Vec<Span<'static>> = Vec::new();
-        let mut suffix_targets: Vec<(u16, u16, HitTarget)> = Vec::new();
+        // Compact suffix: `[👍2] [❤️1] · ↳ 4` (flow-wrapped so `↳ N` never disappears)
+        let mut suffix_rows: Vec<(Vec<Span<'static>>, Vec<(u16, u16, HitTarget)>, u16)> =
+            Vec::new();
+        let mut cur_spans: Vec<Span<'static>> = Vec::new();
+        let mut cur_targets: Vec<(u16, u16, HitTarget)> = Vec::new();
         let mut scol = 0u16;
 
         for (r_idx, r) in msg.reactions.iter().enumerate() {
             let emoji = reaction_emoji(&r.reaction_type);
             let badge = format!("[{emoji}{}]", r.count);
             let bw = UnicodeWidthStr::width(badge.as_str()) as u16;
-            if (scol as usize) + (bw as usize) > content_w {
-                break;
+            let gap = if scol > 0 { 1u16 } else { 0u16 };
+            if scol > 0 && (scol as usize) + (gap as usize) + (bw as usize) > content_w {
+                suffix_rows.push((
+                    std::mem::take(&mut cur_spans),
+                    std::mem::take(&mut cur_targets),
+                    scol,
+                ));
+                scol = 0;
             }
-            if r_idx > 0 {
-                suffix_spans.push(Span::raw(" "));
+            if scol > 0 {
+                cur_spans.push(Span::raw(" "));
                 scol += 1;
             }
-            suffix_spans.push(Span::styled(badge, theme.reaction_style(r.me_reacted)));
-            suffix_targets.push((
+            let avail = content_w.saturating_sub(scol as usize);
+            let fitted = if (bw as usize) > avail && avail > 0 {
+                truncate(&badge, avail)
+            } else {
+                badge
+            };
+            let fitted_w = UnicodeWidthStr::width(fitted.as_str()) as u16;
+            cur_spans.push(Span::styled(fitted, theme.reaction_style(r.me_reacted)));
+            cur_targets.push((
                 scol,
-                bw,
+                fitted_w,
                 HitTarget::Reaction {
                     scope: ctx.scope,
                     msg_index,
                     reaction_index: r_idx,
                 },
             ));
-            scol += bw;
+            scol += fitted_w;
         }
 
         if ctx.is_channel
@@ -1688,39 +1760,66 @@ fn render_message_compact(
         {
             let pill = format!("↳ {}", msg.reply_count);
             let pw = UnicodeWidthStr::width(pill.as_str()) as u16;
-            let sep_w = if suffix_spans.is_empty() { 0u16 } else { 3u16 };
-            if (scol as usize) + (sep_w as usize) + (pw as usize) <= content_w {
-                if sep_w > 0 {
-                    suffix_spans.push(Span::styled(" · ", theme.muted_style()));
-                    scol += sep_w;
-                }
-                suffix_spans.push(Span::styled(pill, theme.accent_style()));
-                suffix_targets.push((scol, pw, HitTarget::OpenThread { msg_index }));
-                scol += pw;
+            let sep_w = if scol == 0 { 0u16 } else { 3u16 };
+            if scol > 0 && (scol as usize) + (sep_w as usize) + (pw as usize) > content_w {
+                suffix_rows.push((
+                    std::mem::take(&mut cur_spans),
+                    std::mem::take(&mut cur_targets),
+                    scol,
+                ));
+                scol = 0;
             }
+            if scol > 0 {
+                cur_spans.push(Span::styled(" · ", theme.muted_style()));
+                scol += 3;
+            }
+            let avail = content_w.saturating_sub(scol as usize);
+            let fitted_pill = if (pw as usize) > avail && avail > 0 {
+                truncate(&pill, avail)
+            } else {
+                pill
+            };
+            let fitted_pw = UnicodeWidthStr::width(fitted_pill.as_str()) as u16;
+            cur_spans.push(Span::styled(fitted_pill, theme.accent_style()));
+            cur_targets.push((scol, fitted_pw, HitTarget::OpenThread { msg_index }));
+            scol += fitted_pw;
         }
 
         if scol > 0 {
+            suffix_rows.push((cur_spans, cur_targets, scol));
+        }
+
+        if suffix_rows.len() == 1 && last_is_appendable {
             let mut appended = false;
-            if last_is_appendable {
-                if let Some(last) = content_lines.last_mut() {
-                    let lw = line_display_width(&last.line);
-                    if lw + 2 + (scol as usize) <= content_w {
-                        last.line.spans.push(Span::raw("  "));
-                        last.line.spans.extend(suffix_spans.clone());
-                        let base_col = (lw + 2) as u16;
-                        for (c, w, t) in &suffix_targets {
-                            last.inline_targets.push((base_col + *c, *w, *t));
-                        }
-                        appended = true;
+            if let Some(last) = content_lines.last_mut() {
+                let lw = line_display_width(&last.line);
+                let row_w = suffix_rows[0].2 as usize;
+                if lw + 2 + row_w <= content_w {
+                    let (spans, targets, _) = suffix_rows.remove(0);
+                    last.line.spans.push(Span::raw("  "));
+                    last.line.spans.extend(spans);
+                    let base_col = (lw + 2) as u16;
+                    for (c, w, t) in targets {
+                        last.inline_targets.push((base_col + c, w, t));
                     }
+                    appended = true;
                 }
             }
             if !appended {
+                for (spans, targets, _) in suffix_rows {
+                    content_lines.push(RenderedLine::with_inline(
+                        Line::from(spans),
+                        Some(target),
+                        targets,
+                    ));
+                }
+            }
+        } else {
+            for (spans, targets, _) in suffix_rows {
                 content_lines.push(RenderedLine::with_inline(
-                    Line::from(suffix_spans),
+                    Line::from(spans),
                     Some(target),
-                    suffix_targets,
+                    targets,
                 ));
             }
         }
@@ -2340,7 +2439,7 @@ fn render_rich_blocks_inner(
                         if i == 0 {
                             format!("{indent}{prefix}")
                         } else {
-                            format!("{indent}  ")
+                            format!("{indent}{}", " ".repeat(prefix.len()))
                         },
                         theme.accent_style().add_modifier(Modifier::BOLD),
                     )];
@@ -2406,26 +2505,34 @@ fn render_rich_blocks_inner(
                 }
                 push_line(Line::from(top_spans));
 
+                let code_prefix = [Span::styled("│ ", header_style)];
+                let code_style = theme.code_style();
                 for raw_line in code.lines() {
-                    let expanded = raw_line.replace('\t', "    ");
-                    let content = truncate(&expanded, body_w.saturating_sub(2));
-                    let content_w = UnicodeWidthStr::width(content.as_str());
-                    let mut code_spans = Vec::new();
-                    if !indent.is_empty() {
-                        code_spans.push(Span::raw(indent.to_string()));
-                    }
-                    code_spans.push(Span::styled("│ ", header_style));
-                    code_spans.push(Span::styled(content, theme.code_style()));
-                    if let Some(bg) = code_bg {
-                        let used = 2 + content_w;
-                        if used < body_w {
-                            code_spans.push(Span::styled(
-                                " ".repeat(body_w - used),
-                                Style::default().bg(bg),
-                            ));
+                    let wrapped = bitefoundry_html::layout::wrap_styled_spans(
+                        &[Span::styled(raw_line.to_string(), code_style)],
+                        body_w,
+                        bitefoundry_html::layout::WrapPrefix {
+                            first: &code_prefix,
+                            cont: &code_prefix,
+                        },
+                    );
+                    for line in wrapped {
+                        let used = line_display_width(&line);
+                        let mut code_spans = Vec::new();
+                        if !indent.is_empty() {
+                            code_spans.push(Span::raw(indent.to_string()));
                         }
+                        code_spans.extend(line.spans);
+                        if let Some(bg) = code_bg {
+                            if used < body_w {
+                                code_spans.push(Span::styled(
+                                    " ".repeat(body_w - used),
+                                    Style::default().bg(bg),
+                                ));
+                            }
+                        }
+                        push_line(Line::from(code_spans));
                     }
-                    push_line(Line::from(code_spans));
                 }
 
                 let mut bot_spans = Vec::new();
@@ -2813,54 +2920,10 @@ fn wrap_rich_spans(
     show_hrefs: bool,
 ) -> Vec<Vec<Span<'static>>> {
     let limit = width.max(1);
-    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-
-    let mut push_wrapped_text = |text: &str, style: Style| {
-        let mut buf = String::new();
-        for ch in text.chars() {
-            if ch == '\n' {
-                if !buf.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                lines.push(std::mem::take(&mut current));
-                used = 0;
-                continue;
-            }
-            if ch == '\t' {
-                for _ in 0..4 {
-                    if used + 1 > limit && (used > 0 || !buf.is_empty()) {
-                        if !buf.is_empty() {
-                            current.push(Span::styled(std::mem::take(&mut buf), style));
-                        }
-                        lines.push(std::mem::take(&mut current));
-                        used = 0;
-                    }
-                    buf.push(' ');
-                    used += 1;
-                }
-                continue;
-            }
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + cw > limit && (used > 0 || !buf.is_empty()) {
-                if !buf.is_empty() {
-                    current.push(Span::styled(std::mem::take(&mut buf), style));
-                }
-                lines.push(std::mem::take(&mut current));
-                used = 0;
-            }
-            buf.push(ch);
-            used += cw;
-        }
-        if !buf.is_empty() {
-            current.push(Span::styled(buf, style));
-        }
-    };
-
+    let mut styled: Vec<Span<'static>> = Vec::with_capacity(rich.len());
     for piece in rich {
         let style = span_style(piece, theme, my_user_id, my_display_name, mentions);
-        push_wrapped_text(&piece.text, style);
+        styled.push(Span::styled(piece.text.clone(), style));
 
         if show_hrefs {
             if let Some(url) = piece
@@ -2872,15 +2935,20 @@ fn wrap_rich_spans(
             {
                 let label_trimmed = piece.text.trim();
                 if !label_trimmed.eq_ignore_ascii_case(url) && !label_trimmed.contains(url) {
-                    let href_suffix = format!(" ({url})");
-                    push_wrapped_text(&href_suffix, theme.muted_style());
+                    styled.push(Span::styled(format!(" ({url})"), theme.muted_style()));
                 }
             }
         }
     }
 
-    lines.push(current);
-    lines
+    bitefoundry_html::layout::wrap_styled_spans(
+        &styled,
+        limit,
+        bitefoundry_html::layout::WrapPrefix::empty(),
+    )
+    .into_iter()
+    .map(|line| line.spans)
+    .collect()
 }
 
 pub fn hyperlinks_enabled() -> bool {
@@ -3818,5 +3886,427 @@ mod tests {
         // 3. Plain-text conversion also preserves newlines and leaks 0 raw `**`
         let plain_out = crate::parser::html_and_cards_to_plain("Line 1\n- **item**", &[]);
         assert_eq!(plain_out, "Line 1\n- item");
+    }
+
+    #[test]
+    fn track_d_adaptive_card_and_connector_card_lossless_at_width_33() {
+        let long_title = "첫째줄긴한글제목입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하\n둘째줄제목연속확인용긴문자열입니다테스트완료";
+        let long_subtitle = "부제목첫줄긴한글설명입니다가나다라마바사아자차카타파하\n부제목둘째줄연속확인";
+        let long_fact_val = "속성값첫줄긴한글데이터입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하\n속성값둘째줄연속확인용문자열";
+        let long_body = "본문첫줄긴한글메시지입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하\n본문둘째줄연속확인용한글메시지";
+        let long_action = "긴한글액션버튼라벨입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하끝";
+
+        let adaptive_json = serde_json::json!({
+            "type": "AdaptiveCard",
+            "body": [
+                { "type": "TextBlock", "text": long_title, "size": "Large", "weight": "Bolder" },
+                { "type": "TextBlock", "text": long_subtitle, "isSubtle": true },
+                { "type": "FactSet", "facts": [{ "title": "배포상태", "value": long_fact_val }] },
+                { "type": "TextBlock", "text": long_body }
+            ],
+            "actions": [
+                { "type": "Action.OpenUrl", "title": long_action, "url": "https://example.com/deploy" }
+            ]
+        })
+        .to_string();
+
+        let connector_json = serde_json::json!({
+            "@type": "MessageCard",
+            "title": long_title,
+            "summary": long_subtitle,
+            "sections": [{
+                "facts": [{ "name": "커넥터항목", "value": long_fact_val }],
+                "text": long_body
+            }],
+            "potentialAction": [{
+                "name": long_action,
+                "targets": [{ "uri": "https://example.com/logs" }]
+            }]
+        })
+        .to_string();
+
+        let theme = Theme::midnight_dark();
+
+        for (kind, content_type, json) in [
+            ("adaptive", crate::parser::card_in::ADAPTIVE_CARD_CONTENT_TYPE, adaptive_json),
+            ("connector", crate::parser::card_in::CONNECTOR_CARD_CONTENT_TYPE, connector_json),
+        ] {
+            let mut msg = sample_msg("m-card", None, 0);
+            msg.attachments = vec![AttachmentInfo {
+                id: "card-1".into(),
+                content_type: content_type.into(),
+                content_url: None,
+                name: None,
+                content_json: Some(json),
+                thumbnail_url: None,
+            }];
+            msg.reactions.clear();
+            msg.body_html = "<attachment id=\"card-1\"></attachment>".into();
+            msg.body_plain.clear();
+
+            // Compact Medium width = 55 -> content_w = 55 - 22 = 33
+            let view = ChatRender {
+                messages: std::slice::from_ref(&msg),
+                is_channel: false,
+                selected_index: None,
+            };
+            let mut out = Vec::new();
+            build_chat_body_lines(
+                &mut out,
+                &view,
+                DensityMode::Compact,
+                None,
+                "",
+                None,
+                None,
+                None,
+                &theme,
+                55,
+                None,
+                (0, 0),
+                (10, 20),
+                false,
+                Vec::new(),
+            );
+
+            // Width invariant: every rendered line <= 55
+            for r in &out {
+                let w = line_display_width(&r.line);
+                assert!(
+                    w <= 55,
+                    "{kind} card line exceeded width 55 (got {w}): {:?}",
+                    r.line
+                );
+            }
+
+            // Collect card lines (those containing `┃ `) and verify bar + card_bg on every wrapped row
+            let card_lines: Vec<&RenderedLine> = out
+                .iter()
+                .filter(|r| r.line.spans.iter().any(|s| s.content.as_ref() == "┃ "))
+                .collect();
+            assert!(
+                card_lines.len() >= 10,
+                "{kind} card should wrap across many lines at content_w=33, got {}",
+                card_lines.len()
+            );
+            for cl in &card_lines {
+                let bar_idx = cl
+                    .line
+                    .spans
+                    .iter()
+                    .position(|s| s.content.as_ref() == "┃ ")
+                    .unwrap();
+                for s in &cl.line.spans[bar_idx..] {
+                    assert_eq!(
+                        s.style.bg,
+                        Some(theme.bg_card),
+                        "{kind} card wrapped row missing card_bg on span {:?}",
+                        s
+                    );
+                }
+            }
+
+            // Reconstruct card text stripping rail and `┃ ` prefix; verify 100% lossless preservation
+            let stripped: String = card_lines
+                .iter()
+                .map(|cl| {
+                    let bar_idx = cl
+                        .line
+                        .spans
+                        .iter()
+                        .position(|s| s.content.as_ref() == "┃ ")
+                        .unwrap();
+                    cl.line.spans[bar_idx + 1..]
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("");
+
+            for expected_part in [
+                "첫째줄긴한글제목입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하",
+                "둘째줄제목연속확인용긴문자열입니다테스트완료",
+                "부제목첫줄긴한글설명입니다가나다라마바사아자차카타파하",
+                "부제목둘째줄연속확인",
+                "속성값첫줄긴한글데이터입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하",
+                "속성값둘째줄연속확인용문자열",
+                "본문첫줄긴한글메시지입니다가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하",
+                "본문둘째줄연속확인용한글메시지",
+                long_action,
+            ] {
+                assert!(
+                    stripped.contains(expected_part),
+                    "{kind} card lost text at width=33:\nmissing: {expected_part}\nactual:  {stripped}"
+                );
+            }
+
+            // Explicit `\n` in title and body must separate lines
+            let row_texts: Vec<String> = card_lines
+                .iter()
+                .map(|cl| cl.line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            let title_l1 = row_texts.iter().position(|t| t.contains("첫째줄긴한글제목")).unwrap();
+            let title_l2 = row_texts.iter().position(|t| t.contains("둘째줄제목연속")).unwrap();
+            assert!(title_l2 > title_l1, "{kind} card title newline did not split lines");
+            let body_l1 = row_texts.iter().position(|t| t.contains("본문첫줄긴한글메시지")).unwrap();
+            let body_l2 = row_texts.iter().position(|t| t.contains("본문둘째줄연속")).unwrap();
+            assert!(body_l2 > body_l1, "{kind} card body newline did not split lines");
+        }
+    }
+
+    #[test]
+    fn track_d_code_block_120_chars_lossless_at_width_33() {
+        let long_code = "\tlet extremely_long_identifier_for_track_d_code_wrapping_test = compute_lossless_layout_result_with_korean_comment_테스트문자열완료(1234567890);";
+        let blocks = vec![RichBlock::CodeBlock {
+            lang: Some("rust".into()),
+            code: long_code.into(),
+        }];
+        let theme = Theme::midnight_dark();
+        let mut out = Vec::new();
+        render_rich_blocks(&mut out, &blocks, "", false, None, &theme, 33, false);
+
+        for r in &out {
+            let w = line_display_width(&r.line);
+            assert!(
+                w <= 33,
+                "CodeBlock line exceeded width 33 (got {w}): {:?}",
+                r.line
+            );
+        }
+
+        let code_lines: Vec<&RenderedLine> = out
+            .iter()
+            .filter(|r| r.line.spans.first().is_some_and(|s| s.content.as_ref() == "│ "))
+            .collect();
+        assert!(
+            code_lines.len() >= 4,
+            "120+ char CodeBlock should wrap across >=4 lines at width 33, got {}",
+            code_lines.len()
+        );
+        for cl in &code_lines {
+            for s in &cl.line.spans {
+                assert_eq!(
+                    s.style.bg,
+                    Some(theme.bg_code),
+                    "CodeBlock wrapped row missing code_bg: {:?}",
+                    s
+                );
+            }
+        }
+
+        let reconstructed: String = code_lines
+            .iter()
+            .map(|cl| {
+                cl.line.spans[1..]
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let expected: String = long_code.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(reconstructed, expected, "CodeBlock lost characters at width 33");
+    }
+
+    #[test]
+    fn track_d_plain_text_three_lines_render_as_three_distinct_lines() {
+        let raw_plain: crate::graph::client::GraphChatMessage = serde_json::from_value(
+            serde_json::json!({
+                "id": "m-plain-3",
+                "createdDateTime": "2026-11-15T06:00:00Z",
+                "from": { "user": { "id": "u1", "displayName": "Alice" } },
+                "body": {
+                    "contentType": "text",
+                    "content": "첫째 줄 R&D 점검\n둘째 줄 a < b 확인\n셋째 줄 배포 완료"
+                }
+            }),
+        )
+        .unwrap();
+        let msg = crate::graph::client::normalize_chat_message("chat:c1", None, None, raw_plain);
+        let view = ChatRender {
+            messages: std::slice::from_ref(&msg),
+            is_channel: false,
+            selected_index: None,
+        };
+        let rendered = build_lines_with_hyperlinks(&view, &Theme::default(), 80, false);
+        let row_texts: Vec<String> = rendered
+            .iter()
+            .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let l1 = row_texts
+            .iter()
+            .position(|t| t.contains("첫째 줄 R&D 점검"))
+            .expect("missing line 1");
+        let l2 = row_texts
+            .iter()
+            .position(|t| t.contains("둘째 줄 a < b 확인"))
+            .expect("missing line 2");
+        let l3 = row_texts
+            .iter()
+            .position(|t| t.contains("셋째 줄 배포 완료"))
+            .expect("missing line 3");
+        assert!(l1 < l2 && l2 < l3, "expected 3 distinct lines, got {l1}, {l2}, {l3}:\n{row_texts:#?}");
+
+        // Also test plain text without `<`/`&`
+        let raw_simple: crate::graph::client::GraphChatMessage = serde_json::from_value(
+            serde_json::json!({
+                "id": "m-plain-simple",
+                "createdDateTime": "2026-11-15T06:01:00Z",
+                "from": { "user": { "id": "u1", "displayName": "Alice" } },
+                "body": {
+                    "contentType": "text",
+                    "content": "Alpha line\nBeta line\nGamma line"
+                }
+            }),
+        )
+        .unwrap();
+        let simple_msg =
+            crate::graph::client::normalize_chat_message("chat:c1", None, None, raw_simple);
+        let simple_rendered = build_lines_with_hyperlinks(
+            &ChatRender {
+                messages: std::slice::from_ref(&simple_msg),
+                is_channel: false,
+                selected_index: None,
+            },
+            &Theme::default(),
+            80,
+            false,
+        );
+        let simple_rows: Vec<String> = simple_rendered
+            .iter()
+            .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let a = simple_rows.iter().position(|t| t.contains("Alpha line")).unwrap();
+        let b = simple_rows.iter().position(|t| t.contains("Beta line")).unwrap();
+        let g = simple_rows.iter().position(|t| t.contains("Gamma line")).unwrap();
+        assert!(a < b && b < g, "expected 3 distinct lines, got {a}, {b}, {g}");
+    }
+
+    #[test]
+    fn track_d_cozy_long_korean_author_and_subject_and_compact_reactions_preserve_metadata() {
+        // 1. Cozy: long Korean author preserves timestamp + [URGENT] + (edited), and subject wraps losslessly
+        let long_subject = "채널공지제목긴한글텍스트입니다가나다라마바사아자차카타파하배포일정안내끝";
+        let mut cozy_msg = sample_msg("m-cozy", Some(long_subject), 0);
+        cozy_msg.attachments.clear();
+        cozy_msg.reactions.clear();
+        cozy_msg.author_name = "김철수플랫폼개발본부아키텍처팀수석엔지니어".into();
+        cozy_msg.importance = "urgent".into();
+        cozy_msg.last_modified_at = Some("2026-11-15T06:05:00Z".into());
+        cozy_msg.body_html = "본문".into();
+        cozy_msg.body_plain = "본문".into();
+
+        let expected_time = format_time(&cozy_msg.created_at);
+        let cozy_lines = build_lines_with_hyperlinks(
+            &ChatRender {
+                messages: std::slice::from_ref(&cozy_msg),
+                is_channel: true,
+                selected_index: None,
+            },
+            &Theme::default(),
+            42,
+            false,
+        );
+        for r in &cozy_lines {
+            let w = line_display_width(&r.line);
+            assert!(w <= 42, "Cozy line exceeded width 42 (got {w}): {:?}", r.line);
+        }
+        let header_text: String = cozy_lines
+            .iter()
+            .find(|r| {
+                let s: String = r.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.contains("[URGENT]")
+            })
+            .map(|r| r.line.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .expect("expected Cozy header with [URGENT]");
+        assert!(header_text.contains(&expected_time), "missing timestamp in {header_text}");
+        assert!(header_text.contains("[URGENT]"), "missing [URGENT] in {header_text}");
+        assert!(header_text.contains("(edited)"), "missing (edited) in {header_text}");
+
+        let subject_joined: String = cozy_lines
+            .iter()
+            .filter(|r| {
+                let s: String = r.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.contains("◆ ") || (s.starts_with("      ") && !s.contains("본문"))
+            })
+            .map(|r| {
+                let s: String = r.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.trim_start_matches(' ')
+                    .trim_start_matches("◆ ")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(subject_joined, long_subject, "Cozy subject lost characters");
+
+        // 2. Compact: many reactions preserve `↳ 3` thread pill & clickable OpenThread target
+        let mut compact_msg = sample_msg("m-compact", Some(long_subject), 3);
+        compact_msg.attachments.clear();
+        compact_msg.body_html = "체크 부탁드립니다".into();
+        compact_msg.body_plain = "체크 부탁드립니다".into();
+        compact_msg.reactions = ["like", "heart", "laugh", "surprised", "sad", "angry"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, rt)| ReactionSummary {
+                reaction_type: rt.into(),
+                count: i + 1,
+                me_reacted: i == 0,
+                users: vec![],
+            })
+            .collect();
+
+        let mut compact_out = Vec::new();
+        build_chat_body_lines(
+            &mut compact_out,
+            &ChatRender {
+                messages: std::slice::from_ref(&compact_msg),
+                is_channel: true,
+                selected_index: None,
+            },
+            DensityMode::Compact,
+            None,
+            "",
+            None,
+            None,
+            None,
+            &Theme::default(),
+            55, // content_w = 33
+            None,
+            (0, 0),
+            (10, 20),
+            false,
+            Vec::new(),
+        );
+        for r in &compact_out {
+            let w = line_display_width(&r.line);
+            assert!(w <= 55, "Compact line exceeded width 55 (got {w}): {:?}", r.line);
+        }
+        let compact_joined = plain_text(&compact_out);
+        assert!(
+            compact_joined.contains("↳ 3"),
+            "Compact mode dropped thread pill `↳ 3` with many reactions:\n{compact_joined}"
+        );
+        assert!(
+            compact_out.iter().any(|r| r
+                .inline_targets
+                .iter()
+                .any(|(_, _, t)| matches!(t, HitTarget::OpenThread { msg_index: 0 }))),
+            "Compact mode missing HitTarget::OpenThread for `↳ 3`"
+        );
+        // Verify compact subject also preserved 100%
+        let stripped_compact: String = compact_out
+            .iter()
+            .map(|r| {
+                let s: String = r.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.split_once("│ ").map(|(_, rhs)| rhs).unwrap_or("").trim().trim_start_matches("◆ ").to_string()
+            })
+            .collect();
+        assert!(
+            stripped_compact.contains(long_subject),
+            "Compact subject lost characters: {stripped_compact}"
+        );
     }
 }

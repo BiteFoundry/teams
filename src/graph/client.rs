@@ -829,6 +829,27 @@ pub(crate) struct GraphChatMessage {
     pub event_detail: Option<serde_json::Value>,
 }
 
+fn escape_plain_text_to_html_preserving_newlines(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push_str("<br>");
+            }
+            '\n' => out.push_str("<br>"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 pub(crate) fn normalize_chat_message(
     conv_key: &str,
     parent_msg_id: Option<String>,
@@ -865,11 +886,23 @@ pub(crate) fn normalize_chat_message(
         _ => false,
     };
 
-    let body_html = raw
+    let is_plain_text_body = raw
+        .body
+        .as_ref()
+        .and_then(|b| b.content_type.as_deref())
+        .is_some_and(|ct| ct.eq_ignore_ascii_case("text"));
+    let raw_body_content = raw
         .body
         .as_ref()
         .and_then(|b| b.content.clone())
         .unwrap_or_default();
+    let body_html = if is_plain_text_body
+        && (raw_body_content.contains('<') || raw_body_content.contains('&'))
+    {
+        escape_plain_text_to_html_preserving_newlines(&raw_body_content)
+    } else {
+        raw_body_content
+    };
 
     let (mut reply_to_id, mut reply_to_author, mut reply_to_preview) =
         extract_quote_from_html(&body_html);

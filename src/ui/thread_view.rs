@@ -11,7 +11,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -140,7 +140,9 @@ pub fn draw(
             "No thread open"
         };
         frame.render_widget(
-            Paragraph::new(msg).style(ui.theme.muted_style()),
+            Paragraph::new(msg)
+                .style(ui.theme.muted_style())
+                .wrap(Wrap { trim: false }),
             body_area,
         );
         return;
@@ -520,10 +522,21 @@ fn build_thread_lines_uncached(
     ))));
 
     if thread.replies.is_empty() {
-        out.push(RenderedLine::plain(Line::from(Span::styled(
-            "  No replies yet — write the first reply below.",
-            theme.muted_style(),
-        ))));
+        let notice_prefix = [Span::styled("  ", theme.muted_style())];
+        let wrapped = bitefoundry_html::layout::wrap_styled_spans(
+            &[Span::styled(
+                "No replies yet — write the first reply below.",
+                theme.muted_style(),
+            )],
+            width,
+            bitefoundry_html::layout::WrapPrefix {
+                first: &notice_prefix,
+                cont: &notice_prefix,
+            },
+        );
+        for line in wrapped {
+            out.push(RenderedLine::plain(line));
+        }
     } else {
         for (i, reply) in thread.replies.iter().enumerate() {
             let is_grouped = i > 0 && messages_groupable(&thread.replies[i - 1], reply, false);
@@ -682,5 +695,41 @@ mod tests {
         assert!(!joined_text(root_slice_2).contains("▎ "));
         assert!(joined_text(rep0_slice_2).contains("▎ "));
         assert!(!joined_text(rep1_slice_2).contains("▎ "));
+    }
+
+    #[test]
+    fn track_d_empty_thread_notice_wraps_losslessly_at_38_cols() {
+        let thread = ThreadView {
+            conv_key: "chan:t1:c1".into(),
+            root: msg("r1", "Alice", "Root body", None),
+            replies: vec![],
+        };
+        let lines = build_thread_lines(&thread, None, &Theme::default(), 38, false);
+        for r in &lines {
+            let w: usize = r
+                .line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(w <= 38, "thread line exceeded width 38 (got {w}): {:?}", r.line);
+        }
+        let normalized = lines
+            .iter()
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains("No replies yet — write the first reply below."),
+            "empty thread notice clipped at 38 cols:\n{normalized}"
+        );
     }
 }

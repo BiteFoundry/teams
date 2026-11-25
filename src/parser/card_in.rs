@@ -683,4 +683,37 @@ mod tests {
             panic!("expected RichBlock::Card");
         }
     }
+
+    #[test]
+    fn card_fields_preserve_embedded_newlines() {
+        let card = serde_json::json!({
+            "type": "AdaptiveCard",
+            "body": [
+                { "type": "TextBlock", "text": "제목1\n제목2", "size": "Large", "weight": "Bolder" },
+                { "type": "TextBlock", "text": "부제1\n부제2", "isSubtle": true },
+                { "type": "FactSet", "facts": [{ "title": "키1\n키2", "value": "값1\n값2" }] },
+                { "type": "TextBlock", "text": "본문1\n본문2\n본문3" }
+            ]
+        });
+        let parsed = parse_card_value(&card, None).unwrap();
+        match parsed {
+            RichBlock::Card {
+                title,
+                subtitle,
+                facts,
+                body_lines,
+                ..
+            } => {
+                assert_eq!(title.as_deref(), Some("제목1\n제목2"));
+                assert_eq!(subtitle.as_deref(), Some("부제1\n부제2"));
+                assert_eq!(facts, vec![("키1\n키2".into(), "값1\n값2".into())]);
+                assert_eq!(body_lines, vec!["본문1", "본문2", "본문3"]);
+            }
+            other => panic!("expected RichBlock::Card, got {other:?}"),
+        }
+
+        let spans = parse_card_markdown_spans("값1\n값2\n값3");
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "값1\n값2\n값3");
+    }
 }

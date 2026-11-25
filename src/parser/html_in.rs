@@ -149,6 +149,34 @@ fn compute_parse_fingerprint(
     (h1.finish(), h2.finish(), html.len())
 }
 
+fn normalize_plain_newlines(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn parse_plain_with_entities_preserving_newlines(input: &str) -> Vec<RichBlock> {
+    let fragment = Html::parse_fragment(input);
+    let decoded = collect_raw_text(fragment.root_element());
+    let normalized = normalize_plain_newlines(&decoded);
+    let trimmed = normalized.trim_matches(|c| c == ' ' || c == '\t' || c == '\n');
+    if trimmed.is_empty() {
+        Vec::new()
+    } else {
+        vec![RichBlock::Paragraph(vec![RichSpan::plain(trimmed)])]
+    }
+}
+
 fn try_fast_path_plain_or_empty(
     html: &str,
     attachments: &[AttachmentInfo],
@@ -159,8 +187,11 @@ fn try_fast_path_plain_or_empty(
     if html.trim().is_empty() {
         return Some(Arc::from([]));
     }
-    if !html.contains('<') && !html.contains('&') && !html.contains('\0') {
-        return Some(Arc::from(parse_plain_markdown_blocks(html)));
+    if !html.contains('<') && !html.contains('\0') {
+        if !html.contains('&') {
+            return Some(Arc::from(parse_plain_markdown_blocks(html)));
+        }
+        return Some(Arc::from(parse_plain_with_entities_preserving_newlines(html)));
     }
     None
 }
@@ -715,8 +746,13 @@ fn parse_message_blocks_uncached(
     };
 
     if !html.trim().is_empty() {
-        if !html.contains('<') && !html.contains('&') && !html.contains('\0') {
-            ctx.blocks.extend(parse_plain_markdown_blocks(html));
+        if !html.contains('<') && !html.contains('\0') {
+            if !html.contains('&') {
+                ctx.blocks.extend(parse_plain_markdown_blocks(html));
+            } else {
+                ctx.blocks
+                    .extend(parse_plain_with_entities_preserving_newlines(html));
+            }
         } else {
             let fragment = Html::parse_fragment(html);
             ctx.walk_children(fragment.root_element(), &TextStyleFlags::default());
@@ -2136,5 +2172,13 @@ mod tests {
         assert!(plain.contains("- item"), "{plain}");
         assert!(plain.contains("- code"), "{plain}");
         assert!(!plain.contains("**"), "raw ** leaked:\n{plain}");
+    }
+
+    #[test]
+    fn plain_text_with_ampersand_preserves_newlines_without_collapsing() {
+        let input = "R&D team update\nTom &amp; Jerry\nFinal line";
+        let blocks = parse_message_blocks(input, &[], &[]);
+        let plain = blocks_to_plain(&blocks);
+        assert_eq!(plain, "R&D team update\nTom & Jerry\nFinal line");
     }
 }

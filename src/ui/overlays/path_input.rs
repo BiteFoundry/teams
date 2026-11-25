@@ -163,26 +163,40 @@ impl PathInputState {
             theme.muted_style()
         };
 
+        let input_viewport = (inner.width as usize).saturating_sub(3).max(1);
+        let render_input_line = |text: &str, style: Style| {
+            let win = bitefoundry_html::layout::windowed_single_line_input(
+                text,
+                text.len(),
+                input_viewport,
+            );
+            let mut spans = vec![Span::styled(" > ", style)];
+            if win.clipped_left {
+                spans.push(Span::styled("‹", theme.muted_style()));
+            }
+            spans.push(Span::raw(win.before_cursor));
+            spans.push(Span::styled("▏", style));
+            if !win.after_cursor.is_empty() {
+                spans.push(Span::raw(win.after_cursor));
+            }
+            if win.clipped_right {
+                spans.push(Span::styled("›", theme.muted_style()));
+            }
+            Line::from(spans)
+        };
+
         let mut lines = vec![
             Line::from(Span::styled(
                 " Local file path (~ expands to home directory)",
                 theme.muted_style(),
             )),
-            Line::from(vec![
-                Span::styled(" > ", path_style),
-                Span::raw(self.path.clone()),
-                Span::styled("▏", path_style),
-            ]),
+            render_input_line(&self.path, path_style),
             Line::from(""),
             Line::from(Span::styled(
                 " Message / caption (optional · Tab to switch)",
                 theme.muted_style(),
             )),
-            Line::from(vec![
-                Span::styled(" > ", caption_style),
-                Span::raw(self.caption.clone()),
-                Span::styled("▏", caption_style),
-            ]),
+            render_input_line(&self.caption, caption_style),
         ];
         match &self.error {
             Some(error) => lines.push(Line::from(Span::styled(

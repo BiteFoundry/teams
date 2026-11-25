@@ -116,11 +116,25 @@ impl SearchOverlay {
             return;
         }
 
-        let query_line = Line::from(vec![
-            Span::styled("Query: ", theme.title(true)),
-            Span::raw(self.query.clone()),
-            Span::styled("▏", theme.muted_style()),
-        ]);
+        let query_viewport = (inner.width as usize).saturating_sub(7).max(1);
+        let win = bitefoundry_html::layout::windowed_single_line_input(
+            &self.query,
+            self.query.len(),
+            query_viewport,
+        );
+        let mut query_spans = vec![Span::styled("Query: ", theme.title(true))];
+        if win.clipped_left {
+            query_spans.push(Span::styled("‹", theme.muted_style()));
+        }
+        query_spans.push(Span::raw(win.before_cursor));
+        query_spans.push(Span::styled("▏", theme.muted_style()));
+        if !win.after_cursor.is_empty() {
+            query_spans.push(Span::raw(win.after_cursor));
+        }
+        if win.clipped_right {
+            query_spans.push(Span::styled("›", theme.muted_style()));
+        }
+        let query_line = Line::from(query_spans);
         frame.render_widget(
             Paragraph::new(query_line),
             Rect::new(inner.x, inner.y, inner.width, 1),
@@ -249,5 +263,45 @@ mod tests {
             search.handle(&Action::Activate, &app),
             OverlayOutcome::CloseAndDispatch(Action::JumpToSearchHit(0))
         );
+    }
+
+    #[test]
+    fn long_query_windows_to_keep_cursor_and_tail_visible() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let cfg = crate::config::AppConfig::default();
+        let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
+        let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
+        let storage = crate::storage::Storage::open_in_memory().unwrap();
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let sync_ctrl = crate::sync::SyncController::from_channels(
+            tokio::sync::watch::channel(crate::sync::FocusTarget::default()).0,
+            event_tx,
+            false,
+        );
+        let (ui_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::new();
+        let search = SearchOverlay {
+            query: "한글검색어테스트긴쿼리문자열입니다가나다라마바사아자차카타파하_TAIL_TOKEN".into(),
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|frame| search.draw(frame, frame.area(), &app, &ui, &mut hitmap))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("TAIL_TOKEN"), "tail text clipped:\n{text}");
+        assert!(text.contains('▏'), "cursor clipped:\n{text}");
+        assert!(text.contains('‹'), "left overflow indicator missing:\n{text}");
     }
 }
