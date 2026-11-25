@@ -175,6 +175,7 @@ Full tool schemas & client setups: **[docs/MCP.md](docs/MCP.md)** · **[docs/NPM
 | [`@bitefoundry/sharepoint`](https://github.com/BiteFoundry/sharepoint) | `sharepoint`, `bitefoundry-onedrive` | SharePoint & OneDrive (Sites, Drives, Lists, Files) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/atlassian`](https://github.com/BiteFoundry/atlassian) | `atlassian`, `confluence`, `conf` | Jira & Confluence (Issues, Boards, Sprints, Wiki) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/notion`](https://github.com/BiteFoundry/notion) | `notion` | Notion (Pages, Databases, Blocks, Comments) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/obsidian`](https://github.com/BiteFoundry/obsidian) | `bitefoundry-obsidian` | Obsidian (Local Vaults, Backlinks & Knowledge Graph) | TUI · CLI · HTTP · MCP |
 
 ---
 
