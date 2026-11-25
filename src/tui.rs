@@ -538,6 +538,7 @@ async fn process_terminal_event_with_burst(
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
+    pending_cell_px_refresh: &mut bool,
     last_activity_sent: &mut Option<Instant>,
     window_focused: &mut Option<bool>,
 ) -> LoopStep {
@@ -547,6 +548,7 @@ async fn process_terminal_event_with_burst(
             app,
             ui,
             dirty,
+            pending_cell_px_refresh,
             last_activity_sent,
             window_focused,
         );
@@ -557,6 +559,7 @@ async fn process_terminal_event_with_burst(
             app,
             ui,
             dirty,
+            pending_cell_px_refresh,
             last_activity_sent,
             window_focused,
         );
@@ -619,6 +622,7 @@ async fn process_terminal_event_with_burst(
                         app,
                         ui,
                         dirty,
+                        pending_cell_px_refresh,
                         last_activity_sent,
                         window_focused
                     ),
@@ -632,7 +636,15 @@ async fn process_terminal_event_with_burst(
 
     if let Some(extra) = trailing_event {
         if matches!(
-            handle_terminal_event(extra, app, ui, dirty, last_activity_sent, window_focused),
+            handle_terminal_event(
+                extra,
+                app,
+                ui,
+                dirty,
+                pending_cell_px_refresh,
+                last_activity_sent,
+                window_focused
+            ),
             LoopStep::Quit
         ) {
             return LoopStep::Quit;
@@ -813,6 +825,7 @@ fn handle_terminal_event(
     app: &mut AppState,
     ui: &mut UiState,
     dirty: &mut bool,
+    pending_cell_px_refresh: &mut bool,
     last_activity_sent: &mut Option<Instant>,
     window_focused: &mut Option<bool>,
 ) -> LoopStep {
@@ -890,12 +903,7 @@ fn handle_terminal_event(
             ui.term_width = w;
             ui.term_height = h;
             *dirty = true;
-            if matches!(
-                ui.overlays.last(),
-                Some(ui::overlays::Overlay::ImagePreview(_))
-            ) {
-                let _ = action::dispatch(Action::LoadPreviewImage, app, ui);
-            }
+            *pending_cell_px_refresh = true;
         }
         CrosstermEvent::FocusGained => {
             if *window_focused != Some(true) {
@@ -1094,10 +1102,34 @@ pub async fn run_with_persona(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
+    let mut pending_cell_px_refresh = false;
     let mut last_activity_sent: Option<Instant> = None;
     let mut window_focused: Option<bool> = None;
 
     loop {
+        if pending_cell_px_refresh {
+            pending_cell_px_refresh = false;
+            #[cfg(windows)]
+            {
+                drop(events);
+                let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+                win_console::enforce_windows_mouse_capture();
+                let mut stdout = io::stdout();
+                let _ = write_vt_mouse_enable(&mut stdout);
+                events = EventStream::new();
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = img_preview::refresh_cell_pixel_size(&mut ui.graphics_caps);
+            }
+            if matches!(
+                ui.overlays.last(),
+                Some(ui::overlays::Overlay::ImagePreview(_))
+            ) {
+                let _ = action::dispatch(Action::LoadPreviewImage, &mut app, &mut ui);
+            }
+        }
+
         if ui.editor_requested {
             ui.editor_requested = false;
             if let Some((_, rect, proto)) = ui.active_pixel_graphic.take() {
@@ -1224,6 +1256,7 @@ pub async fn run_with_persona(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
+                                &mut pending_cell_px_refresh,
                                 &mut last_activity_sent,
                                 &mut window_focused
                             )
@@ -1306,6 +1339,7 @@ pub async fn run_with_persona(
                                 &mut app,
                                 &mut ui,
                                 &mut dirty,
+                                &mut pending_cell_px_refresh,
                                 &mut last_activity_sent,
                                 &mut window_focused
                             )

@@ -2340,18 +2340,44 @@ impl AppState {
         });
     }
 
-    pub fn image_cache_key(owner_id: &str, att_id: &str, cols: u16, rows: u16) -> String {
-        format!("{owner_id}:{att_id}:{cols}x{rows}")
+    pub fn inline_image_bg(theme: &Theme) -> (u8, u8, u8) {
+        let fallback = img_preview::color_to_rgb(theme.bg_card, (20, 22, 26));
+        img_preview::color_to_rgb(theme.bg_canvas, fallback)
+    }
+
+    pub fn modal_image_bg(theme: &Theme) -> (u8, u8, u8) {
+        img_preview::color_to_rgb(theme.bg_elevated, (37, 42, 61))
+    }
+
+    pub fn image_cache_key(
+        owner_id: &str,
+        att_id: &str,
+        cols: u16,
+        rows: u16,
+        cell_px: (u16, u16),
+        bg_rgb: (u8, u8, u8),
+    ) -> String {
+        format!(
+            "{owner_id}:{att_id}:{cols}x{rows}:{}x{}:{:02x}{:02x}{:02x}",
+            cell_px.0, cell_px.1, bg_rgb.0, bg_rgb.1, bg_rgb.2
+        )
     }
 
     pub fn preview_image_cache_key(
         owner_id: &str,
         att_id: &str,
-        cols: u16,
-        rows: u16,
+        view_cols: u16,
+        view_rows: u16,
+        zoom_pct: u16,
+        cell_px: (u16, u16),
         protocol: TerminalImageProtocol,
     ) -> String {
-        format!("{owner_id}:{att_id}:{cols}x{rows}:{}", protocol.as_str())
+        format!(
+            "{owner_id}:{att_id}:{view_cols}x{view_rows}:{zoom_pct}%:{}x{}:{}",
+            cell_px.0,
+            cell_px.1,
+            protocol.as_str()
+        )
     }
 
     pub fn raw_image_cache_key(owner_id: &str, att_id: &str) -> String {
@@ -2472,6 +2498,16 @@ impl AppState {
         }
     }
 
+    /// Clears decoded/rendered image entries while preserving raw fetched bytes (e.g. on theme switch).
+    pub fn clear_rendered_image_cache(&mut self) {
+        self.image_cache.clear();
+        self.image_cache_order.clear();
+        self.image_cache_bytes = 0;
+        self.image_errors.clear();
+        self.image_errors_order.clear();
+        self.image_cache_gen = self.image_cache_gen.wrapping_add(1);
+    }
+
     pub fn clear_image_cache(&mut self) {
         self.image_cache.clear();
         self.image_cache_order.clear();
@@ -2493,8 +2529,8 @@ impl AppState {
         key: String,
         msg_id: String,
         att: AttachmentInfo,
-        cols: u16,
-        rows: u16,
+        fit: img_preview::FitBox,
+        cell_px: (u16, u16),
         bg: (u8, u8, u8),
         caps: Option<TerminalGraphicsCaps>,
     ) {
@@ -2559,8 +2595,10 @@ impl AppState {
                         return;
                     }
                     let decode_res = tokio::task::spawn_blocking(move || match caps {
-                        Some(c) => img_preview::decode_and_render_for_protocol(&bytes, cols, rows, bg, c),
-                        None => img_preview::decode_and_render_halfblocks(&bytes, cols, rows, bg),
+                        Some(c) => img_preview::decode_and_render_for_protocol(&bytes, fit, bg, c),
+                        None => img_preview::decode_and_render_halfblocks_with_cell_px(
+                            &bytes, fit, bg, cell_px,
+                        ),
                     })
                     .await;
                     match decode_res {
@@ -2606,16 +2644,25 @@ impl AppState {
         att: AttachmentInfo,
         cols: u16,
         rows: u16,
+        cell_px: (u16, u16),
+        bg_rgb: (u8, u8, u8),
     ) {
-        let key = Self::image_cache_key(&msg_id, &att.id, cols, rows);
-        self.spawn_attachment_image_decode(key, msg_id, att, cols, rows, (20, 22, 26), None);
+        let key = Self::image_cache_key(&msg_id, &att.id, cols, rows, cell_px, bg_rgb);
+        self.spawn_attachment_image_decode(
+            key,
+            msg_id,
+            att,
+            img_preview::FitBox::fixed(cols, rows),
+            cell_px,
+            bg_rgb,
+            None,
+        );
     }
 
     pub fn request_preview_image(
         &mut self,
         target: &PreviewTarget,
-        cols: u16,
-        rows: u16,
+        fit: img_preview::FitBox,
         caps: TerminalGraphicsCaps,
         bg_rgb: (u8, u8, u8),
     ) {
@@ -2624,16 +2671,18 @@ impl AppState {
                 let key = Self::preview_image_cache_key(
                     msg_id,
                     &attachment.id,
-                    cols,
-                    rows,
+                    fit.view_cols,
+                    fit.view_rows,
+                    fit.zoom_pct,
+                    caps.cell_px,
                     caps.protocol,
                 );
                 self.spawn_attachment_image_decode(
                     key,
                     msg_id.clone(),
                     attachment.clone(),
-                    cols,
-                    rows,
+                    fit,
+                    caps.cell_px,
                     bg_rgb,
                     Some(caps),
                 );
@@ -4180,9 +4229,45 @@ pub(super) mod tests {
     #[test]
     fn image_cache_key_formats_stably() {
         assert_eq!(
-            AppState::image_cache_key("msg-1", "att-9", 40, 14),
-            "msg-1:att-9:40x14"
+            AppState::image_cache_key("msg-1", "att-9", 40, 14, (10, 20), (30, 34, 50)),
+            "msg-1:att-9:40x14:10x20:1e2232"
         );
+    }
+
+    #[test]
+    fn test_preview_cache_key_includes_cell_px() {
+        let k1 = AppState::preview_image_cache_key(
+            "msg-1",
+            "att-9",
+            100,
+            30,
+            100,
+            (10, 20),
+            TerminalImageProtocol::Sixel,
+        );
+        let k2 = AppState::preview_image_cache_key(
+            "msg-1",
+            "att-9",
+            100,
+            30,
+            100,
+            (16, 32),
+            TerminalImageProtocol::Sixel,
+        );
+        let k3 = AppState::preview_image_cache_key(
+            "msg-1",
+            "att-9",
+            100,
+            30,
+            150,
+            (10, 20),
+            TerminalImageProtocol::Sixel,
+        );
+        assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
+        assert!(k1.contains("10x20"));
+        assert!(k2.contains("16x32"));
+        assert!(k3.contains("150%"));
     }
 
     fn make_test_msg(conv_key: &str, msg_id: &str, created_at: &str, body: &str) -> MessageItem {
@@ -4921,7 +5006,8 @@ pub(super) mod tests {
             cell_px: (8, 16),
             cell_px_exact: false,
         };
-        app.request_preview_image(&target, 40, 20, caps_half, (37, 42, 61));
+        let fit_half = img_preview::FitBox::new(40, 20, 100, true);
+        app.request_preview_image(&target, fit_half, caps_half, (37, 42, 61));
         let msg1 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
             .await
             .expect("decode timed out")
@@ -4930,7 +5016,15 @@ pub(super) mod tests {
             UiMsg::ImageDecoded { cache_key, rendered } => {
                 assert_eq!(
                     cache_key,
-                    AppState::preview_image_cache_key("msg-offline", "att-1", 40, 20, TerminalImageProtocol::Halfblock)
+                    AppState::preview_image_cache_key(
+                        "msg-offline",
+                        "att-1",
+                        40,
+                        20,
+                        100,
+                        (8, 16),
+                        TerminalImageProtocol::Halfblock
+                    )
                 );
                 assert_eq!(rendered.protocol, TerminalImageProtocol::Halfblock);
                 app.handle_ui_msg(&mut ui, UiMsg::ImageDecoded { cache_key, rendered });
@@ -4944,7 +5038,8 @@ pub(super) mod tests {
             cell_px: (8, 16),
             cell_px_exact: false,
         };
-        app.request_preview_image(&target, 80, 40, caps_sixel, (37, 42, 61));
+        let fit_sixel = img_preview::FitBox::new(80, 40, 125, true);
+        app.request_preview_image(&target, fit_sixel, caps_sixel, (37, 42, 61));
         let msg2 = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
             .await
             .expect("sixel decode timed out")
@@ -4953,7 +5048,15 @@ pub(super) mod tests {
             UiMsg::ImageDecoded { cache_key, rendered } => {
                 assert_eq!(
                     cache_key,
-                    AppState::preview_image_cache_key("msg-offline", "att-1", 80, 40, TerminalImageProtocol::Sixel)
+                    AppState::preview_image_cache_key(
+                        "msg-offline",
+                        "att-1",
+                        80,
+                        40,
+                        125,
+                        (8, 16),
+                        TerminalImageProtocol::Sixel
+                    )
                 );
                 assert_eq!(rendered.protocol, TerminalImageProtocol::Sixel);
                 assert!(rendered.pixel_payload.is_some());

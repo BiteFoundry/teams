@@ -460,6 +460,7 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
             ui.theme = super::theme::Theme::detect(ui.theme_preset);
             app.config.theme = ui.theme_preset;
             let _ = app.config.save();
+            app.clear_rendered_image_cache();
             ui.info(format!("Theme: {}", ui.theme_preset.label()));
         }
         Action::ShowDownloadDir => {
@@ -1237,31 +1238,32 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
         }
         Action::LoadPreviewImage => {
             let dims = (ui.term_width, ui.term_height);
-            let target_and_dims = ui.overlays.last().and_then(|top| {
+            let target_and_fit = ui.overlays.last().and_then(|top| {
                 if let Overlay::ImagePreview(preview) = top {
                     preview
                         .current()
                         .cloned()
-                        .map(|t| (t, preview.target_dimensions(dims.0, dims.1)))
+                        .map(|t| (t, preview.fit_box(dims.0, dims.1)))
                 } else {
                     None
                 }
             });
-            if let Some((target, (cols, rows))) = target_and_dims {
+            if let Some((target, fit)) = target_and_fit {
                 let key = AppState::preview_image_cache_key(
                     target.owner_id(),
                     target.att_id(),
-                    cols,
-                    rows,
+                    fit.view_cols,
+                    fit.view_rows,
+                    fit.zoom_pct,
+                    ui.graphics_caps.cell_px,
                     ui.graphics_caps.protocol,
                 );
                 app.clear_image_error(&key);
                 app.request_preview_image(
                     &target,
-                    cols,
-                    rows,
+                    fit,
                     ui.graphics_caps,
-                    theme_bg_rgb(ui.theme.bg_elevated),
+                    AppState::modal_image_bg(&ui.theme),
                 );
             }
         }
@@ -1428,31 +1430,25 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
     ui.push_overlay(overlay);
 }
 
-fn theme_bg_rgb(color: ratatui::style::Color) -> (u8, u8, u8) {
-    match color {
-        ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
-        _ => (37, 42, 61),
-    }
-}
-
 fn push_image_preview(preview: ImagePreviewOverlay, app: &mut AppState, ui: &mut UiState) {
     ui.close_overlays_of(OverlayKind::ImagePreview);
     if let Some(target) = preview.current().cloned() {
-        let (cols, rows) = preview.target_dimensions(ui.term_width, ui.term_height);
+        let fit = preview.fit_box(ui.term_width, ui.term_height);
         let key = AppState::preview_image_cache_key(
             target.owner_id(),
             target.att_id(),
-            cols,
-            rows,
+            fit.view_cols,
+            fit.view_rows,
+            fit.zoom_pct,
+            ui.graphics_caps.cell_px,
             ui.graphics_caps.protocol,
         );
         app.clear_image_error(&key);
         app.request_preview_image(
             &target,
-            cols,
-            rows,
+            fit,
             ui.graphics_caps,
-            theme_bg_rgb(ui.theme.bg_elevated),
+            AppState::modal_image_bg(&ui.theme),
         );
     }
     ui.push_overlay(Overlay::ImagePreview(preview));
@@ -2439,6 +2435,8 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                 let req_seq = app.clipboard_paste_seq;
                 let paste_conv_key = app.active_conv_key.clone();
                 let paste_target_thread = ui.composer_target_thread;
+                let paste_bg_rgb = AppState::inline_image_bg(&ui.theme);
+                let paste_cell_px = ui.graphics_caps.cell_px;
                 let tx = app.ui_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     match save_pasted_png_in_dir(&temp_dir, width, height, rgba, unix_ms) {
@@ -2448,11 +2446,11 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("teams-pasted.png")
                                 .to_string();
-                            let preview = crate::img_preview::decode_and_render_halfblocks(
+                            let preview = crate::img_preview::decode_and_render_halfblocks_with_cell_px(
                                 &png_bytes,
-                                24,
-                                5,
-                                (20, 22, 26),
+                                crate::img_preview::FitBox::fixed(24, 5),
+                                paste_bg_rgb,
+                                paste_cell_px,
                             )
                             .ok();
                             let toast_msg = format!(
@@ -3076,7 +3074,7 @@ mod tests {
             web_url: None,
         };
         let overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(0)).unwrap();
-        let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
+        let fit = overlay.fit_box(ui.term_width, ui.term_height);
         ui.push_overlay(Overlay::ImagePreview(overlay));
 
         // Pressing 'p' cycles protocol from Halfblock -> next_manual() and queues LoadPreviewImage.
@@ -3085,7 +3083,15 @@ mod tests {
         assert_eq!(ui.graphics_caps.protocol, expected_next);
 
         // Cache a pixel payload for the new protocol and verify ui::draw populates pending_pixel_graphic.
-        let key = AppState::preview_image_cache_key("m-img", "att-1", cols, rows, expected_next);
+        let key = AppState::preview_image_cache_key(
+            "m-img",
+            "att-1",
+            fit.view_cols,
+            fit.view_rows,
+            fit.zoom_pct,
+            ui.graphics_caps.cell_px,
+            expected_next,
+        );
         app.insert_image_cache(
             key.clone(),
             RenderedTerminalImage {

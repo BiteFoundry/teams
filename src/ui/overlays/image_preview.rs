@@ -108,20 +108,16 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
-        let inner_w = rect.width.saturating_sub(2).max(12);
-        let inner_h = rect.height.saturating_sub(3).max(6);
-        let base_cols = rect.width.saturating_sub(4).max(12);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        let view_cols = rect.width.saturating_sub(2).max(12);
+        let view_rows = rect.height.saturating_sub(3).max(6);
+        (view_cols, view_rows)
+    }
+
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> img_preview::FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        img_preview::FitBox::new(view_cols, view_rows, self.zoom_pct, true)
     }
 
     pub fn next_image(&mut self) {
@@ -285,7 +281,7 @@ impl ImagePreviewOverlay {
             .saturating_sub(2 + if show_close_pill { close_w + 2 } else { 0 })
             as usize;
 
-        let (cols, rows) = self.target_dimensions(area.width, area.height);
+        let fit = self.fit_box(area.width, area.height);
         let Some(cur) = self.current().cloned() else {
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -300,8 +296,10 @@ impl ImagePreviewOverlay {
         let cache_key = AppState::preview_image_cache_key(
             cur.owner_id(),
             cur.att_id(),
-            cols,
-            rows,
+            fit.view_cols,
+            fit.view_rows,
+            fit.zoom_pct,
+            ui.graphics_caps.cell_px,
             ui.graphics_caps.protocol,
         );
         let cached = app.image_cache.get(&cache_key);
@@ -558,11 +556,14 @@ mod tests {
 
         overlay.handle(&Action::Input('+'));
         assert_eq!(overlay.zoom_pct, 125);
-        let (cols_125, rows_125) = overlay.target_dimensions(120, 40);
+        let fit_125 = overlay.fit_box(120, 40);
         overlay.handle(&Action::Input('-'));
-        let (cols_100, rows_100) = overlay.target_dimensions(120, 40);
-        assert!(cols_125 > cols_100);
-        assert!(rows_125 > rows_100);
+        let fit_100 = overlay.fit_box(120, 40);
+        assert_eq!(fit_125.view_cols, fit_100.view_cols);
+        assert_eq!(fit_125.view_rows, fit_100.view_rows);
+        assert_eq!(fit_125.zoom_pct, 125);
+        assert_eq!(fit_100.zoom_pct, 100);
+        assert!(fit_125.scrollable && fit_100.scrollable);
         overlay.handle(&Action::Input('-'));
         assert_eq!(overlay.zoom_pct, 75);
 
@@ -662,7 +663,7 @@ mod tests {
         let msg = teams_msg_with_attachments();
         let mut overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(1)).unwrap();
         let area = Rect::new(0, 0, 100, 30);
-        let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+        let fit = overlay.fit_box(area.width, area.height);
 
         // Verify title protocol badge across all 4 protocols.
         for (proto, badge) in [
@@ -695,8 +696,15 @@ mod tests {
         let proto = img_preview::TerminalImageProtocol::Sixel;
         ui.graphics_caps.protocol = proto;
         let cur = overlay.current().unwrap();
-        let cache_key =
-            AppState::preview_image_cache_key(cur.owner_id(), cur.att_id(), cols, rows, proto);
+        let cache_key = AppState::preview_image_cache_key(
+            cur.owner_id(),
+            cur.att_id(),
+            fit.view_cols,
+            fit.view_rows,
+            fit.zoom_pct,
+            ui.graphics_caps.cell_px,
+            proto,
+        );
         app.insert_image_cache(
             cache_key.clone(),
             img_preview::RenderedTerminalImage {
@@ -809,11 +817,10 @@ mod tests {
             };
 
             let mut overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(1)).unwrap();
-            let (cols, rows) = overlay.target_dimensions(area.width, area.height);
+            let fit = overlay.fit_box(area.width, area.height);
             let rendered = img_preview::decode_and_render_for_protocol(
                 &png,
-                cols,
-                rows,
+                fit,
                 (25, 25, 25),
                 ui.graphics_caps,
             )
@@ -832,8 +839,10 @@ mod tests {
             let base_key = AppState::preview_image_cache_key(
                 cur.owner_id(),
                 cur.att_id(),
-                cols,
-                rows,
+                fit.view_cols,
+                fit.view_rows,
+                fit.zoom_pct,
+                ui.graphics_caps.cell_px,
                 proto,
             );
             app.insert_image_cache(base_key.clone(), rendered);
@@ -886,5 +895,62 @@ mod tests {
 
             app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
         }
+    }
+
+    #[test]
+    fn viewport_dimensions_fit_box_and_cache_key_vary_by_cell_px_and_zoom() {
+        let msg = teams_msg_with_attachments();
+        let mut overlay = ImagePreviewOverlay::from_teams_message(&msg, Some(1)).unwrap();
+
+        let (vw, vh) = ImagePreviewOverlay::viewport_dimensions(180, 30);
+        assert_eq!(vw, 174);
+        assert_eq!(vh, 25);
+
+        let fit_100 = overlay.fit_box(180, 30);
+        assert_eq!(
+            fit_100,
+            img_preview::FitBox {
+                view_cols: 174,
+                view_rows: 25,
+                zoom_pct: 100,
+                scrollable: true,
+            }
+        );
+
+        overlay.zoom_in();
+        let fit_125 = overlay.fit_box(180, 30);
+        assert_eq!(fit_125.view_cols, vw);
+        assert_eq!(fit_125.view_rows, vh);
+        assert_eq!(fit_125.zoom_pct, 125);
+
+        let k_a = AppState::preview_image_cache_key(
+            "m1",
+            "att1",
+            fit_100.view_cols,
+            fit_100.view_rows,
+            fit_100.zoom_pct,
+            (10, 20),
+            TerminalImageProtocol::Sixel,
+        );
+        let k_b = AppState::preview_image_cache_key(
+            "m1",
+            "att1",
+            fit_100.view_cols,
+            fit_100.view_rows,
+            fit_100.zoom_pct,
+            (16, 32),
+            TerminalImageProtocol::Sixel,
+        );
+        let k_c = AppState::preview_image_cache_key(
+            "m1",
+            "att1",
+            fit_125.view_cols,
+            fit_125.view_rows,
+            fit_125.zoom_pct,
+            (10, 20),
+            TerminalImageProtocol::Sixel,
+        );
+        assert_ne!(k_a, k_b);
+        assert_ne!(k_a, k_c);
     }
 }

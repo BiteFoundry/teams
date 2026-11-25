@@ -2059,8 +2059,7 @@ async fn e2e_inline_image_preview_and_self_updater() {
 
     let sixel_tui = img_preview::decode_and_render_for_protocol(
         &png_bytes,
-        16,
-        8,
+        img_preview::FitBox::fixed(16, 8),
         (37, 42, 61),
         TerminalGraphicsCaps {
             protocol: TerminalImageProtocol::Sixel,

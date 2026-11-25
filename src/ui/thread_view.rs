@@ -47,6 +47,7 @@ fn compute_thread_sig(
     my_presence: Option<&PresenceStatus>,
     image_cache_gen: u64,
     inline_images: bool,
+    cell_px: (u16, u16),
     show_hrefs: bool,
     theme: &Theme,
     width: usize,
@@ -89,6 +90,7 @@ fn compute_thread_sig(
         h.write_hash(&0u8);
     }
     h.write_hash(&inline_images);
+    h.write_hash(&cell_px);
     h.write_hash(&show_hrefs);
     h.write_hash(&image_cache_gen);
     h.write_hash(&width);
@@ -145,8 +147,10 @@ pub fn draw(
     };
 
     let width = (body_area.width as usize).max(12);
-    let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
-    let thumb_rows = 10u16;
+    let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
+    let thumb_rows = 16u16;
+    let cell_px = ui.graphics_caps.cell_px;
+    let inline_bg = AppState::inline_image_bg(&ui.theme);
     let my_display_name = app.my_profile.as_ref().map(|p| p.display_name.as_str());
     let thumbs = if ui.inline_images {
         Some(&app.image_cache)
@@ -164,6 +168,7 @@ pub fn draw(
         thumbs,
         app.image_cache_gen,
         (thumb_cols, thumb_rows),
+        cell_px,
         ui.show_hrefs,
         &ui.theme,
         width,
@@ -211,7 +216,7 @@ pub fn draw(
             }
         }
         for (msg_id, att) in to_fetch {
-            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows);
+            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows, cell_px, inline_bg);
         }
     }
 
@@ -382,6 +387,7 @@ pub fn build_thread_lines(
         None,
         0,
         (0, 0),
+        crate::img_preview::TerminalGraphicsCaps::default().cell_px,
         false,
         theme,
         width,
@@ -411,6 +417,7 @@ fn build_thread_stream_cached(
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     image_cache_gen: u64,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
     show_hrefs: bool,
     theme: &Theme,
     width: usize,
@@ -425,6 +432,7 @@ fn build_thread_stream_cached(
         my_presence,
         image_cache_gen,
         image_cache.is_some(),
+        cell_px,
         show_hrefs,
         theme,
         width,
@@ -443,6 +451,7 @@ fn build_thread_stream_cached(
         my_presence,
         image_cache,
         thumb_dims,
+        cell_px,
         show_hrefs,
         theme,
         width,
@@ -467,6 +476,7 @@ fn build_thread_lines_uncached(
     my_presence: Option<&PresenceStatus>,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
     show_hrefs: bool,
     theme: &Theme,
     width: usize,
@@ -489,6 +499,7 @@ fn build_thread_lines_uncached(
         my_presence,
         image_cache,
         thumb_dims,
+        cell_px,
         show_hrefs,
     };
     render_message_item_with_ctx(&mut out, &thread.root, 0, &root_ctx);
@@ -534,6 +545,7 @@ fn build_thread_lines_uncached(
                 my_presence,
                 image_cache,
                 thumb_dims,
+                cell_px,
                 show_hrefs,
             };
             render_message_item_with_ctx(&mut out, reply, i, &reply_ctx);
@@ -637,6 +649,7 @@ mod tests {
             None,
             None,
             (0, 0),
+            (10, 20),
             false,
             &theme,
             80,
@@ -658,6 +671,7 @@ mod tests {
             None,
             None,
             (0, 0),
+            (10, 20),
             false,
             &theme,
             80,

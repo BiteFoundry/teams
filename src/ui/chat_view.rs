@@ -200,8 +200,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
 
     if ui.inline_images {
         let width = (message_area.width as usize).max(12);
-        let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
-        let thumb_rows = 10u16;
+        let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
+        let thumb_rows = 16u16;
+        let cell_px = ui.graphics_caps.cell_px;
+        let inline_bg = AppState::inline_image_bg(&ui.theme);
         let vis_start = offset.saturating_sub(20);
         let vis_end = offset.saturating_add(height).saturating_add(20);
         let mut to_fetch = Vec::new();
@@ -221,7 +223,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
             }
         }
         for (msg_id, att) in to_fetch {
-            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows);
+            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows, cell_px, inline_bg);
         }
     }
 
@@ -777,6 +779,7 @@ fn compute_chat_lines_sig(
     show_hrefs: bool,
     inline_images: bool,
     image_cache_gen: u64,
+    cell_px: (u16, u16),
     loading_older: bool,
     oldest_reached: bool,
     history_error: Option<&str>,
@@ -812,6 +815,7 @@ fn compute_chat_lines_sig(
     h.write_hash(&show_hrefs);
     h.write_hash(&inline_images);
     h.write_hash(&image_cache_gen);
+    h.write_hash(&cell_px);
     h.write_hash(&loading_older);
     h.write_hash(&oldest_reached);
     match history_error {
@@ -922,6 +926,7 @@ fn build_stream_cached(
         ui.show_hrefs,
         ui.inline_images,
         app.image_cache_gen,
+        ui.graphics_caps.cell_px,
         app.loading_older,
         app.oldest_reached,
         app.history_error.as_deref(),
@@ -934,8 +939,8 @@ fn build_stream_cached(
         return result;
     }
 
-    let thumb_cols = width.saturating_sub(4).clamp(16, 40) as u16;
-    let thumb_rows = 10u16;
+    let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
+    let thumb_rows = 16u16;
 
     let mut out = Vec::new();
     let mut ranges = Vec::with_capacity(view.messages.len());
@@ -981,6 +986,7 @@ fn build_stream_cached(
         width,
         thumbs,
         (thumb_cols, thumb_rows),
+        ui.graphics_caps.cell_px,
         ui.show_hrefs,
         ranges,
     );
@@ -1015,6 +1021,7 @@ pub fn build_lines_with_hyperlinks(
         width,
         None,
         (0, 0),
+        img_preview::TerminalGraphicsCaps::default().cell_px,
         false,
         Vec::new(),
     );
@@ -1035,6 +1042,7 @@ fn build_chat_body_lines(
     width: usize,
     image_cache: Option<&HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
     show_hrefs: bool,
     mut ranges: Vec<(usize, usize)>,
 ) -> Vec<(usize, usize)> {
@@ -1115,6 +1123,7 @@ fn build_chat_body_lines(
             my_presence,
             image_cache,
             thumb_dims,
+            cell_px,
             show_hrefs,
         };
         render_message_item_with_ctx(out, msg, msg_index, &ctx);
@@ -1213,6 +1222,7 @@ pub(crate) struct MessageRenderCtx<'a> {
     pub my_presence: Option<&'a PresenceStatus>,
     pub image_cache: Option<&'a HashMap<String, RenderedTerminalImage>>,
     pub thumb_dims: (u16, u16),
+    pub cell_px: (u16, u16),
     pub show_hrefs: bool,
 }
 
@@ -1272,6 +1282,7 @@ pub fn render_message_item_with_thumbs(
         my_presence: None,
         image_cache,
         thumb_dims,
+        cell_px: img_preview::TerminalGraphicsCaps::default().cell_px,
         show_hrefs: false,
     };
     render_message_item_with_ctx(out, msg, msg_index, &ctx);
@@ -1454,6 +1465,7 @@ fn render_message_cozy(
         target,
         image_cache: ctx.image_cache,
         thumb_dims: ctx.thumb_dims,
+        cell_px: ctx.cell_px,
         show_hrefs: ctx.show_hrefs,
     };
     render_message_body_and_attachments(out, msg, &body_ctx);
@@ -1609,6 +1621,7 @@ fn render_message_compact(
             target,
             image_cache: ctx.image_cache,
             thumb_dims: ctx.thumb_dims,
+            cell_px: ctx.cell_px,
             show_hrefs: ctx.show_hrefs,
         };
         let ended_with_plain_text = render_message_body_and_attachments(&mut content_lines, msg, &body_ctx);
@@ -1759,6 +1772,7 @@ struct BodyBlockCtx<'a> {
     target: HitTarget,
     image_cache: Option<&'a HashMap<String, RenderedTerminalImage>>,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
     show_hrefs: bool,
 }
 
@@ -1847,6 +1861,7 @@ fn render_message_body_and_attachments(
                             att,
                             cache,
                             bctx.thumb_dims,
+                            bctx.cell_px,
                             bctx.indent,
                             bctx.width,
                             bctx.theme,
@@ -1893,6 +1908,7 @@ fn render_message_body_and_attachments(
                             att,
                             cache,
                             bctx.thumb_dims,
+                            bctx.cell_px,
                             bctx.indent,
                             bctx.width,
                             bctx.theme,
@@ -1985,6 +2001,7 @@ fn render_message_body_and_attachments(
                     att,
                     cache,
                     bctx.thumb_dims,
+                    bctx.cell_px,
                     bctx.indent,
                     bctx.width,
                     bctx.theme,
@@ -2006,6 +2023,7 @@ fn emit_inline_thumb(
     att: &AttachmentInfo,
     cache: &HashMap<String, RenderedTerminalImage>,
     thumb_dims: (u16, u16),
+    cell_px: (u16, u16),
     indent: &str,
     width: usize,
     theme: &Theme,
@@ -2013,7 +2031,8 @@ fn emit_inline_thumb(
     msg_index: usize,
     attach_idx: usize,
 ) {
-    let key = AppState::image_cache_key(msg_id, &att.id, thumb_dims.0, thumb_dims.1);
+    let bg_rgb = AppState::inline_image_bg(theme);
+    let key = AppState::image_cache_key(msg_id, &att.id, thumb_dims.0, thumb_dims.1, cell_px, bg_rgb);
     if let Some(rendered) = cache.get(&key) {
         let target = HitTarget::Attachment {
             scope,
@@ -2953,6 +2972,7 @@ mod tests {
             80,
             None,
             (0, 0),
+            (10, 20),
             false,
             Vec::new(),
         );
@@ -3001,6 +3021,7 @@ mod tests {
             100,
             None,
             (0, 0),
+            (10, 20),
             false,
             Vec::new(),
         );
@@ -3046,6 +3067,7 @@ mod tests {
             80,
             None,
             (0, 0),
+            (10, 20),
             false,
             Vec::new(),
         );
@@ -3177,6 +3199,7 @@ mod tests {
                 false,
                 true,
                 0,
+                (10, 20),
                 false,
                 false,
                 None,
@@ -3221,6 +3244,7 @@ mod tests {
             false,
             true,
             0,
+            (10, 20),
             false,
             false,
             None,
@@ -3247,6 +3271,7 @@ mod tests {
             false,
             true,
             0,
+            (10, 20),
             false,
             false,
             None,
@@ -3272,6 +3297,7 @@ mod tests {
             false,
             true,
             0,
+            (10, 20),
             false,
             false,
             None,
@@ -3298,6 +3324,7 @@ mod tests {
             false,
             true,
             0,
+            (10, 20),
             false,
             false,
             None,
@@ -3331,6 +3358,7 @@ mod tests {
             false,
             true,
             0,
+            (10, 20),
             false,
             false,
             None,
@@ -3431,8 +3459,17 @@ mod tests {
                 .into();
         msg.body_plain = "Look:".into();
 
-        let thumb_dims = (24u16, 10u16);
-        let cache_key = AppState::image_cache_key("m1", "hosted:1", thumb_dims.0, thumb_dims.1);
+        let theme = Theme::default();
+        let thumb_dims = (24u16, 16u16);
+        let cell_px = (10u16, 20u16);
+        let cache_key = AppState::image_cache_key(
+            "m1",
+            "hosted:1",
+            thumb_dims.0,
+            thumb_dims.1,
+            cell_px,
+            AppState::inline_image_bg(&theme),
+        );
         let mut cache = HashMap::new();
         cache.insert(
             cache_key,
@@ -3455,7 +3492,6 @@ mod tests {
             selected_index: None,
         };
         let mut out = Vec::new();
-        let theme = Theme::default();
         let _ranges = build_chat_body_lines(
             &mut out,
             &view,
@@ -3469,6 +3505,7 @@ mod tests {
             80,
             Some(&cache),
             thumb_dims,
+            cell_px,
             false,
             Vec::new(),
         );
@@ -3522,6 +3559,7 @@ mod tests {
             120,
             None,
             (0, 0),
+            (10, 20),
             false,
             Vec::new(),
         );
@@ -3543,6 +3581,7 @@ mod tests {
             120,
             None,
             (0, 0),
+            (10, 20),
             true,
             Vec::new(),
         );
