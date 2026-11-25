@@ -580,8 +580,10 @@ async fn process_terminal_event_with_burst(
         let next_ev = match events.next().now_or_never() {
             Some(item) => item,
             None => {
-                let buffered = crossterm::event::poll(Duration::ZERO).unwrap_or(false);
-                if !has_enter && !buffered {
+                // `EventStream::poll_next` already polled with `Duration::ZERO` and woke its
+                // background reader thread; calling `crossterm::event::poll` here blocks on
+                // Windows `INTERNAL_EVENT_READER` until the next console event arrives.
+                if !has_enter {
                     break;
                 }
                 match tokio::time::timeout(PASTE_BURST_POLL, events.next()).await {
