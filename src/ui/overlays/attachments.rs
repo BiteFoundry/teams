@@ -1,5 +1,6 @@
 //! Attachments tray overlay (`Ctrl+T` or `[Attachments]`).
 
+use bitefoundry_html::ContentKind;
 use ratatui::{
     layout::Rect,
     style::Style,
@@ -29,19 +30,44 @@ pub struct AttachmentRow {
 }
 
 impl AttachmentRow {
+    pub fn content_kind(&self) -> ContentKind {
+        let kind = bitefoundry_html::sniff_content_kind(
+            Some(self.content_type.as_str()),
+            Some(self.name.as_str()),
+            None,
+        );
+        if matches!(kind, ContentKind::PlainText | ContentKind::Binary)
+            && bitefoundry_html::sniff_content_kind(None, Some(self.name.as_str()), None)
+                == ContentKind::Markdown
+        {
+            return ContentKind::Markdown;
+        }
+        kind
+    }
+
+    pub fn is_markdown(&self) -> bool {
+        self.content_kind() == ContentKind::Markdown
+    }
+
+    pub fn is_previewable_markup(&self) -> bool {
+        matches!(
+            self.content_kind(),
+            ContentKind::Html | ContentKind::Markdown
+        )
+    }
+
     pub fn icon(&self) -> &'static str {
         let ct = self.content_type.to_ascii_lowercase();
-        if ct.contains("image") && !ct.contains("svg") {
-            "[IMG]"
-        } else if ct.contains("html")
-            || self.name.to_ascii_lowercase().ends_with(".html")
-            || self.name.to_ascii_lowercase().ends_with(".htm")
-        {
-            "[HTML]"
-        } else if ct.contains("card") {
+        if ct.contains("card") {
             "[CARD]"
         } else {
-            "[FILE]"
+            match self.content_kind() {
+                ContentKind::RasterImage => "[IMG]",
+                ContentKind::Html => "[HTML]",
+                ContentKind::Markdown => "[MD]",
+                _ if ct.contains("image") && !ct.contains("svg") => "[IMG]",
+                _ => "[FILE]",
+            }
         }
     }
 
@@ -127,6 +153,41 @@ impl AttachmentsState {
                     return OverlayOutcome::CloseAndDispatch(Action::OpenSendFile);
                 }
                 match items.get(self.selected - 1) {
+                    Some(row) if row.is_previewable_markup() => {
+                        OverlayOutcome::CloseAndDispatch(Action::PreviewAttachment {
+                            scope: row.scope,
+                            msg_index: row.msg_index,
+                            attach_index: row.attach_index,
+                        })
+                    }
+                    Some(row) => OverlayOutcome::Dispatch(Action::DownloadAttachment {
+                        scope: row.scope,
+                        msg_index: row.msg_index,
+                        attach_index: row.attach_index,
+                    }),
+                    None => OverlayOutcome::Handled,
+                }
+            }
+            Action::Input('v') | Action::OpenImagePreview => {
+                if self.selected == 0 {
+                    return OverlayOutcome::Handled;
+                }
+                match items.get(self.selected - 1) {
+                    Some(row) if row.is_previewable_markup() || row.icon() == "[IMG]" => {
+                        OverlayOutcome::CloseAndDispatch(Action::PreviewAttachment {
+                            scope: row.scope,
+                            msg_index: row.msg_index,
+                            attach_index: row.attach_index,
+                        })
+                    }
+                    _ => OverlayOutcome::Handled,
+                }
+            }
+            Action::Input('d') | Action::DownloadLatest => {
+                if self.selected == 0 {
+                    return OverlayOutcome::Handled;
+                }
+                match items.get(self.selected - 1) {
                     Some(row) => OverlayOutcome::Dispatch(Action::DownloadAttachment {
                         scope: row.scope,
                         msg_index: row.msg_index,
@@ -162,7 +223,7 @@ impl AttachmentsState {
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(theme.bg_elevated).fg(theme.fg))
             .title(Line::from(Span::styled(
-                " Attachments · Enter Download · Esc Close ",
+                " Attachments · Enter/v Preview · d Download · Esc Close ",
                 theme.title(true),
             )))
             .border_style(theme.border_style(true));
@@ -237,7 +298,7 @@ impl AttachmentsState {
         );
         frame.render_widget(
             Paragraph::new(Span::styled(
-                " Enter: download · first row sends file",
+                " Enter/v: preview HTML/MD or download · d: download · first row sends file",
                 theme.muted_style(),
             )),
             Rect::new(inner.x, hint_y.saturating_add(1), inner.width, 1),

@@ -178,6 +178,11 @@ pub enum Action {
         msg_index: usize,
         attach_index: usize,
     },
+    PreviewAttachment {
+        scope: MessageScope,
+        msg_index: usize,
+        attach_index: usize,
+    },
     DownloadLatest,
     OpenSendFile,
     OpenFilePicker,
@@ -1014,6 +1019,13 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
         } => {
             app.download_attachment(ui, scope, msg_index, attach_index);
         }
+        Action::PreviewAttachment {
+            scope,
+            msg_index,
+            attach_index,
+        } => {
+            click_attachment(scope, msg_index, attach_index, app, ui);
+        }
         Action::DownloadLatest => {
             if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
                 if app
@@ -1536,9 +1548,11 @@ fn open_html_preview_for_message(
     }
 
     let eff = msg.effective_attachments();
-    if let Some(html_att) = eff
+    if let Some(markup_att) = eff
         .iter()
-        .find(|att| HtmlPreviewOverlay::is_html_attachment(att) && att.content_url.is_some())
+        .find(|att| {
+            HtmlPreviewOverlay::is_previewable_markup_attachment(att) && att.content_url.is_some()
+        })
         .cloned()
     {
         let body_trimmed = msg.body_html.trim();
@@ -1548,7 +1562,7 @@ fn open_html_preview_for_message(
                 && !body_trimmed.contains("<p")
                 && !body_trimmed.contains("<div"));
         if body_is_empty_or_placeholder {
-            app.fetch_html_attachment(ui, html_att);
+            app.fetch_html_attachment(ui, markup_att);
             return;
         }
     }
@@ -1564,7 +1578,7 @@ fn open_html_preview_for_message(
 fn serve_active_html_preview(app: &mut AppState, ui: &mut UiState) {
     let payload = ui.overlays.last().and_then(|top| {
         if let Overlay::HtmlPreview(preview) = top {
-            Some((preview.title().to_string(), preview.raw_html().to_string()))
+            Some((preview.title().to_string(), preview.serve_html()))
         } else {
             None
         }
@@ -2190,14 +2204,18 @@ fn click_attachment(
         .and_then(|msg| msg.effective_attachments().get(attach_index).cloned());
 
     if let Some(att) = clicked_att {
-        if HtmlPreviewOverlay::is_html_attachment(&att) {
+        if HtmlPreviewOverlay::is_previewable_markup_attachment(&att) {
             if att.content_url.is_some() {
                 app.fetch_html_attachment(ui, att);
                 return;
             }
-            if let Some(inline_html) = att.content_json.as_deref().filter(|s| !s.trim().is_empty()) {
+            if let Some(inline_src) = att.content_json.as_deref().filter(|s| !s.trim().is_empty()) {
                 ui.close_overlays_of(OverlayKind::HtmlPreview);
-                ui.push_overlay(Overlay::html_preview(att.name, inline_html.to_string()));
+                if HtmlPreviewOverlay::is_markdown_attachment(&att) {
+                    ui.push_overlay(Overlay::markdown_preview(att.name, inline_src.to_string()));
+                } else {
+                    ui.push_overlay(Overlay::html_preview(att.name, inline_src.to_string()));
+                }
                 return;
             }
         }

@@ -1790,9 +1790,9 @@ fn render_message_body_and_attachments(
     let attachments = eff_attachments.as_ref();
     let parsed_blocks =
         parser::parse_message_blocks_arc(&msg.body_html, attachments, &msg.mentions);
-    let fallback_blocks;
+    let fallback_blocks: Vec<RichBlock>;
     let blocks: &[RichBlock] = if parsed_blocks.is_empty() && !msg.body_plain.trim().is_empty() {
-        fallback_blocks = [RichBlock::Paragraph(vec![RichSpan::plain(&msg.body_plain)])];
+        fallback_blocks = parser::html_in::parse_plain_markdown_blocks(&msg.body_plain);
         &fallback_blocks
     } else {
         &parsed_blocks
@@ -1820,10 +1820,17 @@ fn render_message_body_and_attachments(
                     && attachments.get(attach_idx).is_some_and(
                         crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_html_attachment,
                     );
+                let is_md = !is_img
+                    && !is_html
+                    && attachments.get(attach_idx).is_some_and(
+                        crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_markdown_attachment,
+                    );
                 let tag = if is_img {
                     "IMG "
                 } else if is_html {
                     "HTML "
+                } else if is_md {
+                    "MD "
                 } else {
                     "FILE "
                 };
@@ -1960,10 +1967,15 @@ fn render_message_body_and_attachments(
         let is_img = img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref());
         let is_html = !is_img
             && crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_html_attachment(att);
+        let is_md = !is_img
+            && !is_html
+            && crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_markdown_attachment(att);
         let tag = if is_img {
             "IMG "
         } else if is_html {
             "HTML "
+        } else if is_md {
+            "MD "
         } else {
             "FILE "
         };
@@ -2472,66 +2484,114 @@ fn render_rich_blocks_inner(
                     Some(bg) => Style::default().fg(theme.accent).bg(bg),
                     None => theme.accent_style(),
                 };
-                let push_card_line = |push: &mut dyn FnMut(Line<'static>), text_span: Span<'static>| {
-                    let text_w = UnicodeWidthStr::width(text_span.content.as_ref());
-                    let mut spans = Vec::new();
-                    if !indent.is_empty() {
-                        spans.push(Span::raw(indent.to_string()));
-                    }
-                    spans.push(Span::styled("┃ ", bar_style));
-                    spans.push(text_span);
-                    if let Some(bg) = card_bg {
-                        let used = 2 + text_w;
-                        if used < body_w {
-                            spans.push(Span::styled(
-                                " ".repeat(body_w - used),
-                                Style::default().bg(bg),
-                            ));
+                let bar_prefix = [Span::styled("┃ ", bar_style)];
+                let push_card_spans =
+                    |push: &mut dyn FnMut(Line<'static>), styled_spans: &[Span<'static>]| {
+                        let wrapped = bitefoundry_html::wrap_styled_spans(
+                            styled_spans,
+                            body_w,
+                            bitefoundry_html::WrapPrefix {
+                                first: &bar_prefix,
+                                cont: &bar_prefix,
+                            },
+                        );
+                        for line in wrapped {
+                            let used: usize = line
+                                .spans
+                                .iter()
+                                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                                .sum();
+                            let mut spans = Vec::new();
+                            if !indent.is_empty() {
+                                spans.push(Span::raw(indent.to_string()));
+                            }
+                            spans.extend(line.spans);
+                            if let Some(bg) = card_bg {
+                                if used < body_w {
+                                    spans.push(Span::styled(
+                                        " ".repeat(body_w - used),
+                                        Style::default().bg(bg),
+                                    ));
+                                }
+                            }
+                            push(Line::from(spans));
                         }
-                    }
-                    push(Line::from(spans));
-                };
+                    };
 
                 let card_title = title.as_deref().unwrap_or("Adaptive Card");
                 let mut t_style = Style::default().add_modifier(Modifier::BOLD);
                 if let Some(bg) = card_bg {
                     t_style = t_style.fg(theme.fg_primary).bg(bg);
                 }
-                push_card_line(
-                    &mut push_line,
-                    Span::styled(truncate(card_title, body_w.saturating_sub(2)), t_style),
-                );
+                let title_rich = crate::parser::card_in::parse_card_markdown_spans(card_title);
+                let title_spans = if title_rich.is_empty() {
+                    vec![Span::styled(card_title.to_string(), t_style)]
+                } else {
+                    card_rich_to_spans(&title_rich, t_style, card_bg, theme, show_hrefs)
+                };
+                push_card_spans(&mut push_line, &title_spans);
 
                 if let Some(sub) = subtitle {
                     let s_style = match card_bg {
                         Some(bg) => Style::default().fg(theme.fg_muted).bg(bg),
                         None => theme.muted_style(),
                     };
-                    push_card_line(
-                        &mut push_line,
-                        Span::styled(truncate(sub, body_w.saturating_sub(2)), s_style),
-                    );
+                    let sub_rich = crate::parser::card_in::parse_card_markdown_spans(sub);
+                    let sub_spans = if sub_rich.is_empty() {
+                        vec![Span::styled(sub.clone(), s_style)]
+                    } else {
+                        card_rich_to_spans(&sub_rich, s_style, card_bg, theme, show_hrefs)
+                    };
+                    push_card_spans(&mut push_line, &sub_spans);
                 }
                 for (k, v) in facts {
-                    let text = format!("{k}: {v}");
                     let f_style = match card_bg {
                         Some(bg) => Style::default().fg(theme.fg_secondary).bg(bg),
                         None => Style::default(),
                     };
-                    push_card_line(
-                        &mut push_line,
-                        Span::styled(truncate(&text, body_w.saturating_sub(2)), f_style),
-                    );
+                    let key_style = f_style.add_modifier(Modifier::BOLD);
+                    let mut fact_spans: Vec<Span<'static>> = Vec::new();
+                    if !k.trim().is_empty() {
+                        let k_rich = crate::parser::card_in::parse_card_markdown_spans(k);
+                        if k_rich.is_empty() {
+                            fact_spans.push(Span::styled(k.clone(), key_style));
+                        } else {
+                            fact_spans.extend(card_rich_to_spans(
+                                &k_rich,
+                                key_style,
+                                card_bg,
+                                theme,
+                                show_hrefs,
+                            ));
+                        }
+                        fact_spans.push(Span::styled(": ", f_style));
+                    }
+                    let v_rich = crate::parser::card_in::parse_card_markdown_spans(v);
+                    if v_rich.is_empty() {
+                        fact_spans.push(Span::styled(v.clone(), f_style));
+                    } else {
+                        fact_spans.extend(card_rich_to_spans(
+                            &v_rich,
+                            f_style,
+                            card_bg,
+                            theme,
+                            show_hrefs,
+                        ));
+                    }
+                    push_card_spans(&mut push_line, &fact_spans);
                 }
                 for bl in body_lines {
                     let b_style = match card_bg {
                         Some(bg) => Style::default().fg(theme.fg_primary).bg(bg),
                         None => Style::default(),
                     };
-                    push_card_line(
-                        &mut push_line,
-                        Span::styled(truncate(bl, body_w.saturating_sub(2)), b_style),
-                    );
+                    let bl_rich = crate::parser::card_in::parse_card_markdown_spans(bl);
+                    let bl_spans = if bl_rich.is_empty() {
+                        vec![Span::styled(bl.clone(), b_style)]
+                    } else {
+                        card_rich_to_spans(&bl_rich, b_style, card_bg, theme, show_hrefs)
+                    };
+                    push_card_spans(&mut push_line, &bl_spans);
                 }
                 for (label, url) in actions {
                     let link_label = if show_hrefs
@@ -2549,10 +2609,7 @@ fn render_rich_blocks_inner(
                             .add_modifier(Modifier::UNDERLINED),
                         None => theme.accent_style().add_modifier(Modifier::UNDERLINED),
                     };
-                    push_card_line(
-                        &mut push_line,
-                        Span::styled(truncate(&link_label, body_w.saturating_sub(2)), a_style),
-                    );
+                    push_card_spans(&mut push_line, &[Span::styled(link_label, a_style)]);
                 }
             }
             RichBlock::AttachmentChip { .. } | RichBlock::InlineImageChip { .. } => {}
@@ -2643,6 +2700,62 @@ fn is_mention_for_me(
         }
     }
     false
+}
+
+fn card_rich_to_spans(
+    rich: &[RichSpan],
+    base_style: Style,
+    card_bg: Option<Color>,
+    theme: &Theme,
+    show_hrefs: bool,
+) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(rich.len());
+    for piece in rich {
+        let mut style = base_style;
+        if piece.style.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if piece.style.italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if piece.style.strike {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if piece.style.underline {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        if piece.style.code {
+            style = theme.code_style();
+            if style.bg.is_none() || style.bg == Some(Color::Reset) {
+                if let Some(bg) = card_bg {
+                    style = style.bg(bg);
+                }
+            }
+        }
+        if piece.style.link_url.is_some() {
+            style = style.fg(theme.accent).add_modifier(Modifier::UNDERLINED);
+        }
+        out.push(Span::styled(piece.text.clone(), style));
+        if show_hrefs {
+            if let Some(url) = piece
+                .style
+                .link_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            {
+                let label_trimmed = piece.text.trim();
+                if !label_trimmed.eq_ignore_ascii_case(url) && !label_trimmed.contains(url) {
+                    let muted = match card_bg {
+                        Some(bg) => theme.muted_style().bg(bg),
+                        None => theme.muted_style(),
+                    };
+                    out.push(Span::styled(format!(" ({url})"), muted));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn span_style(
@@ -3588,5 +3701,122 @@ mod tests {
         let shown_text = plain_text(&shown_out);
         assert!(shown_text.contains("the guide (https://example.com/guide)"));
         assert!(!shown_text.contains("(https://bare.example.com)"));
+    }
+
+    #[test]
+    fn adaptive_card_and_plain_md_no_raw_leakage() {
+        let card_json = r#"{
+            "type": "AdaptiveCard",
+            "body": [
+                { "type": "TextBlock", "text": "**Deploy** Notice", "size": "Large", "weight": "Bolder" },
+                { "type": "TextBlock", "text": "**Alert**: [Open](https://ex.com)\nLine 2" },
+                { "type": "FactSet", "facts": [{ "title": "**Env**", "value": "`prod` · [Dash](https://ex.com/dash)" }] }
+            ]
+        }"#;
+        let card_att = AttachmentInfo {
+            id: "card-md-1".into(),
+            content_type: crate::parser::card_in::ADAPTIVE_CARD_CONTENT_TYPE.into(),
+            content_url: None,
+            name: None,
+            content_json: Some(card_json.into()),
+            thumbnail_url: None,
+        };
+
+        let mut card_msg = sample_msg("m-card-md", None, 0);
+        card_msg.attachments = vec![card_att.clone()];
+        card_msg.reactions.clear();
+        card_msg.body_html = "<attachment id=\"card-md-1\"></attachment>".into();
+        card_msg.body_plain = String::new();
+
+        let mut plain_md_msg = sample_msg("m-plain-md", None, 0);
+        plain_md_msg.attachments.clear();
+        plain_md_msg.reactions.clear();
+        plain_md_msg.body_html = "Line 1\n- **item**".into();
+        plain_md_msg.body_plain = "Line 1\n- **item**".into();
+
+        // 1. Chat view rendering: 0 raw `**`, newlines preserved for both Adaptive Card and plain-text MD
+        let msgs = vec![card_msg.clone(), plain_md_msg.clone()];
+        let view = ChatRender {
+            messages: &msgs,
+            is_channel: false,
+            selected_index: None,
+        };
+        let rendered = build_lines_with_hyperlinks(&view, &Theme::default(), 100, false);
+        let text = plain_text(&rendered);
+        assert!(
+            !text.contains("**"),
+            "raw `**` leaked in rendered chat view:\n{text}"
+        );
+        assert!(text.contains("Alert: Open"), "{text}");
+        assert!(text.contains("Line 2"), "{text}");
+        let alert_line = rendered
+            .iter()
+            .position(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("Alert: Open")
+            })
+            .expect("expected Alert: Open line");
+        let line2_line = rendered
+            .iter()
+            .position(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("Line 2")
+            })
+            .expect("expected Line 2 line");
+        assert!(
+            line2_line > alert_line,
+            "Adaptive Card newline must place Line 2 on a separate line ({alert_line} vs {line2_line})"
+        );
+
+        let plain_l1 = rendered
+            .iter()
+            .position(|l| {
+                l.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains("Line 1")
+            })
+            .expect("expected Line 1");
+        let plain_item = rendered
+            .iter()
+            .position(|l| {
+                let s: String = l.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.contains("• ") && s.contains("item")
+            })
+            .expect("expected bullet item");
+        assert!(
+            plain_item > plain_l1,
+            "plain-text MD newline must separate Line 1 and list item ({plain_l1} vs {plain_item})"
+        );
+
+        // 2. adaptive_card_to_html renders card Markdown to HTML via pulldown-cmark
+        let (_title, card_html) =
+            crate::ui::overlays::html_preview::adaptive_card_to_html(&card_att)
+                .expect("adaptive_card_to_html");
+        let rendered_section = card_html.split("<details>").next().unwrap_or(&card_html);
+        assert!(
+            rendered_section.contains("<strong>Alert</strong>"),
+            "{rendered_section}"
+        );
+        assert!(
+            rendered_section.contains("<a href=\"https://ex.com\">Open</a>"),
+            "{rendered_section}"
+        );
+        assert!(rendered_section.contains("Line 2"), "{rendered_section}");
+        assert!(!rendered_section.contains("**"), "{rendered_section}");
+
+        // 3. Plain-text conversion also preserves newlines and leaks 0 raw `**`
+        let plain_out = crate::parser::html_and_cards_to_plain("Line 1\n- **item**", &[]);
+        assert_eq!(plain_out, "Line 1\n- item");
     }
 }

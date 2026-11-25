@@ -132,6 +132,10 @@ impl Overlay {
         Overlay::HtmlPreview(HtmlPreviewOverlay::new(title, raw_html))
     }
 
+    pub fn markdown_preview(title: Option<String>, raw_md: String) -> Self {
+        Overlay::HtmlPreview(HtmlPreviewOverlay::new_markdown(title, raw_md))
+    }
+
     pub fn context_menu(menu: ContextMenu) -> Self {
         Overlay::ContextMenu(menu)
     }

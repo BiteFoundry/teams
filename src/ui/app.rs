@@ -299,6 +299,7 @@ pub enum UiMsg {
         conv_key: Option<String>,
         title: String,
         html: String,
+        kind: bitefoundry_html::ContentKind,
     },
     HtmlServed {
         url: String,
@@ -2694,12 +2695,17 @@ impl AppState {
     }
 
     pub fn fetch_html_attachment(&mut self, ui: &mut UiState, att: AttachmentInfo) {
-        let title = att
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("HTML ({})", att.id));
+        let is_md_hint =
+            crate::ui::overlays::html_preview::HtmlPreviewOverlay::is_markdown_attachment(&att);
+        let title = att.name.clone().unwrap_or_else(|| {
+            if is_md_hint {
+                format!("Markdown ({})", att.id)
+            } else {
+                format!("HTML ({})", att.id)
+            }
+        });
         if tokio::runtime::Handle::try_current().is_err() {
-            ui.error("Cannot fetch HTML attachment without async runtime");
+            ui.error("Cannot fetch attachment preview without async runtime");
             return;
         }
         self.html_fetch_seq = self.html_fetch_seq.wrapping_add(1);
@@ -2707,23 +2713,51 @@ impl AppState {
         let conv_key = self.active_conv_key.clone();
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
-        let task_label = format!("Open HTML: {title}");
+        let task_label = if is_md_hint {
+            format!("Open Markdown: {title}")
+        } else {
+            format!("Open HTML: {title}")
+        };
         ui.tasks.begin(task_label.clone());
 
         tokio::spawn(async move {
             match graph.fetch_attachment_bytes(&att).await {
-                Ok((fetched_name, _, bytes)) => {
+                Ok((fetched_name, fetched_mime, bytes)) => {
                     let html = String::from_utf8_lossy(&bytes).into_owned();
                     let resolved_title = if fetched_name.trim().is_empty() {
                         title
                     } else {
                         fetched_name
                     };
+                    let mime_hint = if !fetched_mime.trim().is_empty() {
+                        Some(fetched_mime.as_str())
+                    } else if !att.content_type.trim().is_empty() {
+                        Some(att.content_type.as_str())
+                    } else {
+                        None
+                    };
+                    let mut kind = bitefoundry_html::sniff_content_kind(
+                        mime_hint,
+                        Some(resolved_title.as_str()),
+                        Some(&bytes),
+                    );
+                    if kind != bitefoundry_html::ContentKind::Markdown
+                        && kind != bitefoundry_html::ContentKind::Html
+                        && (is_md_hint
+                            || bitefoundry_html::sniff_content_kind(
+                                None,
+                                Some(resolved_title.as_str()),
+                                None,
+                            ) == bitefoundry_html::ContentKind::Markdown)
+                    {
+                        kind = bitefoundry_html::ContentKind::Markdown;
+                    }
                     let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
                         req_seq,
                         conv_key,
                         title: resolved_title,
                         html,
+                        kind,
                     });
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
@@ -2735,7 +2769,7 @@ impl AppState {
                     let _ = tx.send(UiMsg::TaskDone {
                         label: task_label,
                         error: Some(err.to_string()),
-                        toast: Some((format!("Failed to load HTML: {err}"), ToastKind::Error)),
+                        toast: Some((format!("Failed to load preview: {err}"), ToastKind::Error)),
                     });
                 }
             }
@@ -3883,10 +3917,17 @@ impl AppState {
                 conv_key,
                 title,
                 html,
+                kind,
             } => {
                 if req_seq == self.html_fetch_seq && self.active_conv_key == conv_key {
                     ui.close_overlays_of(OverlayKind::HtmlPreview);
-                    ui.push_overlay(Overlay::html_preview(Some(title), html));
+                    let overlay = match kind {
+                        bitefoundry_html::ContentKind::Markdown => {
+                            Overlay::markdown_preview(Some(title), html)
+                        }
+                        _ => Overlay::html_preview(Some(title), html),
+                    };
+                    ui.push_overlay(overlay);
                 }
             }
             UiMsg::HtmlServed { url } => {
@@ -5868,6 +5909,7 @@ pub(super) mod tests {
                 conv_key: Some("chat:other".into()),
                 title: "stale".into(),
                 html: "<p>stale</p>".into(),
+                kind: bitefoundry_html::ContentKind::Html,
             },
         );
         assert!(ui.overlays.is_empty());

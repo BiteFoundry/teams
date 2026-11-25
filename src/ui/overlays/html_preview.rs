@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession};
+use bitefoundry_html::pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser};
+use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession, SourceKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -81,6 +82,26 @@ impl HtmlPreviewOverlay {
         }
     }
 
+    pub fn new_markdown(title: Option<String>, raw_md: String) -> Self {
+        Self {
+            session: HtmlViewSession::new_markdown(title, raw_md),
+            last_content_area: Rect::default(),
+            last_served_url: None,
+            ensure_focus_visible: false,
+            graphic_cache: HashMap::new(),
+        }
+    }
+
+    pub fn from_content(title: Option<String>, kind: ContentKind, raw: String) -> Self {
+        Self {
+            session: HtmlViewSession::from_content(title, kind, raw),
+            last_content_area: Rect::default(),
+            last_served_url: None,
+            ensure_focus_visible: false,
+            graphic_cache: HashMap::new(),
+        }
+    }
+
     /// Builds an interactive `HtmlPreviewOverlay` from a Teams chat/channel message,
     /// combining its HTML body and any Adaptive / O365 Connector Card attachments.
     pub fn from_teams_message(msg: &MessageItem) -> Option<Self> {
@@ -97,6 +118,26 @@ impl HtmlPreviewOverlay {
         ) == ContentKind::Html
     }
 
+    /// Returns `true` when an attachment's MIME type or filename classifies as Markdown.
+    pub fn is_markdown_attachment(att: &AttachmentInfo) -> bool {
+        let kind = bitefoundry_html::sniff_content_kind(
+            Some(att.content_type.as_str()),
+            att.name.as_deref(),
+            None,
+        );
+        if kind == ContentKind::Markdown {
+            return true;
+        }
+        matches!(kind, ContentKind::PlainText | ContentKind::Binary)
+            && bitefoundry_html::sniff_content_kind(None, att.name.as_deref(), None)
+                == ContentKind::Markdown
+    }
+
+    /// Returns `true` when an attachment can be rendered in `HtmlPreviewOverlay` (HTML or Markdown).
+    pub fn is_previewable_markup_attachment(att: &AttachmentInfo) -> bool {
+        Self::is_html_attachment(att) || Self::is_markdown_attachment(att)
+    }
+
     /// Returns `true` when an attachment is an Adaptive Card or O365 Connector Card.
     pub fn is_card_attachment(att: &AttachmentInfo) -> bool {
         card_in::is_card_content_type(&att.content_type)
@@ -107,11 +148,19 @@ impl HtmlPreviewOverlay {
     }
 
     pub fn title(&self) -> &str {
-        self.session.title().unwrap_or("HTML Preview")
+        self.session.title().unwrap_or(match self.session.source_kind() {
+            SourceKind::Markdown => "Markdown Preview",
+            SourceKind::Html => "HTML Preview",
+        })
     }
 
     pub fn raw_html(&self) -> &str {
         self.session.raw_html()
+    }
+
+    /// Returns standalone HTML ready to serve in an external browser via `NativeHtmlServer`.
+    pub fn serve_html(&self) -> String {
+        self.session.serve_html()
     }
 
     pub fn modal_rect(area: Rect) -> Rect {
@@ -252,7 +301,7 @@ impl HtmlPreviewOverlay {
                 let effects = self.session.activate_focused();
                 self.effects_to_outcome(effects)
             }
-            Action::Input('m') | Action::ContextMenuCurrent => {
+            Action::Input('r') | Action::Input('m') | Action::ContextMenuCurrent => {
                 self.toggle_raw_mode();
                 OverlayOutcome::Handled
             }
@@ -399,7 +448,14 @@ impl HtmlPreviewOverlay {
             .saturating_sub(2 + if pills_w > 0 { pills_w + 2 } else { 0 })
             as usize;
 
-        let mode_badge = if self.session.raw_mode { "RAW" } else { "HTML" };
+        let mode_badge = if self.session.raw_mode {
+            "RAW"
+        } else {
+            match self.session.source_kind() {
+                SourceKind::Markdown => "MD",
+                SourceKind::Html => "HTML",
+            }
+        };
         let js_badge = if self.session.js_active { " · JS" } else { "" };
         let title = format!(" 🌐 {} [{}{} ] ", self.title(), mode_badge, js_badge);
 
@@ -640,7 +696,7 @@ impl HtmlPreviewOverlay {
         let footer = if self.session.editing_input.is_some() {
             " Editing input · Type text · Backspace: Delete · Enter/Esc: Finish editing · Tab: Next control "
         } else {
-            " Tab/⇧Tab: Focus · Enter/Space/Click: Activate · m: Raw/Rendered · o: Browser · j/k/Wheel: Scroll · Esc/q: Close "
+            " Tab/⇧Tab: Focus · Enter/Space/Click: Activate · r/m: Raw/Rendered · o: Browser · j/k/Wheel: Scroll · Esc/q: Close "
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -673,23 +729,27 @@ pub fn adaptive_card_to_html(att: &AttachmentInfo) -> Option<(String, String)> {
 
     let mut html = String::new();
     html.push_str("<section class=\"adaptive-card\">");
-    html.push_str(&format!("<h1>{}</h1>", escape_html(&card_title)));
+    html.push_str(&format!("<h1>{}</h1>", card_markdown_to_html_inline(&card_title)));
     if let Some(sub) = subtitle {
-        html.push_str(&format!("<p><em>{}</em></p>", escape_html(&sub)));
+        html.push_str(&format!(
+            "<p><em>{}</em></p>",
+            card_markdown_to_html_inline(&sub)
+        ));
     }
     if !facts.is_empty() {
         html.push_str("<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>");
         for (k, v) in &facts {
             html.push_str(&format!(
                 "<tr><td><strong>{}</strong></td><td>{}</td></tr>",
-                escape_html(k),
-                escape_html(v)
+                card_markdown_to_html_inline(k),
+                card_markdown_to_html_inline(v)
             ));
         }
         html.push_str("</tbody></table>");
     }
-    for line in &body_lines {
-        html.push_str(&format!("<p>{}</p>", escape_html(line)));
+    if !body_lines.is_empty() {
+        let joined_body = body_lines.join("\n");
+        html.push_str(&card_markdown_to_html_blocks(&joined_body));
     }
     if !actions.is_empty() {
         html.push_str("<div class=\"card-actions\">");
@@ -778,6 +838,33 @@ pub fn build_message_html(msg: &MessageItem) -> Option<(String, String)> {
     };
 
     Some((title, combined))
+}
+
+fn card_markdown_to_html_blocks(input: &str) -> String {
+    let mut opts = MdOptions::empty();
+    opts.insert(MdOptions::ENABLE_STRIKETHROUGH);
+    opts.insert(MdOptions::ENABLE_TASKLISTS);
+    opts.insert(MdOptions::ENABLE_TABLES);
+
+    let events = MdParser::new_ext(input, opts).map(|ev| match ev {
+        MdEvent::SoftBreak => MdEvent::HardBreak,
+        MdEvent::Html(raw) | MdEvent::InlineHtml(raw) => MdEvent::Text(raw),
+        other => other,
+    });
+    let mut out = String::new();
+    bitefoundry_html::pulldown_cmark::html::push_html(&mut out, events);
+    out
+}
+
+fn card_markdown_to_html_inline(input: &str) -> String {
+    let rendered = card_markdown_to_html_blocks(input);
+    let trimmed = rendered.trim();
+    if let Some(inner) = trimmed.strip_prefix("<p>").and_then(|s| s.strip_suffix("</p>")) {
+        if !inner.contains("</p>") {
+            return inner.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn escape_html(input: &str) -> String {
@@ -1100,5 +1187,166 @@ mod tests {
             })
             .unwrap();
         assert_eq!(skipped, (pg.rect.width as usize) * (pg.rect.height as usize));
+    }
+
+    #[tokio::test]
+    async fn markdown_attachment_preview_icon_dispatch_raw_toggle_and_serve_html() {
+        use crate::ui::hitmap::MessageScope;
+        use crate::ui::overlays::attachments::{AttachmentRow, AttachmentsState};
+        use crate::ui::overlays::Overlay;
+
+        // 1. Both text/markdown and application/octet-stream fallback for README.md show [MD]
+        let md_mime_att = AttachmentInfo {
+            id: "md-1".into(),
+            content_type: "text/markdown".into(),
+            content_url: Some("https://contoso.sharepoint.com/README.md".into()),
+            name: Some("README.md".into()),
+            content_json: None,
+            thumbnail_url: None,
+        };
+        let md_octet_att = AttachmentInfo {
+            id: "md-2".into(),
+            content_type: "application/octet-stream".into(),
+            content_url: Some("https://contoso.sharepoint.com/README.md".into()),
+            name: Some("README.md".into()),
+            content_json: None,
+            thumbnail_url: None,
+        };
+        assert!(HtmlPreviewOverlay::is_markdown_attachment(&md_mime_att));
+        assert!(HtmlPreviewOverlay::is_previewable_markup_attachment(&md_mime_att));
+        assert!(HtmlPreviewOverlay::is_markdown_attachment(&md_octet_att));
+        assert!(HtmlPreviewOverlay::is_previewable_markup_attachment(&md_octet_att));
+
+        let row_mime = AttachmentRow {
+            scope: MessageScope::Chat,
+            msg_index: 0,
+            attach_index: 0,
+            name: "README.md".into(),
+            content_type: "text/markdown".into(),
+            author_name: "Alice".into(),
+        };
+        let row_octet = AttachmentRow {
+            scope: MessageScope::Chat,
+            msg_index: 0,
+            attach_index: 1,
+            name: "README.md".into(),
+            content_type: "application/octet-stream".into(),
+            author_name: "Alice".into(),
+        };
+        assert_eq!(row_mime.icon(), "[MD]");
+        assert_eq!(row_octet.icon(), "[MD]");
+
+        // 2. AttachmentsState dispatches PreviewAttachment on Enter and v for .md rows
+        let (mut app, mut ui) = crate::ui::app::tests::make_test_app();
+        app.active_conv_key = Some("chat:c1".into());
+        app.messages.push(MessageItem {
+            msg_key: "chat:c1|m-md".into(),
+            conv_key: "chat:c1".into(),
+            msg_id: "m-md".into(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".into(),
+            is_me: false,
+            created_at: "2026-11-25T00:00:00Z".into(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".into(),
+            message_type: "message".into(),
+            body_html: String::new(),
+            body_plain: String::new(),
+            attachments: vec![md_mime_att, md_octet_att],
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        });
+
+        let mut tray = AttachmentsState { selected: 1 };
+        assert_eq!(
+            tray.handle(&Action::Activate, &app),
+            OverlayOutcome::CloseAndDispatch(Action::PreviewAttachment {
+                scope: MessageScope::Chat,
+                msg_index: 0,
+                attach_index: 0,
+            })
+        );
+        tray.selected = 2;
+        assert_eq!(
+            tray.handle(&Action::Input('v'), &app),
+            OverlayOutcome::CloseAndDispatch(Action::PreviewAttachment {
+                scope: MessageScope::Chat,
+                msg_index: 0,
+                attach_index: 1,
+            })
+        );
+        assert_eq!(
+            tray.handle(&Action::OpenImagePreview, &app),
+            OverlayOutcome::CloseAndDispatch(Action::PreviewAttachment {
+                scope: MessageScope::Chat,
+                msg_index: 0,
+                attach_index: 1,
+            })
+        );
+
+        // 3. Loading sniffed Markdown bytes opens Overlay::HtmlPreview with SourceKind::Markdown
+        let raw_md = "# Title\n\n**bold** | [link](https://example.com)";
+        let sniffed_kind = bitefoundry_html::sniff_content_kind(
+            Some("application/octet-stream"),
+            Some("README.md"),
+            Some(raw_md.as_bytes()),
+        );
+        assert_eq!(sniffed_kind, ContentKind::Markdown);
+
+        app.html_fetch_seq = 1;
+        app.handle_ui_msg(
+            &mut ui,
+            crate::ui::app::UiMsg::HtmlAttachmentLoaded {
+                req_seq: 1,
+                conv_key: Some("chat:c1".into()),
+                title: "README.md".into(),
+                html: raw_md.into(),
+                kind: sniffed_kind,
+            },
+        );
+        let Some(Overlay::HtmlPreview(overlay)) = ui.overlays.last_mut() else {
+            panic!("expected Overlay::HtmlPreview to be opened for .md attachment");
+        };
+        assert_eq!(overlay.session.source_kind(), SourceKind::Markdown);
+        assert!(!overlay.session.js_active);
+        assert_eq!(overlay.title(), "README.md");
+
+        let theme = HtmlPreviewOverlay::html_theme(&Theme::midnight_dark());
+        let rendered = overlay.session.render(80, &theme, false);
+        let text = rendered_text(&rendered.lines);
+        assert!(text.contains("Title"), "rendered markdown missing title:\n{text}");
+        assert!(text.contains("bold"), "rendered markdown missing bold text:\n{text}");
+        assert!(text.contains("link"), "rendered markdown missing link text:\n{text}");
+        assert!(!text.contains("**"), "raw ** leaked in rendered markdown:\n{text}");
+
+        // 4. `r` toggles raw mode showing `# Title`
+        assert_eq!(overlay.handle(&Action::Input('r')), OverlayOutcome::Handled);
+        assert!(overlay.session.raw_mode);
+        let raw_rendered = overlay.session.render(80, &theme, false);
+        let raw_text = rendered_text(&raw_rendered.lines);
+        assert!(
+            raw_text.contains("# Title"),
+            "raw mode must show `# Title`, got:\n{raw_text}"
+        );
+
+        // 5. `serve_html()` produces valid standalone HTML document
+        let served = overlay.serve_html();
+        assert!(
+            served.contains("<!DOCTYPE html>") || served.contains("<html"),
+            "serve_html() must return valid HTML document:\n{served}"
+        );
+        assert!(served.contains("<strong>bold</strong>"), "{served}");
+        assert!(served.contains("https://example.com"), "{served}");
+        assert!(!served.contains("**bold**"), "{served}");
+
+        app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }
 }

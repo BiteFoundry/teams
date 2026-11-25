@@ -1,8 +1,9 @@
 //! Adaptive Card and O365 Connector Card JSON parser -> `RichBlock::Card`.
 
+use bitefoundry_html::pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde_json::Value;
 
-use crate::models::{AttachmentInfo, RichBlock};
+use crate::models::{AttachmentInfo, RichBlock, RichSpan, TextStyleFlags};
 
 pub const ADAPTIVE_CARD_CONTENT_TYPE: &str = "application/vnd.microsoft.card.adaptive";
 pub const CONNECTOR_CARD_CONTENT_TYPE: &str = "application/vnd.microsoft.teams.card.o365connector";
@@ -420,6 +421,232 @@ fn collect_connector_actions(arr: &[Value], actions: &mut Vec<(String, String)>)
             .unwrap_or("");
         actions.push((name.to_string(), uri.to_string()));
     }
+}
+
+fn push_card_span(spans: &mut Vec<RichSpan>, text: &str, style: &TextStyleFlags) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if &last.style == style {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    spans.push(RichSpan {
+        text: text.to_string(),
+        style: style.clone(),
+    });
+}
+
+fn ensure_card_newline(spans: &mut Vec<RichSpan>) {
+    if !spans.is_empty() && !spans.last().is_some_and(|s| s.text.ends_with('\n')) {
+        push_card_span(spans, "\n", &TextStyleFlags::default());
+    }
+}
+
+/// Parses Adaptive Card / O365 Connector Card Markdown (`TextBlock`, `FactSet`, etc.)
+/// into styled [`RichSpan`]s via `bitefoundry_html::pulldown_cmark`, preserving explicit `\n` breaks.
+pub fn parse_card_markdown_spans(input: &str) -> Vec<RichSpan> {
+    if input.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_TABLES);
+
+    let default_style = TextStyleFlags::default();
+    let mut style_stack: Vec<TextStyleFlags> = vec![default_style.clone()];
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+    let mut quote_depth: usize = 0;
+    let mut in_table_head = false;
+    let mut table_cell_idx: usize = 0;
+    let mut spans: Vec<RichSpan> = Vec::new();
+
+    for event in Parser::new_ext(input, opts) {
+        match event {
+            Event::Start(tag) => match tag {
+                Tag::Paragraph => {
+                    if !spans.is_empty() && !spans.last().is_some_and(|s| s.text.ends_with('\n')) {
+                        if list_stack.is_empty() || !spans.last().is_some_and(|s| s.text.ends_with("• ") || s.text.ends_with(". ")) {
+                            push_card_span(&mut spans, "\n", &default_style);
+                            if quote_depth > 0 {
+                                push_card_span(&mut spans, "│ ", &default_style);
+                            }
+                        }
+                    }
+                }
+                Tag::Heading { .. } => {
+                    ensure_card_newline(&mut spans);
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.bold = true;
+                    style_stack.push(next);
+                }
+                Tag::BlockQuote(_) => {
+                    ensure_card_newline(&mut spans);
+                    quote_depth += 1;
+                    push_card_span(&mut spans, "│ ", &default_style);
+                }
+                Tag::List(start) => {
+                    list_stack.push(start);
+                }
+                Tag::Item => {
+                    ensure_card_newline(&mut spans);
+                    let depth = list_stack.len().saturating_sub(1);
+                    if depth > 0 {
+                        push_card_span(&mut spans, &"  ".repeat(depth), &default_style);
+                    }
+                    match list_stack.last_mut() {
+                        Some(Some(num)) => {
+                            let marker = format!("{num}. ");
+                            *num += 1;
+                            push_card_span(&mut spans, &marker, &default_style);
+                        }
+                        _ => {
+                            push_card_span(&mut spans, "• ", &default_style);
+                        }
+                    }
+                }
+                Tag::Strong => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.bold = true;
+                    style_stack.push(next);
+                }
+                Tag::Emphasis => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.italic = true;
+                    style_stack.push(next);
+                }
+                Tag::Strikethrough => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.strike = true;
+                    style_stack.push(next);
+                }
+                Tag::Link { dest_url, .. } => {
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    let url = dest_url.trim();
+                    if !url.is_empty() {
+                        next.link_url = Some(url.to_string());
+                    }
+                    style_stack.push(next);
+                }
+                Tag::CodeBlock(_) => {
+                    ensure_card_newline(&mut spans);
+                    let mut next = style_stack.last().cloned().unwrap_or_default();
+                    next.code = true;
+                    style_stack.push(next);
+                }
+                Tag::TableHead => {
+                    ensure_card_newline(&mut spans);
+                    in_table_head = true;
+                    table_cell_idx = 0;
+                }
+                Tag::TableRow => {
+                    ensure_card_newline(&mut spans);
+                    in_table_head = false;
+                    table_cell_idx = 0;
+                }
+                Tag::TableCell => {
+                    if table_cell_idx > 0 {
+                        push_card_span(&mut spans, " │ ", &default_style);
+                    }
+                    table_cell_idx += 1;
+                    if in_table_head {
+                        let mut next = style_stack.last().cloned().unwrap_or_default();
+                        next.bold = true;
+                        style_stack.push(next);
+                    }
+                }
+                _ => {}
+            },
+            Event::End(tag_end) => match tag_end {
+                TagEnd::Heading(_)
+                | TagEnd::Strong
+                | TagEnd::Emphasis
+                | TagEnd::Strikethrough
+                | TagEnd::Link => {
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                }
+                TagEnd::CodeBlock => {
+                    if let Some(last) = spans.last_mut() {
+                        let trimmed = last.text.trim_end_matches(['\r', '\n']);
+                        if trimmed.len() < last.text.len() {
+                            last.text.truncate(trimmed.len());
+                        }
+                        if last.text.is_empty() {
+                            spans.pop();
+                        }
+                    }
+                    if style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                }
+                TagEnd::BlockQuote(_) => {
+                    quote_depth = quote_depth.saturating_sub(1);
+                }
+                TagEnd::List(_) => {
+                    list_stack.pop();
+                }
+                TagEnd::TableHead => {
+                    in_table_head = false;
+                }
+                TagEnd::TableCell => {
+                    if in_table_head && style_stack.len() > 1 {
+                        style_stack.pop();
+                    }
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                let style = style_stack.last().unwrap_or(&default_style);
+                push_card_span(&mut spans, &text, style);
+            }
+            Event::Code(code) => {
+                let mut style = style_stack.last().cloned().unwrap_or_default();
+                style.code = true;
+                push_card_span(&mut spans, &code, &style);
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                push_card_span(&mut spans, "\n", &default_style);
+                if quote_depth > 0 {
+                    push_card_span(&mut spans, "│ ", &default_style);
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                let style = style_stack.last().unwrap_or(&default_style);
+                push_card_span(&mut spans, if checked { "[x] " } else { "[ ] " }, style);
+            }
+            Event::Rule => {
+                ensure_card_newline(&mut spans);
+                push_card_span(&mut spans, "────────────────", &default_style);
+            }
+            Event::InlineHtml(raw) | Event::Html(raw) => {
+                let lower = raw.trim().to_ascii_lowercase();
+                if lower == "<br>" || lower == "<br/>" || lower == "<br />" {
+                    push_card_span(&mut spans, "\n", &default_style);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    while let Some(last) = spans.last_mut() {
+        let trimmed_len = last.text.trim_end_matches(['\r', '\n']).len();
+        if trimmed_len == 0 {
+            spans.pop();
+        } else {
+            if trimmed_len < last.text.len() {
+                last.text.truncate(trimmed_len);
+            }
+            break;
+        }
+    }
+
+    spans
 }
 
 #[cfg(test)]
