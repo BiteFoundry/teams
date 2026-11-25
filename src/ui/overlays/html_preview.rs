@@ -5,7 +5,9 @@
 //! and `bitefoundry_html::NativeHtmlServer` (`o` to serve natively on localhost and open
 //! in the default browser).
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use bitefoundry_html::{ContentKind, HtmlEffect, HtmlTheme, HtmlViewSession};
 use ratatui::{
@@ -21,22 +23,36 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    img_preview::{self, FitBox, RenderedTerminalImage, TerminalImageProtocol},
     models::{AttachmentInfo, MessageItem, RichBlock},
     parser::card_in,
     ui::{
         action::Action,
-        app::UiState,
+        app::{PendingPixelGraphic, UiState},
         hitmap::{ButtonId, HitMap, HitTarget},
         overlays::{centered_rect, OverlayOutcome},
         theme::Theme,
     },
 };
 
+struct CachedHtmlGraphic {
+    source_bytes: Arc<[u8]>,
+    cell_px: (u16, u16),
+    rendered: RenderedTerminalImage,
+}
+
 pub struct HtmlPreviewOverlay {
     pub session: HtmlViewSession,
     pub last_content_area: Rect,
     pub last_served_url: Option<String>,
     ensure_focus_visible: bool,
+    graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), CachedHtmlGraphic>,
+}
+
+impl Drop for HtmlPreviewOverlay {
+    fn drop(&mut self) {
+        self.graphic_cache.clear();
+    }
 }
 
 impl fmt::Debug for HtmlPreviewOverlay {
@@ -49,6 +65,7 @@ impl fmt::Debug for HtmlPreviewOverlay {
             .field("focused_control", &self.session.focused_control)
             .field("editing_input", &self.session.editing_input)
             .field("last_served_url", &self.last_served_url)
+            .field("cached_graphics", &self.graphic_cache.len())
             .finish()
     }
 }
@@ -60,6 +77,7 @@ impl HtmlPreviewOverlay {
             last_content_area: Rect::default(),
             last_served_url: None,
             ensure_focus_visible: false,
+            graphic_cache: HashMap::new(),
         }
     }
 
@@ -321,7 +339,30 @@ impl HtmlPreviewOverlay {
         }
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ui: &mut UiState, hitmap: &mut HitMap) {
+        let mut pending = std::mem::take(&mut ui.pending_pixel_graphics);
+        self.draw_inner(frame, area, ui, Some(&mut pending), hitmap);
+        ui.pending_pixel_graphics = pending;
+    }
+
+    pub(crate) fn draw_readonly(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ui: &UiState,
+        hitmap: &mut HitMap,
+    ) {
+        self.draw_inner(frame, area, ui, None, hitmap);
+    }
+
+    fn draw_inner(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ui: &UiState,
+        mut pending_out: Option<&mut Vec<PendingPixelGraphic>>,
+        hitmap: &mut HitMap,
+    ) {
         let theme = &ui.theme;
         let rect = Self::modal_rect(area);
         frame.render_widget(Clear, rect);
@@ -418,12 +459,17 @@ impl HtmlPreviewOverlay {
 
         let html_theme = Self::html_theme(theme);
         let focused_idx = self.session.focused_control;
-        let (lines, focused_line, total_lines) = {
+        let (mut lines, graphics, focused_line, total_lines) = {
             let rendered = self.session.render(content_w, &html_theme, ui.show_hrefs);
             let focused_line = focused_idx
                 .and_then(|idx| rendered.controls.get(idx))
                 .map(|c| c.line);
-            (rendered.lines.clone(), focused_line, rendered.lines.len())
+            (
+                rendered.lines.clone(),
+                rendered.graphics.clone(),
+                focused_line,
+                rendered.lines.len(),
+            )
         };
 
         let vh = viewport_h as usize;
@@ -446,10 +492,112 @@ impl HtmlPreviewOverlay {
         let content_area = Rect::new(inner.x, inner.y, content_w, viewport_h);
         self.last_content_area = content_area;
 
+        let vis_top = self.session.scroll_y as usize;
+        let vis_bot = vis_top.saturating_add(vh);
+        let bg_rgb = img_preview::color_to_rgb(theme.bg_elevated, (18, 20, 26));
+        let mut pixel_skip_rects: Vec<(String, Rect, TerminalImageProtocol)> = Vec::new();
+
+        for g in &graphics {
+            let g_start = g.line_start;
+            let g_end = g.line_start.saturating_add(g.line_count);
+            if g.line_count == 0 || g_end <= vis_top || g_start >= vis_bot {
+                continue;
+            }
+            let cache_k = (g.node_id.0, content_w, ui.graphics_caps.protocol);
+            let needs_decode = self.graphic_cache.get(&cache_k).is_none_or(|c| {
+                c.cell_px != ui.graphics_caps.cell_px || !Arc::ptr_eq(&c.source_bytes, &g.image_bytes)
+            });
+            if needs_decode {
+                let fit = FitBox::fixed(content_w, g.line_count.clamp(1, u16::MAX as usize) as u16);
+                if let Ok(rendered_img) = img_preview::decode_and_render_for_protocol(
+                    &g.image_bytes,
+                    fit,
+                    bg_rgb,
+                    ui.graphics_caps,
+                ) {
+                    self.graphic_cache.insert(
+                        cache_k,
+                        CachedHtmlGraphic {
+                            source_bytes: Arc::clone(&g.image_bytes),
+                            cell_px: ui.graphics_caps.cell_px,
+                            rendered: rendered_img,
+                        },
+                    );
+                }
+            }
+            let Some(cached) = self.graphic_cache.get(&cache_k) else {
+                continue;
+            };
+            let rendered_img = &cached.rendered;
+
+            if !rendered_img.protocol.is_pixel() {
+                for offset in 0..g.line_count {
+                    let line_idx = g_start + offset;
+                    if line_idx < lines.len() {
+                        lines[line_idx] = rendered_img
+                            .lines
+                            .get(offset)
+                            .cloned()
+                            .unwrap_or_default();
+                    }
+                }
+            } else {
+                let slice_start = g_start.max(vis_top);
+                let slice_end = g_end.min(vis_bot);
+                let vis_rows = slice_end.saturating_sub(slice_start) as u16;
+                let crop_y = slice_start.saturating_sub(g_start) as u16;
+                let screen_y = content_area
+                    .y
+                    .saturating_add(slice_start.saturating_sub(vis_top) as u16);
+                if let Some((payload, draw_cols, draw_rows)) =
+                    rendered_img.viewport_pixel_payload(0, crop_y, content_w, vis_rows)
+                {
+                    let draw_w = draw_cols.min(content_w);
+                    let draw_h = draw_rows.min(vis_rows);
+                    if draw_w > 0 && draw_h > 0 {
+                        let draw_rect = Rect::new(content_area.x, screen_y, draw_w, draw_h);
+                        let pixel_key = format!(
+                            "html:n{}:w{}:r{}:{}:c{},{}",
+                            g.node_id.0,
+                            content_w,
+                            rendered_img.cols,
+                            rendered_img.rows,
+                            crop_y,
+                            vis_rows
+                        );
+                        if let Some(out) = pending_out.as_deref_mut() {
+                            out.push(PendingPixelGraphic {
+                                cache_key: pixel_key.clone(),
+                                rect: draw_rect,
+                                protocol: rendered_img.protocol,
+                                payload: Some(payload),
+                            });
+                        }
+                        pixel_skip_rects.push((pixel_key, draw_rect, rendered_img.protocol));
+                    }
+                }
+            }
+        }
+
         frame.render_widget(
             Paragraph::new(lines).scroll((self.session.scroll_y, 0)),
             content_area,
         );
+
+        if !pixel_skip_rects.is_empty() {
+            let buf = frame.buffer_mut();
+            for (key, draw_rect, proto) in pixel_skip_rects {
+                if ui.active_pixel_graphics.contains(&(key, draw_rect, proto)) {
+                    for y in draw_rect.top()..draw_rect.bottom() {
+                        for x in draw_rect.left()..draw_rect.right() {
+                            if let Some(cell) = buf.cell_mut((x, y)) {
+                                cell.set_skip(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let show_scrollbar = total_lines > vh && inner.width > content_w;
         if show_scrollbar {
@@ -745,13 +893,13 @@ mod tests {
         let mut overlay = HtmlPreviewOverlay::new(Some("Static Doc".into()), html.into());
         assert!(!overlay.session.js_active);
 
-        let ui = UiState::new();
+        let mut ui = UiState::new();
         let area = Rect::new(0, 0, 100, 28);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         let mut hitmap = HitMap::default();
         terminal
             .draw(|frame| {
-                overlay.draw(frame, area, &ui, &mut hitmap);
+                overlay.draw(frame, area, &mut ui, &mut hitmap);
             })
             .unwrap();
 
@@ -842,5 +990,115 @@ mod tests {
         assert!(text.contains("Deploy Approval"));
         assert!(text.contains("Prod"));
         assert!(text.contains("View Pipeline"));
+    }
+
+    #[test]
+    fn inline_svg_renders_halfblocks_in_slot_and_preserves_button_click_coordinates() {
+        let html = r##"<!DOCTYPE html>
+<html>
+<body>
+  <p>Chart Report</p>
+  <svg width="80" height="40"><rect width="80" height="40" fill="#e11d48"/></svg>
+  <button id="act" onclick="alert('clicked-below-svg')">Approve</button>
+</body>
+</html>"##;
+
+        let mut overlay = HtmlPreviewOverlay::new(Some("SVG Report".into()), html.into());
+        let mut ui = UiState::new();
+        ui.graphics_caps = img_preview::TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Halfblock,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+
+        let area = Rect::new(0, 0, 100, 32);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        let mut hitmap = HitMap::default();
+        terminal
+            .draw(|frame| {
+                overlay.draw(frame, area, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+
+        let content_area = overlay.last_content_area;
+        assert!(content_area.width > 0 && content_area.height > 0);
+        let html_theme = HtmlPreviewOverlay::html_theme(&ui.theme);
+        let rendered = overlay
+            .session
+            .render(content_area.width, &html_theme, ui.show_hrefs);
+        assert_eq!(rendered.graphics.len(), 1);
+        let graphic = &rendered.graphics[0];
+        assert!(graphic.line_count >= 1);
+
+        // Reserved graphic slot must contain Halfblock '▀' glyphs in the rendered TestBackend buffer.
+        let buf = terminal.backend().buffer();
+        let mut halfblock_cells = 0usize;
+        for doc_line in graphic.line_start..graphic.line_start + graphic.line_count {
+            let screen_y = content_area.y + (doc_line as u16);
+            if screen_y < content_area.bottom() {
+                for x in content_area.left()..content_area.right() {
+                    if buf[(x, screen_y)].symbol() == "▀" {
+                        halfblock_cells += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            halfblock_cells > 0,
+            "expected Halfblock '▀' glyphs in reserved SVG slot lines {}..{}",
+            graphic.line_start,
+            graphic.line_start + graphic.line_count
+        );
+
+        // Button located below the SVG must still hit accurately via click_at(line, col) & screen click.
+        let btn = rendered
+            .controls
+            .iter()
+            .find(|c| c.label.contains("Approve"))
+            .expect("expected Approve button control")
+            .clone();
+        assert!(
+            btn.line >= graphic.line_start + graphic.line_count,
+            "button line {} must be below SVG slot end {}",
+            btn.line,
+            graphic.line_start + graphic.line_count
+        );
+        let effects = overlay.click_at(btn.line, btn.col_start + 1);
+        assert!(
+            effects.contains(&HtmlEffect::Toast("clicked-below-svg".to_string())),
+            "expected button click toast, got {effects:?}"
+        );
+
+        // Also verify pixel protocol (Sixel) pushes PendingPixelGraphic and marks skip on active frame.
+        ui.graphics_caps.protocol = TerminalImageProtocol::Sixel;
+        ui.pending_pixel_graphics.clear();
+        ui.active_pixel_graphics.clear();
+        terminal
+            .draw(|frame| {
+                overlay.draw(frame, area, &mut ui, &mut hitmap);
+            })
+            .unwrap();
+        assert_eq!(ui.pending_pixel_graphics.len(), 1);
+        let pg = ui.pending_pixel_graphics[0].clone();
+        assert_eq!(pg.protocol, TerminalImageProtocol::Sixel);
+        assert!(pg.payload.as_deref().is_some_and(|p| p.starts_with("\x1bP")));
+
+        ui.active_pixel_graphics = vec![(pg.cache_key.clone(), pg.rect, pg.protocol)];
+        let mut skipped = 0usize;
+        terminal
+            .draw(|frame| {
+                ui.pending_pixel_graphics.clear();
+                overlay.draw(frame, area, &mut ui, &mut hitmap);
+                let b = frame.buffer_mut();
+                for y in pg.rect.top()..pg.rect.bottom() {
+                    for x in pg.rect.left()..pg.rect.right() {
+                        if b[(x, y)].skip {
+                            skipped += 1;
+                        }
+                    }
+                }
+            })
+            .unwrap();
+        assert_eq!(skipped, (pg.rect.width as usize) * (pg.rect.height as usize));
     }
 }

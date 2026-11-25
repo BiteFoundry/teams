@@ -288,7 +288,7 @@ impl Overlay {
             Overlay::NewChat(new_chat) => new_chat.draw(frame, area, app, ui, hitmap),
             Overlay::RoomInfo(info) => info.draw(frame, area, app, ui, hitmap),
             Overlay::ImagePreview(preview) => preview.draw(frame, area, app, ui, hitmap),
-            Overlay::HtmlPreview(preview) => preview.draw(frame, area, ui, hitmap),
+            Overlay::HtmlPreview(preview) => preview.draw_readonly(frame, area, ui, hitmap),
             Overlay::Help(_) => draw_help(frame, area, ui, hitmap),
             Overlay::Confirm(dialog) => dialog.draw(frame, area, ui, hitmap),
         }

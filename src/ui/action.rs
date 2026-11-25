@@ -3113,18 +3113,20 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            ui.pending_pixel_graphic.as_ref().map(|p| (&p.cache_key, p.protocol)),
+            ui.pending_pixel_graphics
+                .first()
+                .map(|p| (&p.cache_key, p.protocol)),
             Some((&key, expected_next))
         );
 
-        // Closing overlay resets pending_pixel_graphic to None on the next ui::draw.
+        // Closing overlay resets pending_pixel_graphics to empty on the next ui::draw.
         assert!(!dispatch(Action::CloseOverlay, &mut app, &mut ui));
         terminal
             .draw(|frame| {
                 let _ = crate::ui::draw(frame, &mut app, &mut ui);
             })
             .unwrap();
-        assert!(ui.pending_pixel_graphic.is_none());
+        assert!(ui.pending_pixel_graphics.is_empty());
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

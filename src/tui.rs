@@ -1,6 +1,5 @@
 //! TUI entry shell: terminal raw mode, mouse capture, keyboard enhancement, event loop, external editor.
 
-use std::borrow::Cow;
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -257,9 +256,12 @@ impl PixelLayerTracker {
     }
 }
 
-/// Overlay Z-order guard: pixel graphics are only permitted when `ImagePreview` is the top-most overlay.
+/// Overlay Z-order guard: pixel graphics are only permitted when `ImagePreview` or `HtmlPreview` is the top-most overlay.
 fn pixel_graphics_allowed_for_overlays(overlays: &[Overlay]) -> bool {
-    matches!(overlays.last(), Some(Overlay::ImagePreview(_)))
+    matches!(
+        overlays.last(),
+        Some(Overlay::ImagePreview(_) | Overlay::HtmlPreview(_))
+    )
 }
 
 fn parse_pixel_key(key: &str) -> (&str, Option<(u16, u16, u16, u16)>) {
@@ -683,30 +685,53 @@ fn draw_frame(
 
         let term_size = (ui.term_width, ui.term_height);
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
+        let mut desired_payloads: Vec<String> = Vec::new();
 
         if pixel_graphics_allowed_for_overlays(&ui.overlays) {
-            if let Some(pg) = ui.pending_pixel_graphic.clone() {
+            for pg in ui.pending_pixel_graphics.clone() {
                 let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
                 let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
                 let fit_w = pg.rect.width.min(safe_max_w);
                 let fit_h = pg.rect.height.min(safe_max_h);
-                if fit_w > 0 && fit_h > 0 {
-                    let (base_key, _) = parse_pixel_key(&pg.cache_key);
-                    if let Some(payload_len) = app
-                        .image_cache
-                        .get(base_key)
-                        .and_then(|r| r.pixel_payload.as_deref().map(str::len))
-                    {
-                        let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h);
-                        desired.push(ActivePixelGraphic {
-                            cache_key: pg.cache_key,
-                            rect: clamped_rect,
-                            protocol: pg.protocol,
-                            cols: clamped_rect.width,
-                            rows: clamped_rect.height,
-                            payload_len,
-                        });
-                    }
+                if fit_w == 0 || fit_h == 0 {
+                    continue;
+                }
+                let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h);
+                let payload_opt: Option<String> = if let Some(inline_payload) = pg.payload {
+                    Some(inline_payload)
+                } else {
+                    let (base_key, crop) = parse_pixel_key(&pg.cache_key);
+                    app.image_cache.get(base_key).and_then(|rendered| {
+                        if let Some((sx, sy, vw, vh)) = crop {
+                            rendered
+                                .viewport_pixel_payload(sx, sy, vw.min(fit_w), vh.min(fit_h))
+                                .map(|(p, _, _)| p)
+                                .or_else(|| {
+                                    if rendered.cols <= fit_w && rendered.rows <= fit_h {
+                                        rendered.pixel_payload.clone()
+                                    } else {
+                                        None
+                                    }
+                                })
+                        } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
+                            rendered.pixel_payload.clone()
+                        } else {
+                            rendered
+                                .viewport_pixel_payload(0, 0, fit_w, fit_h)
+                                .map(|(p, _, _)| p)
+                        }
+                    })
+                };
+                if let Some(payload) = payload_opt {
+                    desired.push(ActivePixelGraphic {
+                        cache_key: pg.cache_key,
+                        rect: clamped_rect,
+                        protocol: pg.protocol,
+                        cols: clamped_rect.width,
+                        rows: clamped_rect.height,
+                        payload_len: payload.len(),
+                    });
+                    desired_payloads.push(payload);
                 }
             }
         }
@@ -738,68 +763,55 @@ fn draw_frame(
                 }
             }
             terminal.backend_mut().flush()?;
-            ui.active_pixel_graphic = None;
+            ui.active_pixel_graphics.clear();
             terminal.clear()?;
             terminal.draw(|frame| {
                 cursor_pos = ui::draw(frame, app, ui);
             })?;
         }
 
-        let mut committed = desired;
+        let committed = desired;
         if plan.emit_desired {
-            if let Some(graphic) = committed.first().cloned() {
-                let (base_key, crop) = parse_pixel_key(&graphic.cache_key);
-                let fit_w = graphic.rect.width;
-                let fit_h = graphic.rect.height;
-                let payload: Option<Cow<'_, str>> =
-                    app.image_cache.get(base_key).and_then(|rendered| {
-                        if let Some((sx, sy, vw, vh)) = crop {
-                            rendered
-                                .viewport_pixel_payload(sx, sy, vw.min(fit_w), vh.min(fit_h))
-                                .map(|(p, _, _)| Cow::Owned(p))
-                                .or_else(|| {
-                                    if rendered.cols <= fit_w && rendered.rows <= fit_h {
-                                        rendered.pixel_payload.as_deref().map(Cow::Borrowed)
-                                    } else {
-                                        None
-                                    }
-                                })
-                        } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
-                            rendered.pixel_payload.as_deref().map(Cow::Borrowed)
-                        } else {
-                            rendered
-                                .viewport_pixel_payload(0, 0, fit_w, fit_h)
-                                .map(|(p, _, _)| Cow::Owned(p))
-                        }
-                    });
-                if let Some(payload) = payload {
-                    if graphic.protocol == TerminalImageProtocol::Kitty {
-                        terminal
-                            .backend_mut()
-                            .write_all(img_preview::kitty_delete_preview_sequence().as_bytes())?;
-                        guard.kitty_used = true;
-                        KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
-                    }
-                    crossterm::queue!(
-                        terminal.backend_mut(),
-                        crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
-                    )?;
-                    terminal.backend_mut().write_all(payload.as_bytes())?;
-                    terminal.backend_mut().flush()?;
-                    ui.active_pixel_graphic = Some((
-                        graphic.cache_key,
-                        graphic.rect,
-                        graphic.protocol,
-                    ));
-                } else {
-                    committed.clear();
-                    ui.active_pixel_graphic = None;
-                }
-            } else {
-                ui.active_pixel_graphic = None;
+            let any_kitty = committed
+                .iter()
+                .any(|g| g.protocol == TerminalImageProtocol::Kitty);
+            if any_kitty {
+                terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_all_sequence().as_bytes())?;
+                guard.kitty_used = true;
+                KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
             }
+            let multi_kitty = committed
+                .iter()
+                .filter(|g| g.protocol == TerminalImageProtocol::Kitty)
+                .count()
+                > 1;
+            let mut new_active = Vec::with_capacity(committed.len());
+            for (idx, (graphic, payload)) in
+                committed.iter().zip(desired_payloads.iter()).enumerate()
+            {
+                crossterm::queue!(
+                    terminal.backend_mut(),
+                    crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
+                )?;
+                if multi_kitty && graphic.protocol == TerminalImageProtocol::Kitty {
+                    let unique_id = img_preview::KITTY_PREVIEW_IMAGE_ID.saturating_add(idx as u32);
+                    let rewritten = payload.replacen(
+                        &format!("i={},", img_preview::KITTY_PREVIEW_IMAGE_ID),
+                        &format!("i={unique_id},"),
+                        1,
+                    );
+                    terminal.backend_mut().write_all(rewritten.as_bytes())?;
+                } else {
+                    terminal.backend_mut().write_all(payload.as_bytes())?;
+                }
+                new_active.push((graphic.cache_key.clone(), graphic.rect, graphic.protocol));
+            }
+            terminal.backend_mut().flush()?;
+            ui.active_pixel_graphics = new_active;
         } else if committed.is_empty() {
-            ui.active_pixel_graphic = None;
+            ui.active_pixel_graphics.clear();
             if plan.delete_kitty {
                 guard.kitty_used = false;
             }
@@ -1132,26 +1144,33 @@ pub async fn run_with_persona(
 
         if ui.editor_requested {
             ui.editor_requested = false;
-            if let Some((_, rect, proto)) = ui.active_pixel_graphic.take() {
+            let active = std::mem::take(&mut ui.active_pixel_graphics);
+            if !active.is_empty() {
                 use std::io::Write;
-                if proto == TerminalImageProtocol::Kitty {
-                    let _ = terminal
-                        .backend_mut()
-                        .write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
-                    let _ = terminal
-                        .backend_mut()
-                        .write_all(img_preview::kitty_delete_all_sequence().as_bytes());
-                } else {
-                    let erase = img_preview::erase_pixel_rect_sequence(
-                        rect.x,
-                        rect.y,
-                        rect.width,
-                        rect.height,
-                        ui.term_width,
-                        ui.term_height,
-                    );
-                    if !erase.is_empty() {
-                        let _ = terminal.backend_mut().write_all(erase.as_bytes());
+                let mut deleted_kitty = false;
+                for (_, rect, proto) in active {
+                    if proto == TerminalImageProtocol::Kitty {
+                        if !deleted_kitty {
+                            let _ = terminal
+                                .backend_mut()
+                                .write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
+                            let _ = terminal
+                                .backend_mut()
+                                .write_all(img_preview::kitty_delete_all_sequence().as_bytes());
+                            deleted_kitty = true;
+                        }
+                    } else {
+                        let erase = img_preview::erase_pixel_rect_sequence(
+                            rect.x,
+                            rect.y,
+                            rect.width,
+                            rect.height,
+                            ui.term_width,
+                            ui.term_height,
+                        );
+                        if !erase.is_empty() {
+                            let _ = terminal.backend_mut().write_all(erase.as_bytes());
+                        }
                     }
                 }
                 let _ = terminal.backend_mut().flush();
@@ -1497,8 +1516,15 @@ mod tests {
         assert!(pixel_graphics_allowed_for_overlays(&[
             Overlay::ImagePreview(preview.clone())
         ]));
+        assert!(pixel_graphics_allowed_for_overlays(&[
+            Overlay::html_preview(None, "<p>hi</p>".to_string())
+        ]));
         assert!(!pixel_graphics_allowed_for_overlays(&[
             Overlay::ImagePreview(preview),
+            Overlay::confirm("Quit?", None),
+        ]));
+        assert!(!pixel_graphics_allowed_for_overlays(&[
+            Overlay::html_preview(None, "<p>hi</p>".to_string()),
             Overlay::confirm("Quit?", None),
         ]));
     }

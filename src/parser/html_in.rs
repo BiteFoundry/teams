@@ -473,6 +473,9 @@ impl<'a> ParserContext<'a> {
     fn handle_element(&mut self, el_ref: ElementRef<'_>, style: &TextStyleFlags) {
         let el = el_ref.value();
         let tag = el.name();
+        if is_ignored_noise_tag(tag) || has_display_none(el) {
+            return;
+        }
         match tag {
             "br" => {
                 self.push_raw_span("\n", &TextStyleFlags::default());
@@ -650,10 +653,187 @@ impl<'a> ParserContext<'a> {
                     });
                 }
             }
-            "script" | "style" => {}
+            "table" => {
+                self.flush_paragraph();
+                if should_linearize_table(el_ref) {
+                    self.linearize_table(el_ref, style);
+                } else {
+                    self.render_data_table(el_ref, style);
+                }
+            }
             _ => {
                 self.walk_children(el_ref, style);
             }
+        }
+    }
+
+    fn linearize_table(&mut self, table_el: ElementRef<'_>, style: &TextStyleFlags) {
+        for child in table_el.children() {
+            match child.value() {
+                Node::Text(text) => {
+                    self.push_inline_text(text.text.as_ref(), style);
+                }
+                Node::Element(el) => {
+                    if is_ignored_noise_tag(el.name()) || has_display_none(el) {
+                        continue;
+                    }
+                    let Some(child_el) = ElementRef::wrap(child) else {
+                        continue;
+                    };
+                    match el.name() {
+                        "thead" | "tbody" | "tfoot" => {
+                            for row_node in child_el.children() {
+                                match row_node.value() {
+                                    Node::Text(text) => {
+                                        self.push_inline_text(text.text.as_ref(), style);
+                                    }
+                                    Node::Element(rel) => {
+                                        if is_ignored_noise_tag(rel.name())
+                                            || has_display_none(rel)
+                                        {
+                                            continue;
+                                        }
+                                        if let Some(row_el) = ElementRef::wrap(row_node) {
+                                            if rel.name() == "tr" {
+                                                self.linearize_table_row(row_el, style);
+                                            } else {
+                                                self.handle_element(row_el, style);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        "tr" => {
+                            self.linearize_table_row(child_el, style);
+                        }
+                        "caption" => {
+                            self.flush_paragraph();
+                            self.walk_children(child_el, style);
+                            self.flush_paragraph();
+                        }
+                        _ => {
+                            self.handle_element(child_el, style);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.flush_paragraph();
+    }
+
+    fn linearize_table_row(&mut self, row_el: ElementRef<'_>, style: &TextStyleFlags) {
+        for cell_node in row_el.children() {
+            match cell_node.value() {
+                Node::Text(text) => {
+                    self.push_inline_text(text.text.as_ref(), style);
+                }
+                Node::Element(cel) => {
+                    if is_ignored_noise_tag(cel.name()) || has_display_none(cel) {
+                        continue;
+                    }
+                    let Some(cell_el) = ElementRef::wrap(cell_node) else {
+                        continue;
+                    };
+                    if matches!(cel.name(), "td" | "th") {
+                        self.flush_paragraph();
+                        self.walk_children(cell_el, style);
+                        self.flush_paragraph();
+                    } else {
+                        self.handle_element(cell_el, style);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn render_data_table(&mut self, table_el: ElementRef<'_>, style: &TextStyleFlags) {
+        let mut raw_rows: Vec<(bool, ElementRef<'_>)> = Vec::new();
+        for child in table_el.children() {
+            let Some(child_el) = ElementRef::wrap(child) else {
+                continue;
+            };
+            let el = child_el.value();
+            if is_ignored_noise_tag(el.name()) || has_display_none(el) {
+                continue;
+            }
+            match el.name() {
+                "caption" => {
+                    self.flush_paragraph();
+                    let mut cap_style = style.clone();
+                    cap_style.bold = true;
+                    let spans = self.collect_inline_spans(child_el, &cap_style);
+                    if !spans_are_blank(&spans) {
+                        self.blocks.push(RichBlock::Paragraph(trim_spans(spans)));
+                    }
+                }
+                "thead" => {
+                    for row_el in child_el.children().filter_map(ElementRef::wrap) {
+                        if row_el.value().name() == "tr" && !has_display_none(row_el.value()) {
+                            raw_rows.push((true, row_el));
+                        }
+                    }
+                }
+                "tbody" | "tfoot" => {
+                    for row_el in child_el.children().filter_map(ElementRef::wrap) {
+                        if row_el.value().name() == "tr" && !has_display_none(row_el.value()) {
+                            raw_rows.push((false, row_el));
+                        }
+                    }
+                }
+                "tr" => {
+                    raw_rows.push((false, child_el));
+                }
+                _ => {}
+            }
+        }
+
+        let mut table_spans: Vec<RichSpan> = Vec::new();
+        let mut rendered_rows = 0usize;
+        for (in_thead, row_el) in raw_rows {
+            let mut cells: Vec<(bool, Vec<RichSpan>)> = Vec::new();
+            for cell_el in row_el.children().filter_map(ElementRef::wrap) {
+                let cel = cell_el.value();
+                if has_display_none(cel) {
+                    continue;
+                }
+                let is_th = cel.name() == "th";
+                if is_th || cel.name() == "td" {
+                    let mut cell_style = style.clone();
+                    if in_thead || is_th {
+                        cell_style.bold = true;
+                    }
+                    let spans = trim_spans(self.collect_inline_spans(cell_el, &cell_style));
+                    cells.push((in_thead || is_th, spans));
+                }
+            }
+            if cells.is_empty() || cells.iter().all(|(_, s)| spans_are_blank(s)) {
+                continue;
+            }
+            if rendered_rows > 0 {
+                table_spans.push(RichSpan::plain("\n"));
+            }
+            for (ci, (_, cell_spans)) in cells.into_iter().enumerate() {
+                if ci > 0 {
+                    table_spans.push(RichSpan::plain(" │ "));
+                }
+                for mut sp in cell_spans {
+                    if sp.text.contains('\n') {
+                        sp.text = sp.text.replace('\n', " ");
+                    }
+                    if !sp.text.is_empty() {
+                        table_spans.push(sp);
+                    }
+                }
+            }
+            rendered_rows += 1;
+        }
+
+        if !spans_are_blank(&table_spans) {
+            self.blocks.push(RichBlock::Paragraph(trim_spans(table_spans)));
         }
     }
 
@@ -684,7 +864,10 @@ impl<'a> ParserContext<'a> {
                     self.push_inline_text(text.text.as_ref(), style);
                 }
                 Node::Element(el) => {
-                    if el.attr("itemprop") == Some("time") {
+                    if el.attr("itemprop") == Some("time")
+                        || is_ignored_noise_tag(el.name())
+                        || has_display_none(el)
+                    {
                         continue;
                     }
                     let Some(child_el) = ElementRef::wrap(child) else {
@@ -892,6 +1075,144 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
+fn is_ignored_noise_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "script"
+            | "style"
+            | "head"
+            | "meta"
+            | "title"
+            | "noscript"
+            | "template"
+            | "xml"
+            | "o:p"
+            | "svg"
+            | "canvas"
+    )
+}
+
+fn has_display_none(el: &scraper::node::Element) -> bool {
+    let Some(style) = el.attr("style") else {
+        return false;
+    };
+    for decl in style.split(';') {
+        let Some((prop, val)) = decl.split_once(':') else {
+            continue;
+        };
+        let val_clean = val.split('!').next().unwrap_or("").trim();
+        if prop.trim().eq_ignore_ascii_case("display") && val_clean.eq_ignore_ascii_case("none") {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_presentation_role(el: &scraper::node::Element) -> bool {
+    el.attr("role").is_some_and(|r| {
+        let trimmed = r.trim();
+        trimmed.eq_ignore_ascii_case("presentation") || trimmed.eq_ignore_ascii_case("none")
+    })
+}
+
+fn has_nested_table(table_el: ElementRef<'_>) -> bool {
+    table_el
+        .descendants()
+        .skip(1)
+        .any(|desc| ElementRef::wrap(desc).is_some_and(|el| el.value().name() == "table"))
+}
+
+fn row_has_th_or_block_td(row_el: ElementRef<'_>, has_th: &mut bool, has_block_td: &mut bool) {
+    for cell in row_el.children().filter_map(ElementRef::wrap) {
+        match cell.value().name() {
+            "th" => *has_th = true,
+            "td" => {
+                if cell.descendants().skip(1).any(|desc| {
+                    ElementRef::wrap(desc).is_some_and(|el| {
+                        matches!(
+                            el.value().name(),
+                            "div"
+                                | "p"
+                                | "ul"
+                                | "ol"
+                                | "blockquote"
+                                | "pre"
+                                | "h1"
+                                | "h2"
+                                | "h3"
+                                | "h4"
+                                | "h5"
+                                | "h6"
+                                | "hr"
+                                | "table"
+                        )
+                    })
+                }) {
+                    *has_block_td = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn count_row_columns(row_el: ElementRef<'_>) -> usize {
+    let mut cols = 0usize;
+    for cell in row_el.children().filter_map(ElementRef::wrap) {
+        if matches!(cell.value().name(), "td" | "th") {
+            let span = cell
+                .value()
+                .attr("colspan")
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1);
+            cols += span;
+        }
+    }
+    cols
+}
+
+fn should_linearize_table(table_el: ElementRef<'_>) -> bool {
+    if is_presentation_role(table_el.value()) || has_nested_table(table_el) {
+        return true;
+    }
+
+    let mut max_cols = 0usize;
+    let mut has_th_or_thead = false;
+    let mut has_block_td = false;
+    for child in table_el.children() {
+        let Some(child_el) = ElementRef::wrap(child) else {
+            continue;
+        };
+        if is_presentation_role(child_el.value()) {
+            return true;
+        }
+        match child_el.value().name() {
+            "thead" | "tbody" | "tfoot" => {
+                if child_el.value().name() == "thead" {
+                    has_th_or_thead = true;
+                }
+                for row_el in child_el.children().filter_map(ElementRef::wrap) {
+                    if row_el.value().name() == "tr" {
+                        if is_presentation_role(row_el.value()) {
+                            return true;
+                        }
+                        max_cols = max_cols.max(count_row_columns(row_el));
+                        row_has_th_or_block_td(row_el, &mut has_th_or_thead, &mut has_block_td);
+                    }
+                }
+            }
+            "tr" => {
+                max_cols = max_cols.max(count_row_columns(child_el));
+                row_has_th_or_block_td(child_el, &mut has_th_or_thead, &mut has_block_td);
+            }
+            _ => {}
+        }
+    }
+
+    max_cols <= 1 || (!has_th_or_thead && has_block_td)
+}
+
 fn collect_raw_text(el_ref: ElementRef<'_>) -> String {
     let mut out = String::new();
     collect_raw_text_inner(el_ref, &mut out);
@@ -903,6 +1224,9 @@ fn collect_raw_text_inner(el_ref: ElementRef<'_>, out: &mut String) {
         match child.value() {
             Node::Text(t) => out.push_str(t.text.as_ref()),
             Node::Element(el) => {
+                if is_ignored_noise_tag(el.name()) || has_display_none(el) {
+                    continue;
+                }
                 if el.name() == "br" {
                     out.push('\n');
                 } else if let Some(child_el) = ElementRef::wrap(child) {
@@ -1191,5 +1515,56 @@ mod tests {
             crate::parser::html_and_cards_to_plain(r#"<attachment id="x9"></attachment>"#, &[]),
             "[Attachment: x9]"
         );
+    }
+
+    #[test]
+    fn blockquote_strips_noise_tags_svg_and_display_none() {
+        let html = r#"<blockquote><style>.x{color:red}</style><script>bad()</script><svg><desc>secret</desc></svg><p style="display:none">hidden</p><p>Visible</p></blockquote>"#;
+        let blocks = parse_message_blocks(html, &[], &[]);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            RichBlock::Quote(spans) => {
+                let text = spans_to_plain(spans);
+                assert_eq!(text, "Visible");
+            }
+            other => panic!("expected Quote block, got {other:?}"),
+        }
+        let plain = blocks_to_plain(&blocks);
+        assert_eq!(plain, "> Visible");
+        for forbidden in [".x", "color:red", "bad()", "secret", "hidden"] {
+            assert!(!plain.contains(forbidden), "leaked {forbidden} in {plain}");
+        }
+    }
+
+    #[test]
+    fn handle_element_strips_noise_tags_and_handles_layout_and_data_tables() {
+        let html = r#"
+            <head><title>DocTitle</title><meta charset="utf-8"></head>
+            <noscript>no-js</noscript>
+            <template>tpl-secret</template>
+            <xml><o:p>office-meta</o:p></xml>
+            <svg><desc>svg-secret</desc><rect width="10" height="10"/></svg>
+            <canvas>canvas-fallback</canvas>
+            <div style="display: none !important">hidden-div</div>
+            <table role="presentation"><tr><td><p>Layout One</p></td></tr><tr><td><p>Layout Two</p></td></tr></table>
+            <table><thead><tr><th>Name</th><th>Status</th></tr></thead><tbody><tr><td>API</td><td>OK</td></tr></tbody></table>
+        "#;
+        let blocks = parse_message_blocks(html, &[], &[]);
+        let plain = blocks_to_plain(&blocks);
+        for forbidden in [
+            "DocTitle",
+            "no-js",
+            "tpl-secret",
+            "office-meta",
+            "svg-secret",
+            "canvas-fallback",
+            "hidden-div",
+        ] {
+            assert!(!plain.contains(forbidden), "leaked {forbidden} in:\n{plain}");
+        }
+        assert!(plain.contains("Layout One"), "{plain}");
+        assert!(plain.contains("Layout Two"), "{plain}");
+        assert!(plain.contains("Name │ Status"), "{plain}");
+        assert!(plain.contains("API │ OK"), "{plain}");
     }
 }

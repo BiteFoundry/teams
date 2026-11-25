@@ -346,6 +346,9 @@ impl GraphClient {
     }
 
     pub async fn download_hosted_bytes(&self, hosted_url: &str) -> Result<Vec<u8>> {
+        if let Some((_, bytes)) = try_decode_data_image_url(hosted_url)? {
+            return Ok(bytes);
+        }
         let use_bearer = should_send_bearer(&self.config.graph_base_url, hosted_url);
         self.get_bytes_with_limit(hosted_url, use_bearer, MAX_IN_MEMORY_ATTACHMENT_BYTES)
             .await
@@ -361,6 +364,24 @@ impl GraphClient {
             .as_deref()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("Attachment has no content_url to download."))?;
+        if let Some((mime, bytes)) = try_decode_data_image_url(content_url)? {
+            let raw_name = attachment
+                .name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let ext = match mime.as_str() {
+                        "image/jpeg" | "image/jpg" => "jpg",
+                        "image/gif" => "gif",
+                        "image/webp" => "webp",
+                        "image/bmp" | "image/x-ms-bmp" => "bmp",
+                        _ => "png",
+                    };
+                    format!("attachment_{}.{ext}", attachment.id)
+                });
+            return Ok((raw_name, mime, bytes));
+        }
         let raw_name = attachment
             .name
             .as_deref()
@@ -395,6 +416,27 @@ impl GraphClient {
             }
         };
         Ok((raw_name, attachment.content_type.clone(), bytes))
+    }
+}
+
+/// Decodes an inline `data:image/*` URI locally (rasterizing SVG to PNG) without issuing any HTTP request.
+/// Returns `Ok(None)` when `url` is not a `data:image/` URI.
+fn try_decode_data_image_url(url: &str) -> Result<Option<(String, Vec<u8>)>> {
+    let trimmed = url.trim();
+    if trimmed.len() < 11 || !trimmed[..11].eq_ignore_ascii_case("data:image/") {
+        return Ok(None);
+    }
+    let decoded = bitefoundry_html::graphics::decode_data_image_uri(trimmed)?;
+    if decoded.is_svg {
+        let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
+            &decoded.bytes,
+            bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
+            bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
+            None,
+        )?;
+        Ok(Some(("image/png".to_string(), raster.png_bytes.to_vec())))
+    } else {
+        Ok(Some((decoded.mime, decoded.bytes)))
     }
 }
 
@@ -654,7 +696,7 @@ async fn detect_downloaded_mime_and_image(
             }
         }
         if crate::img_preview::looks_like_svg_bytes(&header[..n]) {
-            return ("image/svg+xml".to_string(), false);
+            return ("image/svg+xml".to_string(), true);
         }
         if crate::img_preview::looks_like_html_bytes(&header[..n]) {
             return ("text/html".to_string(), false);
@@ -1020,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_detect_downloaded_mime_rejects_svg_and_html_as_raster_images() {
+    async fn test_detect_downloaded_mime_supports_svg_and_rejects_html_spoof() {
         let dir = tempdir().unwrap();
 
         let svg_path = dir.path().join("diagram.svg");
@@ -1032,17 +1074,17 @@ mod tests {
         let (mime, is_image) =
             detect_downloaded_mime_and_image(&svg_path, "diagram.svg", "image/svg+xml").await;
         assert_eq!(mime, "image/svg+xml");
-        assert!(!is_image, "SVG must not be classified as a raster image");
+        assert!(is_image, "SVG is now natively supported as a previewable image");
 
-        // Empty/unknown body with declared image/svg+xml must also be non-image
+        // Empty/unknown body with declared image/svg+xml is also classified as SVG image
         let empty_svg = dir.path().join("empty.svg");
         std::fs::write(&empty_svg, b"").unwrap();
         let (mime2, is_image2) =
             detect_downloaded_mime_and_image(&empty_svg, "empty.svg", "image/svg+xml").await;
         assert_eq!(mime2, "image/svg+xml");
-        assert!(!is_image2);
+        assert!(is_image2);
 
-        // HTML auth redirect disguised as a .png file must be classified as text/html, not raster image
+        // HTML auth redirect disguised as a .png file must still be classified as text/html, not image
         let html_png = dir.path().join("login.png");
         std::fs::write(
             &html_png,
@@ -1065,5 +1107,68 @@ mod tests {
             detect_downloaded_mime_and_image(&real_png, "ok.bin", "application/octet-stream").await;
         assert_eq!(mime4, "image/png");
         assert!(is_image4);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_attachment_bytes_decodes_data_image_uri_locally_without_network() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
+        use std::io::Cursor;
+
+        // Point graph_base_url at an unreachable local port so any network call would fail immediately.
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = "http://127.0.0.1:1/v1.0".to_string();
+        let tok = crate::auth::StoredTokens {
+            access_token: "unused".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap();
+
+        let img = ImageBuffer::from_pixel(4, 4, Rgba([220u8, 40, 60, 255]));
+        let mut png_buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut png_buf, ImageFormat::Png)
+            .unwrap();
+        let png_bytes = png_buf.into_inner();
+        let data_uri = format!("data:image/png;base64,{}", B64.encode(&png_bytes));
+
+        let att = AttachmentInfo {
+            id: "inline-1".into(),
+            content_type: "image/png".into(),
+            content_url: Some(data_uri.clone()),
+            name: None,
+            content_json: None,
+            thumbnail_url: None,
+        };
+        let (name, mime, bytes) = client.fetch_attachment_bytes(&att).await.unwrap();
+        assert_eq!(name, "attachment_inline-1.png");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, png_bytes);
+
+        let hosted = client.download_hosted_bytes(&data_uri).await.unwrap();
+        assert_eq!(hosted, png_bytes);
+
+        // Percent-encoded SVG data URI is also decoded and rasterized to PNG locally.
+        let svg_uri = "data:image/svg+xml,%3Csvg%20width%3D%2216%22%20height%3D%2216%22%3E%3Crect%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22%23e11d48%22/%3E%3C/svg%3E";
+        let svg_att = AttachmentInfo {
+            id: "inline-svg".into(),
+            content_type: "image/svg+xml".into(),
+            content_url: Some(svg_uri.into()),
+            name: Some("chart.svg".into()),
+            content_json: None,
+            thumbnail_url: None,
+        };
+        let (svg_name, svg_mime, svg_png) = client.fetch_attachment_bytes(&svg_att).await.unwrap();
+        assert_eq!(svg_name, "chart.svg");
+        assert_eq!(svg_mime, "image/png");
+        assert!(svg_png.starts_with(b"\x89PNG"));
     }
 }

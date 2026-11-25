@@ -330,6 +330,9 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded escape sequence payload (e.g. from `HtmlPreviewOverlay`).
+    /// When `None`, `tui.rs` resolves the payload from `app.image_cache` via `cache_key`.
+    pub payload: Option<String>,
 }
 
 pub struct UiState {
@@ -384,8 +387,8 @@ pub struct UiState {
     pub poll_retrying: bool,
     pub spinner_tick: u8,
     pub graphics_caps: TerminalGraphicsCaps,
-    pub pending_pixel_graphic: Option<PendingPixelGraphic>,
-    pub active_pixel_graphic: Option<(String, Rect, TerminalImageProtocol)>,
+    pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
+    pub active_pixel_graphics: Vec<(String, Rect, TerminalImageProtocol)>,
 }
 
 impl Default for UiState {
@@ -455,8 +458,8 @@ impl UiState {
             poll_retrying: false,
             spinner_tick: 0,
             graphics_caps: TerminalGraphicsCaps::default(),
-            pending_pixel_graphic: None,
-            active_pixel_graphic: None,
+            pending_pixel_graphics: Vec::new(),
+            active_pixel_graphics: Vec::new(),
         }
     }
 
