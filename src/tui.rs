@@ -481,6 +481,52 @@ impl PasteBurstDetector {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayoutSnapshot {
+    overlays_len: usize,
+    top_overlay: Option<ui::overlays::OverlayKind>,
+    active_nav_tab: usize,
+    show_nav_rail: bool,
+    narrow_pane: ui::app::NarrowPane,
+    thread_drawer_open: bool,
+    composer_target_thread: bool,
+    show_subject: bool,
+    mention_active: bool,
+    active_conv_key: Option<String>,
+    term_size: (u16, u16),
+}
+
+impl LayoutSnapshot {
+    fn capture(app: &AppState, ui: &UiState) -> Self {
+        Self {
+            overlays_len: ui.overlays.len(),
+            top_overlay: ui.overlays.last().map(Overlay::kind),
+            active_nav_tab: ui.active_nav_tab,
+            show_nav_rail: ui.show_nav_rail,
+            narrow_pane: ui.narrow_pane,
+            thread_drawer_open: ui.thread_drawer_open,
+            composer_target_thread: ui.composer_target_thread,
+            show_subject: ui.show_subject,
+            mention_active: ui.composer.mention_active(),
+            active_conv_key: app.active_conv_key.clone(),
+            term_size: (ui.term_width, ui.term_height),
+        }
+    }
+}
+
+fn event_invalidates_hitmap(ev: &CrosstermEvent) -> bool {
+    matches!(
+        ev,
+        CrosstermEvent::Resize(_, _)
+            | CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(_)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown,
+                ..
+            })
+    )
+}
+
 enum LoopStep {
     Continue,
     Quit,
@@ -1130,6 +1176,7 @@ pub async fn run_with_persona(
         }
 
         let mut should_quit = false;
+        let mut need_redraw_before_coalesce = false;
         tokio::select! {
             _ = tick.tick() => {
                 let before = ui.toasts.len();
@@ -1145,21 +1192,31 @@ pub async fn run_with_persona(
             maybe_core = core_rx.recv() => {
                 match maybe_core {
                     Some(ev) => {
+                        let before = LayoutSnapshot::capture(&app, &ui);
                         app.handle_core_event(&mut ui, ev);
                         dirty = true;
+                        if LayoutSnapshot::capture(&app, &ui) != before {
+                            need_redraw_before_coalesce = true;
+                        }
                     }
                     None => should_quit = true,
                 }
             }
             maybe_ui = ui_rx.recv() => {
                 if let Some(msg) = maybe_ui {
+                    let before = LayoutSnapshot::capture(&app, &ui);
                     app.handle_ui_msg(&mut ui, msg);
                     dirty = true;
+                    if LayoutSnapshot::capture(&app, &ui) != before {
+                        need_redraw_before_coalesce = true;
+                    }
                 }
             }
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(ev)) => {
+                        let invalidates = event_invalidates_hitmap(&ev);
+                        let before = LayoutSnapshot::capture(&app, &ui);
                         if matches!(
                             process_terminal_event_with_burst(
                                 ev,
@@ -1175,6 +1232,9 @@ pub async fn run_with_persona(
                         ) {
                             should_quit = true;
                         }
+                        if invalidates || LayoutSnapshot::capture(&app, &ui) != before {
+                            need_redraw_before_coalesce = true;
+                        }
                     }
                     Some(Err(_)) | None => should_quit = true,
                 }
@@ -1184,17 +1244,24 @@ pub async fn run_with_persona(
             break;
         }
 
-        // Coalesce burst events (scroll wheel, fast typing, sync batches) before redrawing.
+        // Coalesce burst events (fast typing, sync batches) before redrawing,
+        // but immediately stop coalescing after clicks, wheel scrolls, resizes,
+        // or any layout/overlay/tab change so subsequent clicks hit-test a fresh hitmap.
         let mut drained = 0usize;
-        while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
+        while drained < MAX_COALESCED_EVENTS && !ui.editor_requested && !need_redraw_before_coalesce {
             let mut progressed = false;
             while drained < MAX_COALESCED_EVENTS {
                 match core_rx.try_recv() {
                     Ok(ev) => {
+                        let before = LayoutSnapshot::capture(&app, &ui);
                         app.handle_core_event(&mut ui, ev);
                         dirty = true;
                         drained += 1;
                         progressed = true;
+                        if LayoutSnapshot::capture(&app, &ui) != before {
+                            need_redraw_before_coalesce = true;
+                            break;
+                        }
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => {
                         should_quit = true;
@@ -1203,23 +1270,33 @@ pub async fn run_with_persona(
                     Err(mpsc::error::TryRecvError::Empty) => break,
                 }
             }
-            if should_quit {
+            if should_quit || need_redraw_before_coalesce {
                 break;
             }
             while drained < MAX_COALESCED_EVENTS {
                 match ui_rx.try_recv() {
                     Ok(msg) => {
+                        let before = LayoutSnapshot::capture(&app, &ui);
                         app.handle_ui_msg(&mut ui, msg);
                         dirty = true;
                         drained += 1;
                         progressed = true;
+                        if LayoutSnapshot::capture(&app, &ui) != before {
+                            need_redraw_before_coalesce = true;
+                            break;
+                        }
                     }
                     Err(_) => break,
                 }
             }
+            if need_redraw_before_coalesce {
+                break;
+            }
             while drained < MAX_COALESCED_EVENTS && !ui.editor_requested {
                 match events.next().now_or_never() {
                     Some(Some(Ok(ev))) => {
+                        let invalidates = event_invalidates_hitmap(&ev);
+                        let before = LayoutSnapshot::capture(&app, &ui);
                         drained += 1;
                         progressed = true;
                         if matches!(
@@ -1238,6 +1315,10 @@ pub async fn run_with_persona(
                             should_quit = true;
                             break;
                         }
+                        if invalidates || LayoutSnapshot::capture(&app, &ui) != before {
+                            need_redraw_before_coalesce = true;
+                            break;
+                        }
                     }
                     Some(Some(Err(_)) | None) => {
                         should_quit = true;
@@ -1246,7 +1327,7 @@ pub async fn run_with_persona(
                     None => break,
                 }
             }
-            if should_quit || !progressed {
+            if should_quit || need_redraw_before_coalesce || !progressed {
                 break;
             }
         }
@@ -1412,5 +1493,37 @@ mod tests {
             String::from_utf8(disable_buf).unwrap(),
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
         );
+    }
+
+    #[test]
+    fn event_invalidates_hitmap_for_clicks_scrolls_and_resizes() {
+        use crossterm::event::{MouseButton, MouseEvent};
+
+        let click = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        let wheel = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        let moved = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(event_invalidates_hitmap(&click));
+        assert!(event_invalidates_hitmap(&wheel));
+        assert!(event_invalidates_hitmap(&CrosstermEvent::Resize(100, 30)));
+        assert!(!event_invalidates_hitmap(&moved));
+        assert!(!event_invalidates_hitmap(&CrosstermEvent::Key(press(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ))));
     }
 }

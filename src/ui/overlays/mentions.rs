@@ -99,7 +99,6 @@ impl MentionPopup {
         let label_width = self
             .candidates
             .iter()
-            .take(max_rows)
             .map(|c| {
                 UnicodeWidthStr::width(c.display_name.as_str())
                     + c.email.as_deref().map_or(0, |e| e.len() + 3)
@@ -114,12 +113,13 @@ impl MentionPopup {
         let x = composer_area
             .x
             .min(frame_area.width.saturating_sub(width));
-        let area = Rect::new(x, y, width.min(frame_area.width), height);
+        let area = Rect::new(x, y, width.min(frame_area.width), height.min(frame_area.height));
         if area.width == 0 || area.height == 0 {
             return;
         }
 
         frame.render_widget(Clear, area);
+        hitmap.add(area, HitTarget::OverlayBody);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -132,9 +132,20 @@ impl MentionPopup {
             return;
         }
 
-        let mut lines = Vec::with_capacity(rows);
-        for (index, candidate) in self.candidates.iter().take(rows).enumerate() {
-            let selected = index == self.selected;
+        let visible = (inner.height as usize).min(rows).min(self.candidates.len());
+        if visible == 0 {
+            return;
+        }
+        let active_sel = self.selected.min(self.candidates.len().saturating_sub(1));
+        let skip = active_sel
+            .saturating_sub(visible.saturating_sub(1))
+            .min(self.candidates.len().saturating_sub(visible));
+
+        let mut lines = Vec::with_capacity(visible);
+        for slot in 0..visible {
+            let index = skip + slot;
+            let candidate = &self.candidates[index];
+            let selected = index == active_sel;
             let style = if selected {
                 theme.selection()
             } else {
@@ -152,12 +163,13 @@ impl MentionPopup {
                 style,
             )));
         }
-        let list_area = Rect::new(inner.x, inner.y, inner.width, inner.height.min(rows as u16));
+        let list_area = Rect::new(inner.x, inner.y, inner.width, visible as u16);
         frame.render_widget(Paragraph::new(lines), list_area);
-        for index in 0..list_area.height as usize {
+        for slot in 0..visible {
+            let index = skip + slot;
             hitmap.add_line(
                 list_area.x,
-                list_area.y + index as u16,
+                list_area.y + slot as u16,
                 list_area.width,
                 HitTarget::MentionCandidate(index),
             );
@@ -303,5 +315,40 @@ mod tests {
 
         popup.refresh("hello world", 11, &sample_members());
         assert!(!popup.active);
+    }
+
+    #[test]
+    fn mention_popup_windows_candidates_registers_overlay_body_and_maps_actual_indices() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let members: Vec<MemberInfo> = (0..8)
+            .map(|i| MemberInfo {
+                user_id: format!("u{i}"),
+                member_id: None,
+                display_name: format!("User {i}"),
+                email: None,
+                roles: vec![],
+                presence: None,
+            })
+            .collect();
+        let mut popup = MentionPopup::default();
+        popup.refresh("@", 1, &members);
+        assert_eq!(popup.candidates.len(), 8);
+        popup.selected = 7;
+
+        let theme = Theme::default();
+        let mut hitmap = HitMap::default();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let composer_area = Rect::new(2, 20, 60, 3);
+        term.draw(|f| {
+            popup.draw(f, composer_area, &theme, &mut hitmap);
+        })
+        .unwrap();
+
+        // Border cell (y = 20 - 8 = 12, x = 2) must register OverlayBody so clicks don't fall through.
+        assert_eq!(hitmap.hit(12, 2), Some(HitTarget::OverlayBody));
+        // 6 visible rows: candidates 2..=7 mapped to y = 13..=18.
+        assert_eq!(hitmap.hit(13, 4), Some(HitTarget::MentionCandidate(2)));
+        assert_eq!(hitmap.hit(18, 4), Some(HitTarget::MentionCandidate(7)));
     }
 }

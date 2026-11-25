@@ -150,12 +150,21 @@ impl PresenceOverlay {
         );
 
         let start_y = inner.y.saturating_add(2);
-        for (index, opt) in PRESENCE_OPTIONS.iter().enumerate() {
-            let y = start_y + index as u16;
+        let visible = inner.height.saturating_sub(2) as usize;
+        let active_sel = self.selected.min(PRESENCE_OPTIONS.len().saturating_sub(1));
+        let skip = active_sel
+            .saturating_sub(visible.saturating_sub(1))
+            .min(PRESENCE_OPTIONS.len().saturating_sub(visible));
+        for slot in 0..visible {
+            let index = skip + slot;
+            let Some(opt) = PRESENCE_OPTIONS.get(index) else {
+                break;
+            };
+            let y = start_y + slot as u16;
             if y >= inner.y + inner.height {
                 break;
             }
-            let selected = index == self.selected;
+            let selected = index == active_sel;
             let (_, dot_color) = theme.presence_indicator(Some(opt.availability));
             let style = if selected {
                 theme.selection()

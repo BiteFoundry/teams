@@ -472,7 +472,7 @@ fn handle_lane1_error(
     event_tx: &mpsc::UnboundedSender<CoreEvent>,
 ) {
     match classify_sync_error(err) {
-        SyncErrorKind::Forbidden403 => {
+        SyncErrorKind::Forbidden403 | SyncErrorKind::NotFound404 => {
             if let Some(target) = &focus.target {
                 restricted_convs.insert(target.conv_key());
             }
@@ -480,7 +480,7 @@ fn handle_lane1_error(
         SyncErrorKind::Unauthorized401 => {
             shared.pause_auth(Instant::now(), Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS));
         }
-        SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
+        SyncErrorKind::Transient => {
             if err_backoff.record_transient_failure(Instant::now()) {
                 let _ = event_tx.send(CoreEvent::SyncStateChanged {
                     busy: false,
@@ -970,11 +970,14 @@ pub fn spawn_sync_engine(
                             chat_err_backoff.reset_window();
                             channel_err_backoff.reset_window();
                             presence_err_backoff.reset_window();
-                            let active_key = bg_focus_rx
-                                .borrow()
-                                .target
-                                .as_ref()
-                                .map(ConversationTarget::conv_key);
+                            let current_pins = tokio::task::spawn_blocking(|| {
+                                AppConfig::load_from(&crate::config::config_file_path())
+                                    .ok()
+                                    .map(|cfg| cfg.pinned_convs.into_iter().collect::<HashSet<_>>())
+                            })
+                            .await
+                            .ok()
+                            .flatten();
                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                 busy: true,
                                 summary: "Syncing conversations...".to_string(),
@@ -987,7 +990,10 @@ pub fn spawn_sync_engine(
                                 &mut chat_cache_seeded,
                                 &mut chats_cursor_initialized,
                                 &mut rolling_chat_cursor,
-                                active_key.as_deref(),
+                                current_pins.as_ref().unwrap_or(&config_pinned),
+                                Some(&bg_focus_rx),
+                                None,
+                                Some(&mut presence_cache),
                             ).await {
                                 Ok(()) => {
                                     chat_err_backoff.record_success();
@@ -1398,7 +1404,7 @@ async fn sync_active_focus_inner(
                     Some(root_id) => Some((
                         root_id.clone(),
                         graph
-                            .list_thread_replies(team_id, channel_id, root_id, 50)
+                            .list_thread_replies(team_id, channel_id, root_id, 200)
                             .await,
                     )),
                     None => None,
@@ -2078,6 +2084,7 @@ async fn poll_channels_tier3_rotating(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refresh_all_conversations_with_cache(
     graph: &GraphClient,
     storage: &Storage,
@@ -2086,7 +2093,10 @@ async fn refresh_all_conversations_with_cache(
     chat_cache_seeded: &mut bool,
     chats_cursor_initialized: &mut bool,
     rolling_cursor: &mut usize,
-    active_conv_key: Option<&str>,
+    config_pinned: &HashSet<String>,
+    live_focus_rx: Option<&watch::Receiver<FocusTarget>>,
+    fallback_active_conv_key: Option<&str>,
+    presence_cache: Option<&mut PresencePollCache>,
 ) -> Result<()> {
     let (chats_res, teams_res) = tokio::join!(
         poll_chats_tier2_with_rolling_cache(
@@ -2100,40 +2110,72 @@ async fn refresh_all_conversations_with_cache(
         ),
         graph.list_joined_teams_with_channels(),
     );
-    chats_res?;
-    if let Ok(fetched) = teams_res {
-        let teams = run_storage(storage, move |st| st.upsert_joined_teams(&fetched)).await?;
+    let mut first_err: Option<anyhow::Error> = chats_res.err();
 
-        // Explicit refresh also reconciles inactive joined channels via delta so new posts,
-        // @me mentions, deletions, and unread counts surface without focusing each channel.
-        let mut refreshed_channels = 0usize;
-        'teams_loop: for team in &teams {
-            for ch in &team.channels {
-                if refreshed_channels >= MAX_REFRESH_CHANNELS {
-                    break 'teams_loop;
+    match teams_res {
+        Ok(fetched) => {
+            let teams = run_storage(storage, move |st| st.upsert_joined_teams(&fetched)).await?;
+            let existing_convs = run_storage(storage, |st| st.list_conversations()).await?;
+            let empty_restricted = HashSet::new();
+            let mut candidates = build_channel_poll_candidates(
+                &teams,
+                &existing_convs,
+                config_pinned,
+                None,
+                &empty_restricted,
+            );
+            // Ensure the currently focused channel is always prioritized inside the refresh budget.
+            let initial_live_active = live_focus_rx
+                .and_then(|rx| rx.borrow().target.as_ref().map(ConversationTarget::conv_key))
+                .or_else(|| fallback_active_conv_key.map(str::to_string));
+            if let Some(ref active_key) = initial_live_active {
+                if let Some(pos) = candidates.iter().position(|c| &c.conv_key == active_key) {
+                    let active_cand = candidates.remove(pos);
+                    candidates.insert(0, active_cand);
                 }
-                refreshed_channels += 1;
-                let conv_key = ch.conv_key();
-                let is_active = active_conv_key == Some(conv_key.as_str());
-                let conv_title = format!("{} › #{}", team.display_name, ch.display_name);
+            }
+
+            // Explicit refresh also reconciles joined channels via delta (prioritizing active,
+            // pinned, and recently active channels) so new posts, @me mentions, deletions, and
+            // unread counts surface without focusing each channel.
+            for cand in candidates.into_iter().take(MAX_REFRESH_CHANNELS) {
+                let live_active = live_focus_rx
+                    .and_then(|rx| rx.borrow().target.as_ref().map(ConversationTarget::conv_key))
+                    .or_else(|| fallback_active_conv_key.map(str::to_string));
+                let is_active = live_active.as_deref() == Some(cand.conv_key.as_str());
                 let _ = refresh_channel_delta_once(
                     graph,
                     storage,
                     event_tx,
-                    &ch.team_id,
-                    &ch.id,
-                    &conv_key,
-                    &conv_title,
+                    &cand.team_id,
+                    &cand.channel_id,
+                    &cand.conv_key,
+                    &cand.conv_title,
                     !is_active,
-                    None,
+                    live_focus_rx,
                 )
                 .await;
             }
-        }
 
-        let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
-        let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
-        let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
+            let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
+            let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
+            let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
+        }
+        Err(err) => {
+            if let Some(prev) = first_err.take() {
+                first_err = Some(anyhow::anyhow!("{prev}; Teams refresh failed: {err}"));
+            } else {
+                first_err = Some(err);
+            }
+        }
+    }
+
+    if let Some(p_cache) = presence_cache {
+        let _ = poll_presences_tier3_with_cache(graph, storage, event_tx, p_cache).await;
+    }
+
+    if let Some(err) = first_err {
+        return Err(err);
     }
     Ok(())
 }
@@ -3882,7 +3924,10 @@ mod tests {
             &mut seeded,
             &mut cursor_init,
             &mut rolling,
+            &HashSet::new(),
+            None,
             Some("chat:c-rx"),
+            None,
         )
         .await
         .unwrap();
@@ -3895,6 +3940,29 @@ mod tests {
         assert_eq!(ch_conv.unread_count, 1, "inactive channel must record unread_count on new message");
 
         server.abort();
+    }
+
+    #[test]
+    fn lane1_404_restricts_conversation_without_transient_retry_loop() {
+        let focus = FocusTarget {
+            target: Some(ConversationTarget::Chat {
+                chat_id: "deleted-chat".to_string(),
+            }),
+            thread_root_id: None,
+        };
+        let shared = SyncSharedState::new();
+        let mut restricted = HashSet::new();
+        let mut err_backoff = ErrorBackoffState::new(1000);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let err = anyhow::anyhow!(
+            "Graph API error (GET /chats/deleted-chat/messages): 404 Not Found"
+        );
+        handle_lane1_error(&err, &focus, &shared, &mut restricted, &mut err_backoff, &tx);
+
+        assert!(restricted.contains("chat:deleted-chat"));
+        assert!(!err_backoff.is_degraded());
+        assert!(rx.try_recv().is_err(), "404 must not emit transient retry spinner");
     }
 
     #[tokio::test]

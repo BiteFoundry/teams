@@ -127,6 +127,11 @@ impl SearchOverlay {
         );
 
         let len = app.search_results.len();
+        let active_sel = if len == 0 {
+            0
+        } else {
+            self.selected.min(len - 1)
+        };
         let status_y = inner.y.saturating_add(1);
         let status = if app.searching {
             "Searching…".to_string()
@@ -137,7 +142,7 @@ impl SearchOverlay {
                 "'{}': {} hits · {}/{}",
                 app.search_query,
                 len,
-                if len == 0 { 0 } else { self.selected + 1 },
+                if len == 0 { 0 } else { active_sel + 1 },
                 len
             )
         };
@@ -151,7 +156,9 @@ impl SearchOverlay {
         if visible == 0 {
             return;
         }
-        let skip = self.selected.saturating_sub(visible.saturating_sub(1));
+        let skip = active_sel
+            .saturating_sub(visible.saturating_sub(1))
+            .min(len.saturating_sub(visible));
         for row in 0..visible {
             let index = skip + row;
             if index >= len {
@@ -161,7 +168,7 @@ impl SearchOverlay {
             if y >= inner.y + inner.height {
                 break;
             }
-            let selected = index == self.selected;
+            let selected = index == active_sel;
             let style = if selected {
                 theme.selection()
             } else {

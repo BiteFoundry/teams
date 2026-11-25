@@ -298,8 +298,11 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
     ui.term_width = area.width;
     ui.term_height = area.height;
     ui.hitmap.clear();
+    ui.nav_area = Rect::default();
+    ui.chat_scroll.area = Rect::default();
+    ui.thread_scroll.area = Rect::default();
+    ui.thread_composer_area = Rect::default();
     if area.width == 0 || area.height == 0 {
-        ui.thread_composer_area = Rect::default();
         return None;
     }
 
@@ -975,5 +978,97 @@ mod tests {
     fn truncate_width_handles_multibyte_korean() {
         assert_eq!(truncate_width("안녕하세요", 4), "안…");
         assert_eq!(truncate_width("abc", 5), "abc");
+    }
+
+    #[tokio::test]
+    async fn draw_resets_hidden_pane_rects_and_medium_thread_scrolls_thread() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let (mut app, mut ui) = crate::ui::app::tests::make_test_app();
+        let conv = "chan:t1:ch1";
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(crate::models::ConversationTarget::Channel {
+            team_id: "t1".to_string(),
+            channel_id: "ch1".to_string(),
+        });
+        let root = crate::models::MessageItem {
+            msg_key: format!("{conv}|r1"),
+            conv_key: conv.to_string(),
+            msg_id: "r1".to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: "<p>root</p>".to_string(),
+            body_plain: "root".to_string(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 1,
+            web_url: None,
+        };
+        app.messages = vec![root.clone()];
+        app.active_thread = Some(crate::models::ThreadView {
+            conv_key: conv.to_string(),
+            root,
+            replies: Vec::new(),
+        });
+
+        // 1) Wide mode with nav rail visible: nav_area and chat_scroll.area are populated.
+        let mut wide_term = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        wide_term.draw(|f| {
+            draw(f, &mut app, &mut ui);
+        }).unwrap();
+        assert!(ui.nav_area.width > 0);
+        assert!(ui.chat_scroll.area.width > 0);
+        assert_eq!(ui.thread_scroll.area, Rect::default());
+
+        // 2) Hide nav rail (Ctrl+B): nav_area must be cleared so it cannot hijack wheel/clicks.
+        ui.show_nav_rail = false;
+        wide_term.draw(|f| {
+            draw(f, &mut app, &mut ui);
+        }).unwrap();
+        assert_eq!(ui.nav_area, Rect::default());
+        assert!(ui.chat_scroll.area.width > 0);
+
+        // 3) Medium mode with Thread open: chat_scroll.area must be cleared; hovering over composer scrolls Thread.
+        ui.show_nav_rail = true;
+        ui.thread_drawer_open = true;
+        let mut med_term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        med_term.draw(|f| {
+            draw(f, &mut app, &mut ui);
+        }).unwrap();
+        assert_eq!(ui.chat_scroll.area, Rect::default());
+        assert!(ui.thread_scroll.area.width > 0);
+
+        ui.thread_scroll.total_lines = 40;
+        ui.chat_scroll.total_lines = 40;
+        ui.thread_scroll.bottom();
+        ui.chat_scroll.bottom();
+        // Scroll over composer row (bottom of right pane, outside nav_area and outside thread_scroll.area)
+        let composer_x = ui.thread_scroll.area.x + 2;
+        let composer_y = 27;
+        crate::ui::action::dispatch(
+            crate::ui::action::Action::MouseScroll {
+                delta: -3,
+                column: composer_x,
+                row: composer_y,
+            },
+            &mut app,
+            &mut ui,
+        );
+        assert!(ui.thread_scroll.scroll_up > 0, "Medium thread mode should scroll Thread");
+        assert_eq!(ui.chat_scroll.scroll_up, 0, "Hidden Chat must not be scrolled");
+
+        app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }
 }

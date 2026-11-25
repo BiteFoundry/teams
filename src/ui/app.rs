@@ -184,16 +184,21 @@ pub enum UiMsg {
         scope_warning: Option<String>,
     },
     MessagesLoaded {
+        req_seq: u64,
         conv_key: String,
         messages: Vec<MessageItem>,
         members: Vec<MemberInfo>,
     },
     MembersLoaded {
+        req_seq: u64,
         conv_key: String,
         members: Vec<MemberInfo>,
         clear_loading: bool,
     },
     ClipboardImageEncoded {
+        req_seq: u64,
+        conv_key: Option<String>,
+        composer_target_thread: bool,
         width: u32,
         height: u32,
         file_name: String,
@@ -201,11 +206,13 @@ pub enum UiMsg {
         preview: Option<RenderedTerminalImage>,
     },
     OlderMessagesLoaded {
+        req_seq: u64,
         conv_key: String,
         messages: Vec<MessageItem>,
         reached_eof: bool,
     },
     OlderMessagesFailed {
+        req_seq: u64,
         conv_key: String,
         local_messages: Vec<MessageItem>,
         error: String,
@@ -216,11 +223,13 @@ pub enum UiMsg {
     },
     OlderChatsFailed,
     ThreadLoaded {
+        req_seq: u64,
         conv_key: String,
         root_msg_id: String,
         thread: ThreadView,
     },
     ThreadLoadFailed {
+        req_seq: u64,
         conv_key: String,
         root_msg_id: String,
         error: String,
@@ -234,7 +243,7 @@ pub enum UiMsg {
     MessageSendFailed {
         conv_key: String,
         parent_msg_id: Option<String>,
-        optimistic_id: String,
+        optimistic_id: Option<String>,
         text: String,
     },
     MessageDeleted {
@@ -258,6 +267,7 @@ pub enum UiMsg {
         hits: Vec<SearchHit>,
     },
     UserSearchResults {
+        req_seq: u64,
         query: String,
         users: Vec<UserProfile>,
     },
@@ -285,6 +295,8 @@ pub enum UiMsg {
         html: String,
     },
     HtmlAttachmentLoaded {
+        req_seq: u64,
+        conv_key: Option<String>,
         title: String,
         html: String,
     },
@@ -342,6 +354,8 @@ pub struct UiState {
     /// Scroll the selected chat message into view on the next render (line ranges are only
     /// known after layout, so a jump cannot do it itself).
     pub pending_reveal_selection: bool,
+    /// Scroll the selected thread message into view on the next thread render.
+    pub pending_thread_reveal: bool,
     pub attach_index: usize,
     pub show_nav_rail: bool,
     pub auto_thread_pane: bool,
@@ -413,6 +427,7 @@ impl UiState {
             pending_prepend_anchor: None,
             pending_append_anchor: None,
             pending_reveal_selection: false,
+            pending_thread_reveal: false,
             attach_index: 0,
             show_nav_rail: true,
             auto_thread_pane: true,
@@ -542,6 +557,15 @@ pub struct AppState {
     /// `(conv_key, root_msg_id)` of the thread fetch in flight. The drawer can be open on a
     /// root that is not cached yet, so `active_thread` alone cannot match the answer.
     pub pending_thread: Option<(String, String)>,
+    /// Target reply message ID to select & reveal once the active thread finishes loading.
+    pub pending_thread_reply_id: Option<String>,
+    /// Monotonic sequence counters guarding async UI loaders against stale out-of-order answers.
+    pub conv_req_seq: u64,
+    pub older_req_seq: u64,
+    pub thread_req_seq: u64,
+    pub user_search_seq: u64,
+    pub clipboard_paste_seq: u64,
+    pub html_fetch_seq: u64,
     pub loading_older_chats: bool,
     pub chats_oldest_reached: bool,
     pub syncing: bool,
@@ -614,6 +638,13 @@ impl AppState {
             loading_older: false,
             loading_thread: false,
             pending_thread: None,
+            pending_thread_reply_id: None,
+            conv_req_seq: 0,
+            older_req_seq: 0,
+            thread_req_seq: 0,
+            user_search_seq: 0,
+            clipboard_paste_seq: 0,
+            html_fetch_seq: 0,
             loading_older_chats: false,
             chats_oldest_reached: false,
             syncing: false,
@@ -1052,6 +1083,13 @@ impl AppState {
         self.tail_message_updated = false;
         self.active_thread = None;
         self.pending_thread = None;
+        self.pending_thread_reply_id = None;
+        self.conv_req_seq = self.conv_req_seq.wrapping_add(1);
+        self.older_req_seq = self.older_req_seq.wrapping_add(1);
+        self.thread_req_seq = self.thread_req_seq.wrapping_add(1);
+        self.clipboard_paste_seq = self.clipboard_paste_seq.wrapping_add(1);
+        self.html_fetch_seq = self.html_fetch_seq.wrapping_add(1);
+        let conv_req_seq = self.conv_req_seq;
         self.loading_thread = false;
         self.loading_older = false;
         self.history_error = None;
@@ -1063,6 +1101,7 @@ impl AppState {
         ui.pending_prepend_anchor = None;
         ui.pending_append_anchor = None;
         ui.pending_reveal_selection = false;
+        ui.pending_thread_reveal = false;
 
         self.messages = self
             .storage
@@ -1157,9 +1196,7 @@ impl AppState {
                         }
                     }
                     if let Some(ref members) = fetched_members {
-                        if !members.is_empty() {
-                            let _ = storage.upsert_members(&db_conv_key, members);
-                        }
+                        let _ = storage.replace_members(&db_conv_key, members);
                     }
                     let messages = if had_msgs {
                         Some(
@@ -1178,12 +1215,14 @@ impl AppState {
 
                 if let Some(messages) = messages {
                     let _ = tx.send(UiMsg::MessagesLoaded {
+                        req_seq: conv_req_seq,
                         conv_key,
                         messages,
                         members,
                     });
                 } else {
                     let _ = tx.send(UiMsg::MembersLoaded {
+                        req_seq: conv_req_seq,
                         conv_key,
                         members,
                         clear_loading: need_messages_fetch,
@@ -1191,6 +1230,7 @@ impl AppState {
                 }
             } else if need_messages_fetch {
                 let _ = tx.send(UiMsg::MembersLoaded {
+                    req_seq: conv_req_seq,
                     conv_key,
                     members: Vec::new(),
                     clear_loading: true,
@@ -1236,16 +1276,15 @@ impl AppState {
                 conv_key,
                 msg_id,
                 parent_msg_id,
+                created_at,
                 ..
             } => {
                 if let Some(target) = ConversationTarget::from_conv_key(&conv_key) {
                     self.select_conversation(ui, target);
                     if let Some(root) = parent_msg_id {
-                        self.open_thread_by_id(ui, root);
-                    } else if let Some(m_idx) =
-                        self.messages.iter().position(|m| m.msg_id == msg_id)
-                    {
-                        ui.chat_scroll.selected_idx = Some(m_idx);
+                        self.open_thread_by_id_with_reply(ui, root, Some(msg_id));
+                    } else {
+                        self.reveal_message(ui, &msg_id, &created_at);
                     }
                 }
             }
@@ -1274,6 +1313,15 @@ impl AppState {
     }
 
     pub fn open_thread_by_id(&mut self, ui: &mut UiState, root_msg_id: String) {
+        self.open_thread_by_id_with_reply(ui, root_msg_id, None);
+    }
+
+    pub fn open_thread_by_id_with_reply(
+        &mut self,
+        ui: &mut UiState,
+        root_msg_id: String,
+        target_reply_id: Option<String>,
+    ) {
         let Some(ConversationTarget::Channel {
             team_id,
             channel_id,
@@ -1286,8 +1334,11 @@ impl AppState {
         };
 
         self.stash_and_reset_draft(ui);
+        self.thread_req_seq = self.thread_req_seq.wrapping_add(1);
+        let req_seq = self.thread_req_seq;
         self.loading_thread = true;
         self.pending_thread = Some((conv_key.clone(), root_msg_id.clone()));
+        self.pending_thread_reply_id = target_reply_id.clone();
         if let Ok(Some(cached)) = self.storage.get_thread(&conv_key, &root_msg_id, 200) {
             self.active_thread = Some(cached);
         } else if let Some(root) = self
@@ -1309,6 +1360,16 @@ impl AppState {
         ui.composer_target_thread = true;
         ui.narrow_pane = NarrowPane::Thread;
         ui.thread_scroll = ScrollState::default();
+        ui.pending_thread_reveal = false;
+        if let (Some(ref target_id), Some(ref thread)) = (&target_reply_id, &self.active_thread) {
+            if thread.root.msg_id == *target_id {
+                ui.thread_scroll.selected_idx = Some(0);
+                ui.pending_thread_reveal = true;
+            } else if let Some(pos) = thread.replies.iter().position(|r| r.msg_id == *target_id) {
+                ui.thread_scroll.selected_idx = Some(pos + 1);
+                ui.pending_thread_reveal = true;
+            }
+        }
         self.restore_draft(ui);
         ui.set_focus(Focus::Thread);
 
@@ -1333,6 +1394,7 @@ impl AppState {
                     })
                     .await;
                     let _ = tx.send(UiMsg::ThreadLoaded {
+                        req_seq,
                         conv_key,
                         root_msg_id,
                         thread,
@@ -1340,6 +1402,7 @@ impl AppState {
                 }
                 Err(err) => {
                     let _ = tx.send(UiMsg::ThreadLoadFailed {
+                        req_seq,
                         conv_key,
                         root_msg_id,
                         error: err.to_string(),
@@ -1367,6 +1430,8 @@ impl AppState {
             return;
         }
 
+        self.thread_req_seq = self.thread_req_seq.wrapping_add(1);
+        let req_seq = self.thread_req_seq;
         self.loading_thread = true;
         self.pending_thread = Some((conv_key.clone(), root_msg_id.clone()));
         let task_label = "Sync thread replies".to_string();
@@ -1397,6 +1462,7 @@ impl AppState {
                     .flatten();
                     if let Some(thread) = thread_opt {
                         let _ = tx.send(UiMsg::ThreadLoaded {
+                            req_seq,
                             conv_key,
                             root_msg_id,
                             thread,
@@ -1411,6 +1477,7 @@ impl AppState {
                 Err(err) => {
                     // The failure handler reports the error and ends the loading state.
                     let _ = tx.send(UiMsg::ThreadLoadFailed {
+                        req_seq,
                         conv_key,
                         root_msg_id,
                         error: err.to_string(),
@@ -1431,7 +1498,11 @@ impl AppState {
         ui.composer_target_thread = false;
         self.active_thread = None;
         self.pending_thread = None;
+        self.pending_thread_reply_id = None;
+        self.thread_req_seq = self.thread_req_seq.wrapping_add(1);
+        self.clipboard_paste_seq = self.clipboard_paste_seq.wrapping_add(1);
         self.loading_thread = false;
+        ui.pending_thread_reveal = false;
         ui.narrow_pane = NarrowPane::Chat;
         self.sync_ctrl.set_focus(self.active_target.clone(), None);
         self.restore_draft(ui);
@@ -1575,11 +1646,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
-                    if let Some(opt_id) = optimistic_id {
+                    if optimistic_id.is_some() || !text.is_empty() {
                         let _ = tx.send(UiMsg::MessageSendFailed {
                             conv_key,
                             parent_msg_id: thread_root_id,
-                            optimistic_id: opt_id,
+                            optimistic_id,
                             text,
                         });
                     }
@@ -1637,6 +1708,8 @@ impl AppState {
         let oldest_ts = earliest.map(|m| m.created_at.clone());
         let oldest_id = earliest.map(|m| m.msg_id.clone());
 
+        self.older_req_seq = self.older_req_seq.wrapping_add(1);
+        let req_seq = self.older_req_seq;
         self.loading_older = true;
         self.history_error = None;
         let task_label = "Load older messages".to_string();
@@ -1741,6 +1814,7 @@ impl AppState {
                     .unwrap_or(true)
                 };
                 let _ = tx.send(UiMsg::OlderMessagesLoaded {
+                    req_seq,
                     conv_key,
                     messages: refreshed_older,
                     reached_eof,
@@ -1817,6 +1891,7 @@ impl AppState {
                     .unwrap_or_default();
 
                     let _ = tx.send(UiMsg::OlderMessagesLoaded {
+                        req_seq,
                         conv_key,
                         messages: combined_older,
                         reached_eof,
@@ -1834,6 +1909,7 @@ impl AppState {
                         auth::explain_graph_permission_error(&raw_err, tok.as_deref())
                             .unwrap_or_else(|| format!("Failed to load older messages: {raw_err}"));
                     let _ = tx.send(UiMsg::OlderMessagesFailed {
+                        req_seq,
                         conv_key,
                         local_messages: local_older,
                         error: friendly_err.clone(),
@@ -2203,6 +2279,8 @@ impl AppState {
     }
 
     pub fn search_users(&mut self, ui: &mut UiState, query: String) {
+        self.user_search_seq = self.user_search_seq.wrapping_add(1);
+        let req_seq = self.user_search_seq;
         if query.trim().is_empty() {
             self.user_search_results.clear();
             self.user_searching = false;
@@ -2216,7 +2294,11 @@ impl AppState {
 
         tokio::spawn(async move {
             let users = graph.search_users(&query, 20).await.unwrap_or_default();
-            let _ = tx.send(UiMsg::UserSearchResults { query, users });
+            let _ = tx.send(UiMsg::UserSearchResults {
+                req_seq,
+                query,
+                users,
+            });
             let _ = tx.send(UiMsg::TaskDone {
                 label: task_label,
                 error: None,
@@ -2559,7 +2641,7 @@ impl AppState {
         }
     }
 
-    pub fn fetch_html_attachment(&self, ui: &mut UiState, att: AttachmentInfo) {
+    pub fn fetch_html_attachment(&mut self, ui: &mut UiState, att: AttachmentInfo) {
         let title = att
             .name
             .clone()
@@ -2568,6 +2650,9 @@ impl AppState {
             ui.error("Cannot fetch HTML attachment without async runtime");
             return;
         }
+        self.html_fetch_seq = self.html_fetch_seq.wrapping_add(1);
+        let req_seq = self.html_fetch_seq;
+        let conv_key = self.active_conv_key.clone();
         let graph = self.graph.clone();
         let tx = self.ui_tx.clone();
         let task_label = format!("Open HTML: {title}");
@@ -2583,6 +2668,8 @@ impl AppState {
                         fetched_name
                     };
                     let _ = tx.send(UiMsg::HtmlAttachmentLoaded {
+                        req_seq,
+                        conv_key,
                         title: resolved_title,
                         html,
                     });
@@ -2873,6 +2960,59 @@ impl AppState {
         }
     }
 
+    fn apply_active_read_guard(&self, convs: &mut [ConversationSummary]) {
+        if let (Some(active_key), Some((read_key, read_at))) = (
+            self.active_conv_key.as_deref(),
+            self.active_marked_read_at.as_ref(),
+        ) {
+            if active_key == read_key {
+                if let Some(c) = convs.iter_mut().find(|c| c.conv_key == active_key) {
+                    let stale_unread = c
+                        .last_updated_at
+                        .as_deref()
+                        .is_none_or(|ts| ts <= read_at.as_str());
+                    if stale_unread {
+                        c.unread_count = 0;
+                        if c.last_read_at.as_deref().is_none_or(|r| r < read_at.as_str()) {
+                            c.last_read_at = Some(read_at.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_conversation_preview_from_sent(&mut self, conv_key: &str, sent: &MessageItem) {
+        if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
+            let is_newer_or_same = sent.created_at.is_empty()
+                || conv
+                    .last_updated_at
+                    .as_deref()
+                    .is_none_or(|ts| sent.created_at.as_str() >= ts);
+            if is_newer_or_same {
+                conv.last_msg_id = Some(sent.msg_id.clone());
+                conv.last_msg_author = Some(sent.author_name.clone());
+                let preview = sent
+                    .body_plain
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                conv.last_msg_preview = Some(if preview.is_empty() && !sent.attachments.is_empty() {
+                    sent.attachments
+                        .first()
+                        .and_then(|a| a.name.clone())
+                        .map(|n| format!("[Attachment: {n}]"))
+                        .unwrap_or_else(|| "[Attachment]".to_string())
+                } else {
+                    preview
+                });
+                if !sent.created_at.is_empty() {
+                    conv.last_updated_at = Some(sent.created_at.clone());
+                }
+            }
+        }
+    }
+
     pub fn handle_core_event(&mut self, ui: &mut UiState, event: CoreEvent) {
         match event {
             CoreEvent::SyncStateChanged { busy, summary } => {
@@ -2892,26 +3032,10 @@ impl AppState {
             }
             CoreEvent::ConversationsUpdated(mut convs) => {
                 ui.poll_retrying = false;
-                if let (Some(active_key), Some((read_key, read_at))) = (
-                    self.active_conv_key.as_deref(),
-                    self.active_marked_read_at.as_ref(),
-                ) {
-                    if active_key == read_key {
-                        if let Some(c) = convs.iter_mut().find(|c| c.conv_key == active_key) {
-                            let stale_unread = c
-                                .last_updated_at
-                                .as_deref()
-                                .is_none_or(|ts| ts <= read_at.as_str());
-                            if stale_unread {
-                                c.unread_count = 0;
-                                if c.last_read_at.as_deref().is_none_or(|r| r < read_at.as_str()) {
-                                    c.last_read_at = Some(read_at.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+                let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
+                self.apply_active_read_guard(&mut convs);
                 self.conversations = convs;
+                preserve_nav_selection(self, ui, prev_row);
                 if self.daemon_attached
                     && self.active_conv_key.is_none()
                     && self.active_target.is_none()
@@ -3013,6 +3137,7 @@ impl AppState {
                             merge_optimistic_messages(&mut self.messages, msgs);
                         }
                     }
+                    clamp_chat_selection(self.messages.len(), &mut ui.chat_scroll.selected_idx);
 
                     let appended_at_bottom = self.messages.len() > prev_len
                         || self.messages.last().map(|m| m.msg_id.as_str())
@@ -3079,6 +3204,10 @@ impl AppState {
                                 thread.replies = std::mem::take(&mut existing.replies);
                             }
                             self.active_thread = Some(thread);
+                            clamp_thread_selection(
+                                self.active_thread.as_ref(),
+                                &mut ui.thread_scroll.selected_idx,
+                            );
                         }
                     }
                 }
@@ -3178,7 +3307,7 @@ impl AppState {
             UiMsg::BootstrapDone {
                 me,
                 presence,
-                conversations,
+                mut conversations,
                 teams,
                 mentions,
                 presences,
@@ -3191,10 +3320,13 @@ impl AppState {
                 if let Some(p) = presence {
                     self.my_presence = Some(p);
                 }
+                let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
+                self.apply_active_read_guard(&mut conversations);
                 self.conversations = conversations;
                 self.teams = teams;
                 self.activity_mentions = mentions;
                 self.presences.extend(presences);
+                preserve_nav_selection(self, ui, prev_row);
                 self.syncing = false;
                 self.sync_summary = "Synced".to_string();
                 self.emit_scope_warning_once(ui, scope_warning);
@@ -3206,16 +3338,23 @@ impl AppState {
                 }
             }
             UiMsg::MessagesLoaded {
+                req_seq,
                 conv_key,
                 messages,
                 members,
             } => {
-                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                if req_seq == self.conv_req_seq
+                    && self.active_conv_key.as_deref() == Some(&conv_key)
+                {
                     self.loading_messages = false;
                     if !messages.is_empty() {
                         let prev_len = self.messages.len();
                         let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
                         merge_optimistic_messages(&mut self.messages, messages);
+                        clamp_chat_selection(
+                            self.messages.len(),
+                            &mut ui.chat_scroll.selected_idx,
+                        );
                         let appended_at_bottom = self.messages.len() > prev_len
                             || self.messages.last().map(|m| m.msg_id.as_str())
                                 != prev_last_id.as_deref();
@@ -3235,11 +3374,14 @@ impl AppState {
                 }
             }
             UiMsg::MembersLoaded {
+                req_seq,
                 conv_key,
                 members,
                 clear_loading,
             } => {
-                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                if req_seq == self.conv_req_seq
+                    && self.active_conv_key.as_deref() == Some(&conv_key)
+                {
                     if clear_loading {
                         self.loading_messages = false;
                     }
@@ -3249,26 +3391,37 @@ impl AppState {
                 }
             }
             UiMsg::ClipboardImageEncoded {
+                req_seq,
+                conv_key,
+                composer_target_thread,
                 width: _,
                 height: _,
                 file_name,
                 png_bytes,
                 preview,
             } => {
-                ui.composer.stage_inline_image_with_preview(
-                    png_bytes,
-                    "image/png",
-                    Some(file_name),
-                    preview,
-                );
-                ui.set_focus(Focus::Composer);
+                if req_seq == self.clipboard_paste_seq
+                    && self.active_conv_key == conv_key
+                    && ui.composer_target_thread == composer_target_thread
+                {
+                    ui.composer.stage_inline_image_with_preview(
+                        png_bytes,
+                        "image/png",
+                        Some(file_name),
+                        preview,
+                    );
+                    ui.set_focus(Focus::Composer);
+                }
             }
             UiMsg::OlderMessagesLoaded {
+                req_seq,
                 conv_key,
                 messages,
                 reached_eof,
             } => {
-                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                if req_seq == self.older_req_seq
+                    && self.active_conv_key.as_deref() == Some(&conv_key)
+                {
                     self.loading_older = false;
                     self.oldest_reached = reached_eof;
                     self.history_error = None;
@@ -3276,50 +3429,91 @@ impl AppState {
                 }
             }
             UiMsg::OlderMessagesFailed {
+                req_seq,
                 conv_key,
                 local_messages,
                 error,
             } => {
-                if self.active_conv_key.as_deref() == Some(&conv_key) {
+                if req_seq == self.older_req_seq
+                    && self.active_conv_key.as_deref() == Some(&conv_key)
+                {
                     self.loading_older = false;
                     self.history_error = Some(error);
                     self.prepend_older_messages(ui, local_messages);
                 }
             }
             UiMsg::OlderChatsLoaded {
-                conversations,
+                mut conversations,
                 reached_eof,
             } => {
                 self.loading_older_chats = false;
                 self.chats_oldest_reached = reached_eof;
                 if !conversations.is_empty() {
+                    let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
+                    self.apply_active_read_guard(&mut conversations);
                     self.conversations = conversations;
+                    preserve_nav_selection(self, ui, prev_row);
                 }
             }
             UiMsg::OlderChatsFailed => {
                 self.loading_older_chats = false;
             }
             UiMsg::ThreadLoaded {
+                req_seq,
                 conv_key,
                 root_msg_id,
-                thread,
+                mut thread,
             } => {
-                // Accepted for the fetch in flight (the root may not have been cached when the
-                // drawer opened) or for the thread on screen; anything else is a stale answer.
-                if self.thread_msg_is_current(&conv_key, &root_msg_id) {
+                // Accepted only for the latest in-flight thread request matching the active thread.
+                if req_seq == self.thread_req_seq
+                    && self.thread_msg_is_current(&conv_key, &root_msg_id)
+                {
                     self.loading_thread = false;
                     self.pending_thread = None;
+                    if let Some(existing) = self.active_thread.as_mut() {
+                        if existing.conv_key == thread.conv_key
+                            && existing.root.msg_id == thread.root.msg_id
+                        {
+                            merge_optimistic_messages(
+                                &mut existing.replies,
+                                std::mem::take(&mut thread.replies),
+                            );
+                            thread.replies = std::mem::take(&mut existing.replies);
+                        }
+                    }
+                    let target_reply_id = self.pending_thread_reply_id.take();
                     self.active_thread = Some(thread);
+                    if let (Some(target_id), Some(active)) =
+                        (target_reply_id.as_deref(), self.active_thread.as_ref())
+                    {
+                        if active.root.msg_id == target_id {
+                            ui.thread_scroll.selected_idx = Some(0);
+                            ui.pending_thread_reveal = true;
+                        } else if let Some(pos) =
+                            active.replies.iter().position(|r| r.msg_id == target_id)
+                        {
+                            ui.thread_scroll.selected_idx = Some(pos + 1);
+                            ui.pending_thread_reveal = true;
+                        }
+                    }
+                    clamp_thread_selection(
+                        self.active_thread.as_ref(),
+                        &mut ui.thread_scroll.selected_idx,
+                    );
                 }
             }
             UiMsg::ThreadLoadFailed {
+                req_seq,
                 conv_key,
                 root_msg_id,
                 error,
             } => {
-                if self.thread_msg_is_current(&conv_key, &root_msg_id) {
+                if req_seq == self.thread_req_seq
+                    && self.thread_msg_is_current(&conv_key, &root_msg_id)
+                {
                     self.loading_thread = false;
                     self.pending_thread = None;
+                    self.pending_thread_reply_id = None;
                     let has_cached = self
                         .active_thread
                         .as_ref()
@@ -3337,6 +3531,7 @@ impl AppState {
                 optimistic_id,
                 sent,
             } => {
+                self.update_conversation_preview_from_sent(&conv_key, &sent);
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     if let Some(pid) = parent_msg_id {
                         if let Some(thread) = self.active_thread.as_mut() {
@@ -3353,9 +3548,11 @@ impl AppState {
                                     } else if !thread.replies.iter().any(|r| r.msg_id == sent.msg_id)
                                     {
                                         thread.replies.push(sent);
+                                        ui.thread_scroll.bottom();
                                     }
                                 } else if !thread.replies.iter().any(|r| r.msg_id == sent.msg_id) {
                                     thread.replies.push(sent);
+                                    ui.thread_scroll.bottom();
                                 }
                             }
                         }
@@ -3390,21 +3587,43 @@ impl AppState {
                 text,
             } => {
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
-                    if let Some(pid) = parent_msg_id {
-                        if let Some(thread) = self.active_thread.as_mut() {
-                            if thread.root.msg_id == pid {
-                                thread.replies.retain(|r| r.msg_id != optimistic_id);
+                    if let Some(ref opt_id) = optimistic_id {
+                        if let Some(ref pid) = parent_msg_id {
+                            if let Some(thread) = self.active_thread.as_mut() {
+                                if &thread.root.msg_id == pid {
+                                    thread.replies.retain(|r| &r.msg_id != opt_id);
+                                }
                             }
+                            clamp_thread_selection(
+                                self.active_thread.as_ref(),
+                                &mut ui.thread_scroll.selected_idx,
+                            );
+                        } else {
+                            self.messages.retain(|m| &m.msg_id != opt_id);
+                            clamp_chat_selection(
+                                self.messages.len(),
+                                &mut ui.chat_scroll.selected_idx,
+                            );
                         }
-                    } else {
-                        self.messages.retain(|m| m.msg_id != optimistic_id);
                     }
-                    if ui.composer.text().trim().is_empty() {
-                        ui.composer.load_text(&text);
+                }
+                if !text.trim().is_empty() {
+                    let orig_draft_key = match parent_msg_id {
+                        Some(ref pid) => format!("{conv_key}#thread:{pid}"),
+                        None => conv_key.clone(),
+                    };
+                    if self.current_draft_key(ui).as_deref() == Some(orig_draft_key.as_str()) {
+                        if ui.composer.text().trim().is_empty() {
+                            ui.composer.load_text(&text);
+                        }
+                    } else if !self.drafts.contains_key(&orig_draft_key) {
+                        self.drafts.insert(orig_draft_key, text);
+                        self.persist_drafts();
                     }
                 }
             }
             UiMsg::AttachmentSent { conv_key, sent } => {
+                self.update_conversation_preview_from_sent(&conv_key, &sent);
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
                     if let Some(pid) = sent.parent_msg_id.clone() {
                         if let Some(thread) = self.active_thread.as_mut() {
@@ -3412,6 +3631,7 @@ impl AppState {
                                 && !thread.replies.iter().any(|r| r.msg_id == sent.msg_id)
                             {
                                 thread.replies.push(sent);
+                                ui.thread_scroll.bottom();
                             }
                         }
                         if let Some(root) = self.messages.iter_mut().find(|m| m.msg_id == pid) {
@@ -3437,9 +3657,7 @@ impl AppState {
                         if let Some(thread) = self.active_thread.as_mut() {
                             for r in &mut thread.replies {
                                 if r.msg_id == msg_id {
-                                    r.deleted = true;
-                                    r.body_html.clear();
-                                    r.body_plain = "(deleted message)".to_string();
+                                    mark_message_deleted_in_memory(r);
                                 }
                             }
                         }
@@ -3451,16 +3669,12 @@ impl AppState {
                     } else {
                         for m in &mut self.messages {
                             if m.msg_id == msg_id {
-                                m.deleted = true;
-                                m.body_html.clear();
-                                m.body_plain = "(deleted message)".to_string();
+                                mark_message_deleted_in_memory(m);
                             }
                         }
                         if let Some(thread) = self.active_thread.as_mut() {
                             if thread.root.msg_id == msg_id {
-                                thread.root.deleted = true;
-                                thread.root.body_html.clear();
-                                thread.root.body_plain = "(deleted message)".to_string();
+                                mark_message_deleted_in_memory(&mut thread.root);
                             }
                         }
                     }
@@ -3518,11 +3732,30 @@ impl AppState {
                 if self.search_query == query {
                     self.searching = false;
                     self.search_results = hits;
+                    if let Some(Overlay::Search(search)) = ui.overlays.last_mut() {
+                        if self.search_results.is_empty() {
+                            search.selected = 0;
+                        } else if search.selected >= self.search_results.len() {
+                            search.selected = self.search_results.len() - 1;
+                        }
+                    }
                 }
             }
-            UiMsg::UserSearchResults { query: _, users } => {
-                self.user_searching = false;
-                self.user_search_results = users;
+            UiMsg::UserSearchResults {
+                req_seq,
+                query,
+                users,
+            } => {
+                let query_matches_overlay = match ui.overlays.last() {
+                    Some(Overlay::NewChat(nc)) => {
+                        nc.peers_input.trim().eq_ignore_ascii_case(query.trim())
+                    }
+                    _ => true,
+                };
+                if req_seq == self.user_search_seq && query_matches_overlay {
+                    self.user_searching = false;
+                    self.user_search_results = users;
+                }
             }
             UiMsg::ChatCreated(conv) => {
                 if !self.conversations.iter().any(|c| c.conv_key == conv.conv_key) {
@@ -3593,9 +3826,16 @@ impl AppState {
                     ui.info("HTML content detected — opened in interactive HTML Preview");
                 }
             }
-            UiMsg::HtmlAttachmentLoaded { title, html } => {
-                ui.close_overlays_of(OverlayKind::HtmlPreview);
-                ui.push_overlay(Overlay::html_preview(Some(title), html));
+            UiMsg::HtmlAttachmentLoaded {
+                req_seq,
+                conv_key,
+                title,
+                html,
+            } => {
+                if req_seq == self.html_fetch_seq && self.active_conv_key == conv_key {
+                    ui.close_overlays_of(OverlayKind::HtmlPreview);
+                    ui.push_overlay(Overlay::html_preview(Some(title), html));
+                }
             }
             UiMsg::HtmlServed { url } => {
                 if let Some(Overlay::HtmlPreview(preview)) = ui.overlays.last_mut() {
@@ -3711,6 +3951,86 @@ impl AppState {
             ConversationKind::Meeting => "Meeting",
             ConversationKind::Channel => "Channel",
         }
+    }
+}
+
+fn mark_message_deleted_in_memory(msg: &mut MessageItem) {
+    msg.deleted = true;
+    msg.body_html.clear();
+    msg.body_plain = "(deleted message)".to_string();
+    msg.attachments.clear();
+    msg.reactions.clear();
+    msg.mentions.clear();
+    msg.subject = None;
+}
+
+fn clamp_chat_selection(messages_len: usize, selected_idx: &mut Option<usize>) {
+    if let Some(sel) = *selected_idx {
+        *selected_idx = if messages_len == 0 {
+            None
+        } else {
+            Some(sel.min(messages_len - 1))
+        };
+    }
+}
+
+fn clamp_thread_selection(thread: Option<&ThreadView>, selected_idx: &mut Option<usize>) {
+    let total = thread.map_or(0, |t| 1 + t.replies.len());
+    if let Some(sel) = *selected_idx {
+        *selected_idx = if total == 0 {
+            None
+        } else {
+            Some(sel.min(total - 1))
+        };
+    }
+}
+
+pub(crate) fn preserve_nav_selection(
+    app: &AppState,
+    ui: &mut UiState,
+    prev_row: Option<NavRow>,
+) {
+    let rows = nav_pane::nav_rows_cached(app, ui);
+    if rows.is_empty() {
+        ui.nav_selected = 0;
+        return;
+    }
+    if let Some(prev) = prev_row {
+        let matched = match prev {
+            NavRow::Chat { conv_key, .. } => rows.iter().position(
+                |r| matches!(r, NavRow::Chat { conv_key: k, .. } if k == &conv_key),
+            ),
+            NavRow::TeamChannel { conv_key, .. } => rows.iter().position(
+                |r| matches!(r, NavRow::TeamChannel { conv_key: k, .. } if k == &conv_key),
+            ),
+            NavRow::TeamHeader { team_id, .. } => rows.iter().position(
+                |r| matches!(r, NavRow::TeamHeader { team_id: t, .. } if t == &team_id),
+            ),
+            NavRow::ActivityMention {
+                conv_key, msg_id, ..
+            } => rows.iter().position(|r| {
+                matches!(
+                    r,
+                    NavRow::ActivityMention { conv_key: k, msg_id: m, .. }
+                        if k == &conv_key && m == &msg_id
+                )
+            }),
+            NavRow::SectionHeader { .. } => None,
+        };
+        if let Some(idx) = matched {
+            ui.nav_selected = idx;
+            return;
+        }
+    }
+    let clamped = ui.nav_selected.min(rows.len() - 1);
+    if rows[clamped].is_selectable() {
+        ui.nav_selected = clamped;
+    } else if let Some(fwd) = rows[clamped..].iter().position(NavRow::is_selectable) {
+        ui.nav_selected = clamped + fwd;
+    } else if let Some(bwd) = rows[..clamped].iter().rposition(NavRow::is_selectable) {
+        ui.nav_selected = bwd;
+    } else {
+        ui.nav_selected = 0;
     }
 }
 
@@ -3935,6 +4255,7 @@ pub(super) mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::MessagesLoaded {
+                req_seq: app.conv_req_seq,
                 conv_key: "chat:room-b".to_string(),
                 messages: vec![stale_msg.clone()],
                 members: Vec::new(),
@@ -3947,6 +4268,7 @@ pub(super) mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::MessagesLoaded {
+                req_seq: app.conv_req_seq,
                 conv_key: "chat:room-a".to_string(),
                 messages: vec![stale_msg],
                 members: Vec::new(),
@@ -3999,7 +4321,7 @@ pub(super) mod tests {
             UiMsg::MessageSendFailed {
                 conv_key: "chat:c1".to_string(),
                 parent_msg_id: None,
-                optimistic_id: failed_opt_id,
+                optimistic_id: Some(failed_opt_id),
                 text: "retry me".to_string(),
             },
         );
@@ -4134,12 +4456,14 @@ pub(super) mod tests {
                 replies: vec![reply],
             }
         };
-        let loaded = |root_id: &str| UiMsg::ThreadLoaded {
+        let loaded = |req_seq: u64, root_id: &str| UiMsg::ThreadLoaded {
+            req_seq,
             conv_key: conv.to_string(),
             root_msg_id: root_id.to_string(),
             thread: thread(root_id),
         };
-        let failed = |root_id: &str| UiMsg::ThreadLoadFailed {
+        let failed = |req_seq: u64, root_id: &str| UiMsg::ThreadLoadFailed {
+            req_seq,
             conv_key: conv.to_string(),
             root_msg_id: root_id.to_string(),
             error: "503 Service Unavailable".to_string(),
@@ -4148,10 +4472,11 @@ pub(super) mod tests {
 
         // 1) Uncached root, then the answer arrives.
         app.open_thread_by_id(&mut ui, "root-a".to_string());
+        let seq_a = app.thread_req_seq;
         assert!(app.loading_thread);
         assert!(app.active_thread.is_none());
         assert_eq!(app.pending_thread, Some((conv.to_string(), "root-a".to_string())));
-        app.handle_ui_msg(&mut ui, loaded("root-a"));
+        app.handle_ui_msg(&mut ui, loaded(seq_a, "root-a"));
         assert!(!app.loading_thread);
         assert!(app.pending_thread.is_none());
         assert_eq!(shown(&app).as_deref(), Some("root-a"));
@@ -4159,13 +4484,14 @@ pub(super) mod tests {
         // 2) Another uncached root: the previous thread is not shown under it, and a late
         //    answer for the thread the user left is dropped.
         app.open_thread_by_id(&mut ui, "root-b".to_string());
+        let seq_b = app.thread_req_seq;
         assert!(app.active_thread.is_none());
-        app.handle_ui_msg(&mut ui, loaded("root-a"));
+        app.handle_ui_msg(&mut ui, loaded(seq_a, "root-a"));
         assert!(app.active_thread.is_none());
         assert!(app.loading_thread);
 
         // 3) The fetch fails with nothing to show: loading ends, drawer closes, error shown.
-        app.handle_ui_msg(&mut ui, failed("root-b"));
+        app.handle_ui_msg(&mut ui, failed(seq_b, "root-b"));
         assert!(!app.loading_thread);
         assert!(app.pending_thread.is_none());
         assert!(app.active_thread.is_none());
@@ -4181,8 +4507,9 @@ pub(super) mod tests {
         rows.extend(cached.replies.clone());
         app.storage.upsert_messages(&rows).unwrap();
         app.open_thread_by_id(&mut ui, "root-c".to_string());
+        let seq_c = app.thread_req_seq;
         assert_eq!(shown(&app).as_deref(), Some("root-c"));
-        app.handle_ui_msg(&mut ui, failed("root-c"));
+        app.handle_ui_msg(&mut ui, failed(seq_c, "root-c"));
         assert!(!app.loading_thread);
         assert!(ui.thread_drawer_open);
         assert_eq!(shown(&app).as_deref(), Some("root-c"));
@@ -4190,6 +4517,7 @@ pub(super) mod tests {
         // 5) Switching conversation drops the answer of the fetch in flight.
         app.close_thread(&mut ui);
         app.open_thread_by_id(&mut ui, "root-d".to_string());
+        let seq_d = app.thread_req_seq;
         seed_root_messages(&app, "chat:other", 3);
         app.select_conversation(
             &mut ui,
@@ -4199,7 +4527,7 @@ pub(super) mod tests {
         );
         assert!(app.pending_thread.is_none());
         assert!(!app.loading_thread);
-        app.handle_ui_msg(&mut ui, loaded("root-d"));
+        app.handle_ui_msg(&mut ui, loaded(seq_d, "root-d"));
         assert!(app.active_thread.is_none());
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
@@ -4223,6 +4551,7 @@ pub(super) mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::OlderMessagesLoaded {
+                req_seq: app.older_req_seq,
                 conv_key: conv.to_string(),
                 messages: vec![
                     make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two"),
@@ -4257,6 +4586,7 @@ pub(super) mod tests {
         app.handle_ui_msg(
             &mut ui,
             UiMsg::OlderMessagesFailed {
+                req_seq: app.older_req_seq,
                 conv_key: conv.to_string(),
                 local_messages: vec![make_test_msg(conv, "m2", "2026-11-18T02:00:00Z", "two")],
                 error: err_msg.clone(),
@@ -5283,6 +5613,219 @@ pub(super) mod tests {
             crate::ui::nav_pane::NavRow::TeamChannel { conv_key, unread: 1, .. }
             if conv_key == &bg_chan_key
         )));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn async_loader_seq_guards_and_thread_optimistic_merge() {
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chan:t1:ch1";
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(ConversationTarget::Channel {
+            team_id: "t1".into(),
+            channel_id: "ch1".into(),
+        });
+
+        // 1) UserSearchResults: stale seq or mismatched NewChat query must be ignored.
+        app.user_search_seq = 5;
+        app.user_searching = true;
+        let mut nc = super::super::overlays::new_chat::NewChatState::new();
+        nc.peers_input = "bob".into();
+        ui.push_overlay(Overlay::NewChat(nc));
+        let alice = UserProfile {
+            id: "u1".into(),
+            display_name: "Alice".into(),
+            mail: None,
+            user_principal_name: None,
+        };
+        let bob = UserProfile {
+            id: "u2".into(),
+            display_name: "Bob".into(),
+            mail: None,
+            user_principal_name: None,
+        };
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::UserSearchResults {
+                req_seq: 4,
+                query: "bob".into(),
+                users: vec![alice.clone()],
+            },
+        );
+        assert!(app.user_searching);
+        assert!(app.user_search_results.is_empty());
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::UserSearchResults {
+                req_seq: 5,
+                query: "alice".into(),
+                users: vec![alice],
+            },
+        );
+        assert!(app.user_searching);
+        assert!(app.user_search_results.is_empty());
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::UserSearchResults {
+                req_seq: 5,
+                query: "bob".into(),
+                users: vec![bob],
+            },
+        );
+        assert!(!app.user_searching);
+        assert_eq!(app.user_search_results.len(), 1);
+        assert_eq!(app.user_search_results[0].id, "u2");
+        ui.overlays.clear();
+
+        // 2) ThreadLoaded: stale req_seq ignored; current req_seq merges optimistic replies & reveals target reply_id.
+        let root = make_test_msg(conv, "root-1", "2026-11-20T00:00:00Z", "root");
+        let mut opt_reply = make_test_msg(conv, "optimistic-1", "2026-11-20T00:05:00Z", "pending");
+        opt_reply.parent_msg_id = Some("root-1".into());
+        app.messages = vec![root.clone()];
+        app.open_thread_by_id_with_reply(&mut ui, "root-1".into(), Some("rep-2".into()));
+        let seq = app.thread_req_seq;
+        app.active_thread.as_mut().unwrap().replies.push(opt_reply);
+
+        let mut rep1 = make_test_msg(conv, "rep-1", "2026-11-20T00:01:00Z", "first");
+        rep1.parent_msg_id = Some("root-1".into());
+        let mut rep2 = make_test_msg(conv, "rep-2", "2026-11-20T00:02:00Z", "target");
+        rep2.parent_msg_id = Some("root-1".into());
+        let fetched = ThreadView {
+            conv_key: conv.to_string(),
+            root: root.clone(),
+            replies: vec![rep1, rep2],
+        };
+
+        // Stale seq must be rejected.
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ThreadLoaded {
+                req_seq: seq - 1,
+                conv_key: conv.to_string(),
+                root_msg_id: "root-1".into(),
+                thread: fetched.clone(),
+            },
+        );
+        assert!(app.loading_thread);
+
+        // Current seq merges optimistic reply AND selects/reveals rep-2 (index 1 + 1 = 2).
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ThreadLoaded {
+                req_seq: seq,
+                conv_key: conv.to_string(),
+                root_msg_id: "root-1".into(),
+                thread: fetched,
+            },
+        );
+        assert!(!app.loading_thread);
+        let reply_ids: Vec<&str> = app
+            .active_thread
+            .as_ref()
+            .unwrap()
+            .replies
+            .iter()
+            .map(|r| r.msg_id.as_str())
+            .collect();
+        assert_eq!(reply_ids, vec!["rep-1", "rep-2", "optimistic-1"]);
+        assert_eq!(ui.thread_scroll.selected_idx, Some(2));
+        assert!(ui.pending_thread_reveal);
+
+        // 3) ClipboardImageEncoded & HtmlAttachmentLoaded with stale seq/conv_key are ignored.
+        app.clipboard_paste_seq = 10;
+        app.html_fetch_seq = 20;
+        ui.set_focus(Focus::Chat);
+        let target_thread = ui.composer_target_thread;
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ClipboardImageEncoded {
+                req_seq: 9,
+                conv_key: Some(conv.to_string()),
+                composer_target_thread: target_thread,
+                width: 10,
+                height: 10,
+                file_name: "stale.png".into(),
+                png_bytes: vec![1, 2, 3],
+                preview: None,
+            },
+        );
+        assert!(ui.composer.pending_images.is_empty());
+        assert_eq!(ui.focus(), Focus::Chat);
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::HtmlAttachmentLoaded {
+                req_seq: 20,
+                conv_key: Some("chat:other".into()),
+                title: "stale".into(),
+                html: "<p>stale</p>".into(),
+            },
+        );
+        assert!(ui.overlays.is_empty());
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn message_deleted_clears_metadata_and_failed_send_restores_original_target() {
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chan:t1:ch1";
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(ConversationTarget::Channel {
+            team_id: "t1".into(),
+            channel_id: "ch1".into(),
+        });
+        let mut msg = make_test_msg(conv, "m1", "2026-11-20T00:00:00Z", "with att");
+        msg.subject = Some("Sub".into());
+        msg.attachments.push(AttachmentInfo {
+            id: "a1".into(),
+            content_type: "application/pdf".into(),
+            content_url: None,
+            name: Some("doc.pdf".into()),
+            content_json: None,
+            thumbnail_url: None,
+        });
+        app.messages = vec![msg];
+
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageDeleted {
+                conv_key: conv.to_string(),
+                msg_id: "m1".into(),
+                parent_msg_id: None,
+            },
+        );
+        assert!(app.messages[0].deleted);
+        assert!(app.messages[0].attachments.is_empty());
+        assert!(app.messages[0].reactions.is_empty());
+        assert!(app.messages[0].mentions.is_empty());
+        assert!(app.messages[0].subject.is_none());
+        assert!(
+            super::super::overlays::attachments::rows_from(&app.messages, MessageScope::Chat)
+                .is_empty()
+        );
+
+        // Failed thread reply while user is now in main composer must NOT clobber main composer;
+        // it must restore into the thread draft key instead.
+        ui.composer_target_thread = false;
+        ui.composer.load_text("");
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::MessageSendFailed {
+                conv_key: conv.to_string(),
+                parent_msg_id: Some("root-9".into()),
+                optimistic_id: None,
+                text: "caption for failed thread image".into(),
+            },
+        );
+        assert!(ui.composer.text().is_empty());
+        assert_eq!(
+            app.drafts.get(&format!("{conv}#thread:root-9")).map(String::as_str),
+            Some("caption for failed thread image")
+        );
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

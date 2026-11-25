@@ -499,7 +499,8 @@ impl GraphClient {
         }
         .conv_key();
 
-        let top = limit.clamp(1, 50);
+        const MAX_THREAD_REPLY_PAGES: usize = 20;
+        let top = 50usize;
         let mut next_url = Some(format!(
             "/teams/{}/channels/{}/messages/{}/replies?$top={top}",
             urlencoding::encode(team_id),
@@ -508,8 +509,11 @@ impl GraphClient {
         ));
         let mut replies = Vec::new();
         let mut seen_ids = HashSet::new();
+        let mut pages_fetched = 0usize;
+        let max_pages = limit.saturating_add(49).div_ceil(50).max(MAX_THREAD_REPLY_PAGES);
 
         while let Some(url) = next_url.take() {
+            pages_fetched += 1;
             let page: GraphListPage<GraphChatMessage> = self.get_json(&url).await?;
             for raw in page.value {
                 let normalized = normalize_chat_message(
@@ -527,7 +531,7 @@ impl GraphClient {
                 .next_link
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            if replies.len() >= limit {
+            if pages_fetched >= max_pages {
                 break;
             }
         }
@@ -1299,5 +1303,71 @@ mod tests {
             .unwrap();
         let reply_ids: Vec<&str> = replies.iter().map(|m| m.msg_id.as_str()).collect();
         assert_eq!(reply_ids, vec!["rep-2a", "rep-2b", "rep-2c"]);
+    }
+
+    #[tokio::test]
+    async fn fetch_thread_replies_walks_oldest_first_pages_to_return_latest() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use std::collections::HashMap;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let page2_url = format!("{base}/teams/t1/channels/ch1/messages/root-1/replies?page=2");
+        let p2_clone = page2_url.clone();
+
+        let router = Router::new().route(
+            "/v1.0/teams/t1/channels/ch1/messages/root-1/replies",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let next = p2_clone.clone();
+                async move {
+                    let is_p2 = q.get("page").map(String::as_str) == Some("2");
+                    let (start, end) = if is_p2 { (50usize, 60usize) } else { (0usize, 50usize) };
+                    let vals: Vec<serde_json::Value> = (start..end)
+                        .map(|i| {
+                            serde_json::json!({
+                                "id": format!("rep-{i:02}"),
+                                "messageType": "message",
+                                "createdDateTime": format!("2026-11-20T10:{:02}:00Z", i),
+                                "from": { "user": { "id": "u1", "displayName": "Alice" } },
+                                "body": { "contentType": "text", "content": format!("reply {i}") }
+                            })
+                        })
+                        .collect();
+                    if is_p2 {
+                        Json(serde_json::json!({ "value": vals }))
+                    } else {
+                        Json(serde_json::json!({ "value": vals, "@odata.nextLink": next }))
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = base;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1");
+
+        let replies = client
+            .list_thread_replies("t1", "ch1", "root-1", 50)
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 50);
+        assert_eq!(replies.first().unwrap().msg_id, "rep-10");
+        assert_eq!(replies.last().unwrap().msg_id, "rep-59");
     }
 }

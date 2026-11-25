@@ -73,7 +73,10 @@ impl ContextMenu {
                         .active_conversation()
                         .is_some_and(|c| c.kind == ConversationKind::Channel)
                     && msg.is_some_and(|m| m.parent_msg_id.is_none());
-                let has_attach = msg.is_some_and(|m| !m.attachments.is_empty());
+                let eff_att_len = msg
+                    .filter(|m| !m.deleted)
+                    .map_or(0, |m| m.effective_attachments().len());
+                let has_attach = eff_att_len > 0;
                 let is_me = msg.is_some_and(|m| m.is_me);
 
                 let mut items = Vec::new();
@@ -107,7 +110,7 @@ impl ContextMenu {
                 items.push(MenuItem::new(
                     "Extract Links (URLs)",
                     Some("u"),
-                    Action::OpenLinks,
+                    Action::OpenLinksForMessage { scope, msg_index },
                 ));
                 items.push(MenuItem::new(
                     "Toggle Inline Link URLs",
@@ -115,9 +118,7 @@ impl ContextMenu {
                     Action::ToggleShowHrefs,
                 ));
                 if has_attach {
-                    let attach_index = ui.attach_index.min(
-                        msg.map_or(0, |m| m.attachments.len().saturating_sub(1)),
-                    );
+                    let attach_index = ui.attach_index.min(eff_att_len.saturating_sub(1));
                     items.push(MenuItem::new(
                         "Download Attachment",
                         Some("d"),
@@ -241,12 +242,21 @@ impl ContextMenu {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
-        for (index, item) in self.items.iter().enumerate() {
-            if index as u16 >= inner.height {
+        let visible = inner.height as usize;
+        if visible == 0 || self.items.is_empty() {
+            return;
+        }
+        let active_sel = self.selected.min(self.items.len().saturating_sub(1));
+        let skip = active_sel
+            .saturating_sub(visible.saturating_sub(1))
+            .min(self.items.len().saturating_sub(visible));
+        for slot in 0..visible {
+            let index = skip + slot;
+            let Some(item) = self.items.get(index) else {
                 break;
-            }
-            let row = inner.y + index as u16;
-            let selected = index == self.selected;
+            };
+            let row = inner.y + slot as u16;
+            let selected = index == active_sel;
             let label_style = if selected {
                 theme.selection().remove_modifier(Modifier::BOLD)
             } else {

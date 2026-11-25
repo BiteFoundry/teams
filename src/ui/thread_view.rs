@@ -178,6 +178,11 @@ pub fn draw(
     let height = body_area.height as usize;
     ui.thread_scroll.total_lines = cached.lines.len();
     ui.thread_scroll.clamp_to_viewport(height);
+    if std::mem::take(&mut ui.pending_thread_reveal) {
+        if let Some(idx) = ui.thread_scroll.selected_idx {
+            ui.thread_scroll.ensure_visible(idx, height);
+        }
+    }
     let offset = ui.thread_scroll.offset(height);
     ui.thread_scroll.offset = offset;
 

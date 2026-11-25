@@ -191,6 +191,10 @@ pub enum Action {
 
     // Links & href visibility
     OpenLinks,
+    OpenLinksForMessage {
+        scope: MessageScope,
+        msg_index: usize,
+    },
     OpenUrl(String),
     ToggleShowHrefs,
 
@@ -264,7 +268,21 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
     }
 
     if let Action::OpenContextMenuAt { column, row } = action {
-        open_context_menu_at(column, row, app, ui);
+        if ui.overlays.is_empty()
+            || ui
+                .overlays
+                .last()
+                .is_some_and(|o| o.kind() == OverlayKind::ContextMenu)
+        {
+            open_context_menu_at(column, row, app, ui);
+        }
+        return false;
+    }
+
+    if let Action::OverlaySelect(index) = action {
+        if let Some(top) = ui.overlays.last_mut() {
+            top.select(index);
+        }
         return false;
     }
 
@@ -281,7 +299,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
             OverlayOutcome::Dispatch(next) => {
                 ui.overlays.push(top);
-                return dispatch(next, app, ui);
+                return dispatch_without_overlay(next, app, ui);
             }
             OverlayOutcome::CloseAndDispatch(next) => {
                 return dispatch(next, app, ui);
@@ -292,8 +310,36 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
     }
 
+    dispatch_without_overlay(action, app, ui)
+}
+
+fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
+    if matches!(action, Action::Quit) {
+        app.stash_draft(ui);
+        return true;
+    }
+
+    if let Action::Click { column, row } = action {
+        return handle_click(column, row, app, ui);
+    }
+
+    if let Action::OpenContextMenuAt { column, row } = action {
+        if ui.overlays.is_empty()
+            || ui
+                .overlays
+                .last()
+                .is_some_and(|o| o.kind() == OverlayKind::ContextMenu)
+        {
+            open_context_menu_at(column, row, app, ui);
+        }
+        return false;
+    }
+
     // Mention popup interception while typing in the composer.
-    if matches!(ui.focus(), Focus::Composer) && ui.composer.mention_active() {
+    if ui.overlays.is_empty()
+        && matches!(ui.focus(), Focus::Composer)
+        && ui.composer.mention_active()
+    {
         match action {
             Action::MoveUp | Action::CursorUp => {
                 ui.composer.mention_prev();
@@ -301,6 +347,14 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
             Action::MoveDown | Action::CursorDown => {
                 ui.composer.mention_next();
+                return false;
+            }
+            Action::MouseScroll { delta, .. } => {
+                if delta < 0 {
+                    ui.composer.mention_prev();
+                } else if delta > 0 {
+                    ui.composer.mention_next();
+                }
                 return false;
             }
             Action::AcceptMention | Action::Tab | Action::Activate => {
@@ -480,9 +534,10 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             }
         }
         Action::TogglePinSelected => {
-            let conv_key = match nav_pane::nav_row_at(app, ui, ui.nav_selected) {
+            let prev_row = nav_pane::nav_row_at(app, ui, ui.nav_selected);
+            let conv_key = match prev_row.as_ref() {
                 Some(NavRow::Chat { conv_key, .. })
-                | Some(NavRow::TeamChannel { conv_key, .. }) => Some(conv_key),
+                | Some(NavRow::TeamChannel { conv_key, .. }) => Some(conv_key.clone()),
                 _ => None,
             };
             if let Some(key) = conv_key {
@@ -499,6 +554,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == key) {
                     conv.pinned = pinned_now;
                 }
+                super::app::preserve_nav_selection(app, ui, prev_row);
                 ui.info(if pinned_now {
                     "Pinned conversation"
                 } else {
@@ -565,13 +621,21 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                     ui.set_focus(Focus::Chat);
                 }
             }
-            MessageScope::ThreadRoot | MessageScope::ThreadReply => {
-                ui.thread_scroll.selected_idx = Some(match scope {
-                    MessageScope::ThreadRoot => 0,
-                    MessageScope::ThreadReply => msg_index + 1,
-                    MessageScope::Chat => unreachable!(),
-                });
-                ui.set_focus(Focus::Thread);
+            MessageScope::ThreadRoot => {
+                if app.active_thread.is_some() {
+                    ui.thread_scroll.selected_idx = Some(0);
+                    ui.set_focus(Focus::Thread);
+                }
+            }
+            MessageScope::ThreadReply => {
+                if app
+                    .active_thread
+                    .as_ref()
+                    .is_some_and(|t| msg_index < t.replies.len())
+                {
+                    ui.thread_scroll.selected_idx = Some(msg_index + 1);
+                    ui.set_focus(Focus::Thread);
+                }
             }
         },
         Action::MoveUp => move_selection(app, ui, -1),
@@ -636,6 +700,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
 
         // Composer
         Action::OpenComposer => {
+            ui.composer.subject_focused = false;
             ui.set_focus(Focus::Composer);
         }
         Action::ToggleSubject => {
@@ -655,7 +720,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::FocusSubject => {
             ui.show_subject = true;
-            ui.composer.subject_focused = !ui.composer.subject_focused;
+            ui.composer.subject_focused = true;
             ui.set_focus(Focus::Composer);
         }
         Action::SendMessage => {
@@ -952,7 +1017,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some((scope, msg_index)) = selected_message_scope_and_index(app, ui) {
                 if app
                     .message_at(scope, msg_index)
-                    .is_some_and(|m| !m.effective_attachments().is_empty())
+                    .is_some_and(|m| !m.deleted && !m.effective_attachments().is_empty())
                 {
                     app.download_attachment(ui, scope, msg_index, 0);
                     return false;
@@ -963,7 +1028,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, m)| !m.effective_attachments().is_empty())
+                .find(|(_, m)| !m.deleted && !m.effective_attachments().is_empty())
             {
                 app.download_attachment(ui, MessageScope::Chat, idx, 0);
             } else {
@@ -997,6 +1062,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::OpenLinks => {
             open_links_overlay(app, ui);
         }
+        Action::OpenLinksForMessage { scope, msg_index } => {
+            open_links_overlay_for_message(scope, msg_index, app, ui);
+        }
         Action::OpenUrl(url) => match open_url_decision(&url) {
             Err(reason) => ui.error(reason),
             Ok(()) => match open::that_detached(url.trim()) {
@@ -1022,6 +1090,9 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         }
         Action::OpenSearchWithQuery(query) => {
             ui.close_overlays_of(OverlayKind::Search);
+            app.search_results.clear();
+            app.search_query.clear();
+            app.searching = false;
             let mut search = SearchOverlay::default();
             search.query = query.clone();
             ui.push_overlay(Overlay::Search(search));
@@ -1034,7 +1105,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
                 if let Some(target) = ConversationTarget::from_conv_key(&hit.conv_key) {
                     app.select_conversation(ui, target);
                     if let Some(root) = hit.parent_msg_id {
-                        app.open_thread_by_id(ui, root);
+                        app.open_thread_by_id_with_reply(ui, root, Some(hit.msg_id));
                     } else {
                         app.reveal_message(ui, &hit.msg_id, &hit.created_at);
                     }
@@ -1059,6 +1130,8 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
         Action::MarkActiveRead => {
             if let Some(conv_key) = app.active_conv_key.clone() {
                 let now_ts = Utc::now().to_rfc3339();
+                app.active_marked_read_at = Some((conv_key.clone(), now_ts.clone()));
+                ui.unread_anchor = None;
                 if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
                     conv.unread_count = 0;
                     conv.last_read_at = Some(now_ts.clone());
@@ -1198,7 +1271,7 @@ pub fn dispatch(action: Action, app: &mut AppState, ui: &mut UiState) -> bool {
             if let Some(Overlay::ImagePreview(preview)) = ui.overlays.last_mut() {
                 preview.error = None;
             }
-            let _ = dispatch(Action::LoadPreviewImage, app, ui);
+            let _ = dispatch_without_overlay(Action::LoadPreviewImage, app, ui);
         }
         Action::DownloadPreviewImage => {
             let current = ui.overlays.last().and_then(|top| {
@@ -1315,7 +1388,12 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
         }
         OverlayKind::CommandPalette => Overlay::command_palette(),
         OverlayKind::Settings => Overlay::settings(),
-        OverlayKind::Search => Overlay::Search(SearchOverlay::default()),
+        OverlayKind::Search => {
+            app.search_results.clear();
+            app.search_query.clear();
+            app.searching = false;
+            Overlay::Search(SearchOverlay::default())
+        }
         OverlayKind::Presence => Overlay::presence(),
         OverlayKind::Reactions => {
             let (scope, idx) =
@@ -1329,7 +1407,12 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
             open_links_overlay(app, ui);
             return;
         }
-        OverlayKind::NewChat => Overlay::new_chat(),
+        OverlayKind::NewChat => {
+            app.user_search_seq = app.user_search_seq.wrapping_add(1);
+            app.user_searching = false;
+            app.user_search_results.clear();
+            Overlay::new_chat()
+        }
         OverlayKind::RoomInfo => Overlay::room_info(),
         OverlayKind::ImagePreview => {
             open_image_preview(app, ui);
@@ -1381,6 +1464,7 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
     let thread_preview = if in_thread_context {
         selected_thread_scope_and_index(app, ui)
             .and_then(|(scope, idx)| app.message_at(scope, idx))
+            .filter(|msg| !msg.deleted)
             .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
             .or_else(|| {
                 app.active_thread.as_ref().and_then(|thread| {
@@ -1389,6 +1473,7 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
                         .iter()
                         .rev()
                         .chain(std::iter::once(&thread.root))
+                        .filter(|msg| !msg.deleted)
                         .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
                 })
             })
@@ -1400,12 +1485,14 @@ fn open_image_preview(app: &mut AppState, ui: &mut UiState) {
         .or_else(|| {
             selected_message_scope_and_index(app, ui)
                 .and_then(|(scope, idx)| app.message_at(scope, idx))
+                .filter(|msg| !msg.deleted)
                 .and_then(|msg| ImagePreviewOverlay::from_teams_message(msg, Some(ui.attach_index)))
         })
         .or_else(|| {
             app.messages
                 .iter()
                 .rev()
+                .filter(|msg| !msg.deleted)
                 .find_map(|msg| ImagePreviewOverlay::from_teams_message(msg, None))
         });
 
@@ -1447,6 +1534,10 @@ fn open_html_preview_for_message(
         ui.info("No message selected for HTML preview");
         return;
     };
+    if msg.deleted {
+        ui.info("Cannot preview a deleted message");
+        return;
+    }
 
     let eff = msg.effective_attachments();
     if let Some(html_att) = eff
@@ -1486,6 +1577,28 @@ fn serve_active_html_preview(app: &mut AppState, ui: &mut UiState) {
         return;
     };
     app.serve_html_preview(ui, title, html);
+}
+
+fn open_links_overlay_for_message(
+    scope: MessageScope,
+    msg_index: usize,
+    app: &AppState,
+    ui: &mut UiState,
+) {
+    let Some(msg) = app.message_at(scope, msg_index).filter(|m| !m.deleted) else {
+        ui.info("No links found in focused message");
+        return;
+    };
+    let extracted = links::extract_links_from_message(msg);
+    if extracted.is_empty() {
+        ui.info("No links found in focused message");
+        return;
+    }
+    ui.close_overlays_of(OverlayKind::Links);
+    ui.push_overlay(Overlay::links(LinksOverlay::new(
+        extracted,
+        msg.author_name.clone(),
+    )));
 }
 
 fn open_links_overlay(app: &AppState, ui: &mut UiState) {
@@ -1883,7 +1996,9 @@ fn handle_mouse_scroll(app: &mut AppState, ui: &mut UiState, delta: i32, column:
     if ui.nav_area.contains(pos) {
         move_nav_selection(app, ui, delta);
     } else if ui.thread_drawer_open
-        && (ui.thread_scroll.area.contains(pos) || ui.thread_composer_area.contains(pos))
+        && (ui.thread_scroll.area.contains(pos)
+            || ui.thread_composer_area.contains(pos)
+            || (ui.chat_scroll.area.width == 0 && ui.thread_scroll.area.width > 0))
     {
         if delta < 0 {
             ui.thread_scroll.scroll_up((-delta) as u16);
@@ -1935,20 +2050,46 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
     if !ui.overlays.is_empty() {
         match target {
             Some(HitTarget::OverlayItem { index }) => {
-                let is_ctx = ui
-                    .overlays
-                    .last()
-                    .is_some_and(|o| o.kind() == OverlayKind::ContextMenu);
+                let clicked_target = HitTarget::OverlayItem { index };
+                let now = Instant::now();
+                let should_activate = match ui.overlays.last() {
+                    Some(Overlay::FilePicker(picker)) => {
+                        match picker.mode {
+                            super::overlays::file_picker::PickerMode::ZoxideJump => true,
+                            super::overlays::file_picker::PickerMode::Browse => {
+                                let is_dir = picker
+                                    .filtered_entries()
+                                    .get(index)
+                                    .is_some_and(|e| e.is_dir);
+                                if is_dir {
+                                    true
+                                } else {
+                                    let was_selected = picker.selected == index;
+                                    let is_repeat_click = ui.last_click.is_some_and(
+                                        |(_, _, _, prev_hit)| prev_hit == clicked_target,
+                                    );
+                                    was_selected && is_repeat_click
+                                }
+                            }
+                        }
+                    }
+                    Some(_) => true,
+                    None => false,
+                };
                 dispatch(Action::OverlaySelect(index), app, ui);
-                if is_ctx {
+                if should_activate {
+                    ui.last_click = None;
                     return dispatch(Action::Activate, app, ui);
                 }
+                ui.last_click = Some((now, column, row, clicked_target));
                 return false;
             }
             Some(HitTarget::Button(ButtonId::ConfirmOk)) => {
+                ui.last_click = None;
                 return dispatch(Action::Activate, app, ui);
             }
             Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
+                ui.last_click = None;
                 ui.close_top_overlay();
                 return false;
             }
@@ -1972,6 +2113,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
             }
             // Clicking outside the modal (either empty background or an underlying pane target) closes the top overlay.
             _ => {
+                ui.last_click = None;
                 ui.close_top_overlay();
                 return false;
             }
@@ -1998,6 +2140,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 ui.composer_target_thread = true;
                 app.restore_draft(ui);
             }
+            ui.composer.subject_focused = false;
             return dispatch(Action::OpenComposer, app, ui);
         }
         if hit == HitTarget::Composer {
@@ -2006,6 +2149,7 @@ fn handle_click(column: u16, row: u16, app: &mut AppState, ui: &mut UiState) -> 
                 ui.composer_target_thread = false;
                 app.restore_draft(ui);
             }
+            ui.composer.subject_focused = false;
             return dispatch(Action::OpenComposer, app, ui);
         }
 
@@ -2172,6 +2316,9 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
         })
         | Some(HitTarget::Reaction {
             scope, msg_index, ..
+        })
+        | Some(HitTarget::InlineAction {
+            scope, msg_index, ..
         }) => ContextTarget::Message { scope, msg_index },
         Some(HitTarget::OpenThread { msg_index }) => ContextTarget::Message {
             scope: MessageScope::Chat,
@@ -2183,6 +2330,18 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
         _ => ContextTarget::Global,
     };
     ui.close_overlays_of(OverlayKind::ContextMenu);
+    match ctx {
+        ContextTarget::Message { scope, msg_index } => {
+            let _ = dispatch(Action::SelectMessage { scope, msg_index }, app, ui);
+        }
+        ContextTarget::NavRow(idx) => {
+            if idx < nav_pane::nav_row_count(app, ui) {
+                ui.nav_selected = idx;
+                ui.set_focus(Focus::Nav);
+            }
+        }
+        ContextTarget::Composer | ContextTarget::Global => {}
+    }
     let menu = ContextMenu::build(ctx, (column, row), app, ui);
     ui.push_overlay(Overlay::context_menu(menu));
 }
@@ -2276,6 +2435,10 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                 ui.tasks.begin(task_label.clone());
                 ui.set_focus(Focus::Composer);
                 ui.info(format!("Encoding clipboard image ({width}x{height})…"));
+                app.clipboard_paste_seq = app.clipboard_paste_seq.wrapping_add(1);
+                let req_seq = app.clipboard_paste_seq;
+                let paste_conv_key = app.active_conv_key.clone();
+                let paste_target_thread = ui.composer_target_thread;
                 let tx = app.ui_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     match save_pasted_png_in_dir(&temp_dir, width, height, rgba, unix_ms) {
@@ -2297,6 +2460,9 @@ fn paste_clipboard(app: &mut AppState, ui: &mut UiState) {
                                 saved_path.display()
                             );
                             let _ = tx.send(super::app::UiMsg::ClipboardImageEncoded {
+                                req_seq,
+                                conv_key: paste_conv_key,
+                                composer_target_thread: paste_target_thread,
                                 width,
                                 height,
                                 file_name,
@@ -3611,6 +3777,271 @@ mod tests {
         assert!(matches!(
             ui.overlays.last(),
             Some(Overlay::HtmlPreview(p)) if p.raw_html().contains("Attached report")
+        ));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn overlay_item_click_activates_list_overlays_and_file_picker_guards_files() {
+        let (mut app, mut ui) = crate::ui::app::tests::make_test_app();
+
+        // 1) Settings overlay: single-click row 0 toggles notify immediately.
+        let before_notify = ui.notify;
+        ui.push_overlay(Overlay::settings());
+        ui.hitmap.clear();
+        ui.hitmap.add_line(5, 5, 30, HitTarget::OverlayItem { index: 0 });
+        dispatch(Action::Click { column: 10, row: 5 }, &mut app, &mut ui);
+        assert_ne!(ui.notify, before_notify, "Settings click must activate row");
+        ui.overlays.clear();
+
+        // 2) Presence overlay: single-click row 1 closes & sets presence.
+        ui.push_overlay(Overlay::presence());
+        ui.hitmap.clear();
+        ui.hitmap.add_line(5, 6, 30, HitTarget::OverlayItem { index: 1 });
+        dispatch(Action::Click { column: 10, row: 6 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty(), "Presence click must activate and close");
+
+        // 3) RoomInfo overlay: single-click button 3 ("Close") closes overlay.
+        ui.push_overlay(Overlay::room_info());
+        ui.hitmap.clear();
+        ui.hitmap.add_line(5, 7, 15, HitTarget::OverlayItem { index: 3 });
+        dispatch(Action::Click { column: 8, row: 7 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty(), "RoomInfo Close click must activate");
+
+        // 4) NewChat overlay: single-click search result adds peer to selected_peers.
+        app.user_search_results = vec![crate::models::UserProfile {
+            id: "u-alice".into(),
+            display_name: "Alice".into(),
+            mail: Some("alice@example.com".into()),
+            user_principal_name: Some("alice@example.com".into()),
+        }];
+        ui.push_overlay(Overlay::new_chat());
+        ui.hitmap.clear();
+        ui.hitmap.add_line(5, 8, 30, HitTarget::OverlayItem { index: 0 });
+        dispatch(Action::Click { column: 10, row: 8 }, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::NewChat(nc)) if nc.selected_peers == vec!["alice@example.com".to_string()]
+        ));
+        ui.overlays.clear();
+
+        // 5) FilePicker overlay: directory activates on single-click; file requires second-click.
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_dir = tmp.path().join("alpha_dir");
+        std::fs::create_dir(&sub_dir).unwrap();
+        let file_path = tmp.path().join("notes.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let picker = super::super::overlays::file_picker::FilePickerOverlay::open_dir(
+            tmp.path().to_path_buf(),
+        );
+        ui.push_overlay(Overlay::FilePicker(picker));
+        ui.hitmap.clear();
+        ui.hitmap.add_line(5, 5, 30, HitTarget::OverlayItem { index: 0 }); // alpha_dir
+        ui.hitmap.add_line(5, 6, 30, HitTarget::OverlayItem { index: 1 }); // notes.txt
+
+        // First click on file (index 1): selects only, does NOT close/send.
+        dispatch(Action::Click { column: 10, row: 6 }, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::FilePicker(p)) if p.selected == 1
+        ));
+
+        // Second click on same file (index 1): activates & closes FilePicker.
+        dispatch(Action::Click { column: 10, row: 6 }, &mut app, &mut ui);
+        assert!(ui.overlays.is_empty(), "Second click on file must activate FilePicker");
+
+        // Reopen and single-click directory (index 0): enters directory immediately.
+        let picker2 = super::super::overlays::file_picker::FilePickerOverlay::open_dir(
+            tmp.path().to_path_buf(),
+        );
+        ui.push_overlay(Overlay::FilePicker(picker2));
+        dispatch(Action::Click { column: 10, row: 5 }, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::FilePicker(p)) if p.current_dir == sub_dir
+        ));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn subject_and_composer_clicks_set_focus_explicitly() {
+        let (mut app, mut ui) = crate::ui::app::tests::make_test_app();
+        ui.show_subject = true;
+        ui.composer.subject_focused = false;
+        ui.hitmap.clear();
+        ui.hitmap.add_line(0, 10, 40, HitTarget::SubjectInput);
+        ui.hitmap.add_line(0, 11, 40, HitTarget::Composer);
+
+        // Clicking SubjectInput sets subject_focused = true (and clicking again does NOT toggle it off).
+        dispatch(Action::Click { column: 5, row: 10 }, &mut app, &mut ui);
+        assert!(ui.composer.subject_focused);
+        assert_eq!(ui.focus(), Focus::Composer);
+        dispatch(Action::Click { column: 5, row: 10 }, &mut app, &mut ui);
+        assert!(ui.composer.subject_focused, "Repeated SubjectInput click must not toggle off");
+
+        // Clicking Composer body returns focus to message body (subject_focused = false).
+        dispatch(Action::Click { column: 5, row: 11 }, &mut app, &mut ui);
+        assert!(!ui.composer.subject_focused);
+        assert_eq!(ui.focus(), Focus::Composer);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn mark_active_read_guards_against_sync_and_clears_unread_anchor() {
+        let (mut app, mut ui) = crate::ui::app::tests::make_test_app();
+        let target = ConversationTarget::Chat {
+            chat_id: "c1".into(),
+        };
+        let conv_key = target.conv_key();
+        let summary = crate::models::ConversationSummary {
+            conv_key: conv_key.clone(),
+            target: target.clone(),
+            kind: crate::models::ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: "Alice".into(),
+            topic: None,
+            unread_count: 3,
+            last_read_at: None,
+            last_msg_id: Some("m1".into()),
+            last_msg_author: Some("Alice".into()),
+            last_msg_preview: Some("hi".into()),
+            last_updated_at: Some("2026-11-20T00:00:00Z".into()),
+            pinned: false,
+            peer_user_id: None,
+            web_url: None,
+        };
+        app.conversations = vec![summary.clone()];
+        app.active_conv_key = Some(conv_key.clone());
+        app.active_target = Some(target);
+        ui.unread_anchor = Some((conv_key.clone(), "2026-11-19T23:00:00Z".into()));
+
+        dispatch(Action::MarkActiveRead, &mut app, &mut ui);
+        assert!(app.active_marked_read_at.is_some());
+        assert!(ui.unread_anchor.is_none());
+        assert_eq!(app.conversations[0].unread_count, 0);
+
+        // Stale BootstrapDone and OlderChatsLoaded must not flip unread_count back to 3.
+        app.handle_ui_msg(
+            &mut ui,
+            super::super::app::UiMsg::BootstrapDone {
+                me: None,
+                presence: None,
+                conversations: vec![summary.clone()],
+                teams: Vec::new(),
+                mentions: Vec::new(),
+                presences: std::collections::HashMap::new(),
+                scope_warning: None,
+            },
+        );
+        assert_eq!(app.conversations[0].unread_count, 0);
+
+        app.handle_ui_msg(
+            &mut ui,
+            super::super::app::UiMsg::OlderChatsLoaded {
+                conversations: vec![summary],
+                reached_eof: false,
+            },
+        );
+        assert_eq!(app.conversations[0].unread_count, 0);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn right_click_blocked_over_modal_and_selects_message_with_effective_attachments_and_links()
+    {
+        let (mut app, mut ui) = crate::ui::app::tests::make_test_app();
+        app.active_conv_key = Some("chat:c1".into());
+        let msg0 = crate::models::MessageItem {
+            msg_key: "chat:c1|m0".into(),
+            conv_key: "chat:c1".into(),
+            msg_id: "m0".into(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: None,
+            author_name: "Alice".into(),
+            is_me: false,
+            created_at: "2026-11-20T00:00:00Z".into(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".into(),
+            message_type: "message".into(),
+            body_html: "<p>Check https://first.example.com</p>".into(),
+            body_plain: "Check https://first.example.com".into(),
+            attachments: Vec::new(),
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        };
+        let msg1 = crate::models::MessageItem {
+            msg_key: "chat:c1|m1".into(),
+            conv_key: "chat:c1".into(),
+            msg_id: "m1".into(),
+            author_name: "Bob".into(),
+            body_html: r#"<p>See <img src="https://graph.microsoft.com/v1.0/chats/c1/messages/m1/hostedContents/h1/$value" /> and https://second.example.com</p>"#.into(),
+            body_plain: "See https://second.example.com".into(),
+            ..msg0.clone()
+        };
+        app.messages = vec![msg0, msg1];
+        ui.chat_scroll.selected_idx = Some(0);
+        ui.hitmap.clear();
+        ui.hitmap.add_line(
+            4,
+            8,
+            10,
+            HitTarget::InlineAction {
+                scope: MessageScope::Chat,
+                msg_index: 1,
+                action: super::super::hitmap::InlineActionKind::React,
+            },
+        );
+
+        // 1) Blocked when another modal (Settings) is open.
+        ui.push_overlay(Overlay::settings());
+        dispatch(Action::OpenContextMenuAt { column: 6, row: 8 }, &mut app, &mut ui);
+        assert_eq!(ui.overlays.len(), 1);
+        assert_eq!(ui.overlays.last().map(Overlay::kind), Some(OverlayKind::Settings));
+        ui.overlays.clear();
+
+        // 2) Right-clicking InlineAction on msg 1 selects msg 1, offers Download Attachment (hosted image),
+        //    and its Extract Links action targets msg 1 directly.
+        dispatch(Action::OpenContextMenuAt { column: 6, row: 8 }, &mut app, &mut ui);
+        assert_eq!(ui.chat_scroll.selected_idx, Some(1));
+        let Some(Overlay::ContextMenu(menu)) = ui.overlays.last() else {
+            panic!("expected ContextMenu");
+        };
+        assert!(
+            menu.items.iter().any(|i| i.label == "Download Attachment"),
+            "effective hosted attachment should appear in ContextMenu"
+        );
+        let links_action = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Extract Links (URLs)")
+            .map(|i| i.action.clone())
+            .expect("Extract Links item");
+        assert_eq!(
+            links_action,
+            Action::OpenLinksForMessage {
+                scope: MessageScope::Chat,
+                msg_index: 1
+            }
+        );
+
+        ui.overlays.clear();
+        dispatch(links_action, &mut app, &mut ui);
+        assert!(matches!(
+            ui.overlays.last(),
+            Some(Overlay::Links(l)) if l.links.len() == 1 && l.links[0].url == "https://second.example.com"
         ));
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
