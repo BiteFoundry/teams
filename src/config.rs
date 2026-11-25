@@ -336,6 +336,10 @@ impl AppConfig {
     /// Writes the config file. Values that only come from a `TEAMS_*` variable of this process
     /// are not made permanent: see [`AppConfig::persistable`].
     pub fn save(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::env::var_os("TEAMS_CONFIG_DIR").is_none() {
+            return Ok(());
+        }
         let path = config_file_path();
         self.persistable(&path).save_to(&path)
     }
@@ -655,6 +659,10 @@ pub fn load_drafts_from(path: &Path) -> Result<HashMap<String, String>> {
 }
 
 pub fn save_drafts(drafts: &HashMap<String, String>) -> Result<()> {
+    #[cfg(test)]
+    if std::env::var_os("TEAMS_CONFIG_DIR").is_none() {
+        return Ok(());
+    }
     save_drafts_to(drafts, &drafts_path())
 }
 
