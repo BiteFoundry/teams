@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
+use futures::StreamExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1082,12 +1083,19 @@ pub fn spawn_sync_engine(
                     let (idle, seq) = bg_shared.idle_snapshot(now);
                     maybe_shrink_on_idle_async(idle, &mut was_idle, &storage);
                     if channel_backoff.on_tick(idle, seq) && !bg_shared.is_auth_paused(now) {
-                        if !channel_err_backoff.is_backed_off(now) {
-                            let active_key = bg_focus_rx
-                                .borrow()
-                                .target
-                                .as_ref()
-                                .map(ConversationTarget::conv_key);
+                        let run_channels = !channel_err_backoff.is_backed_off(now);
+                        let run_presence = idle < Duration::from_secs(IDLE_THRESHOLD_SECS)
+                            && !presence_err_backoff.is_backed_off(now);
+
+                        let active_key = bg_focus_rx
+                            .borrow()
+                            .target
+                            .as_ref()
+                            .map(ConversationTarget::conv_key);
+                        let channel_fut = async {
+                            if !run_channels {
+                                return None;
+                            }
                             let current_pins = tokio::task::spawn_blocking(|| {
                                 AppConfig::load_from(&crate::config::config_file_path())
                                     .ok()
@@ -1096,18 +1104,43 @@ pub fn spawn_sync_engine(
                             .await
                             .ok()
                             .flatten();
-                            match poll_channels_tier3_rotating(
+                            Some(
+                                poll_channels_tier3_rotating(
+                                    &graph,
+                                    &storage,
+                                    &event_tx,
+                                    Some(&bg_focus_rx),
+                                    current_pins.as_ref().unwrap_or(&config_pinned),
+                                    active_key.as_deref(),
+                                    &mut channel_rotation,
+                                    &mut restricted_channels,
+                                )
+                                .await,
+                            )
+                        };
+                        let presence_fut = async {
+                            if !run_presence {
+                                return None;
+                            }
+                            let token_fp = current_token_fingerprint(&graph).await;
+                            if presence_disabled_for_token.as_ref() == Some(&token_fp) {
+                                return None;
+                            }
+                            let res = poll_presences_tier3_with_cache(
                                 &graph,
                                 &storage,
                                 &event_tx,
-                                Some(&bg_focus_rx),
-                                current_pins.as_ref().unwrap_or(&config_pinned),
-                                active_key.as_deref(),
-                                &mut channel_rotation,
-                                &mut restricted_channels,
+                                &mut presence_cache,
                             )
-                            .await
-                            {
+                            .await;
+                            Some((token_fp, res))
+                        };
+
+                        let (channel_res_opt, presence_res_opt) =
+                            tokio::join!(channel_fut, presence_fut);
+
+                        if let Some(channel_res) = channel_res_opt {
+                            match channel_res {
                                 Ok(()) => {
                                     let was_degraded = chat_err_backoff.is_degraded()
                                         || channel_err_backoff.is_degraded()
@@ -1150,63 +1183,50 @@ pub fn spawn_sync_engine(
                             }
                         }
 
-                        if idle < Duration::from_secs(IDLE_THRESHOLD_SECS)
-                            && !bg_shared.is_auth_paused(now)
-                            && !presence_err_backoff.is_backed_off(now)
-                        {
-                            let token_fp = current_token_fingerprint(&graph).await;
-                            if presence_disabled_for_token.as_ref() != Some(&token_fp) {
-                                presence_disabled_for_token = None;
-                                match poll_presences_tier3_with_cache(
-                                    &graph,
-                                    &storage,
-                                    &event_tx,
-                                    &mut presence_cache,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
+                        if let Some((token_fp, presence_res)) = presence_res_opt {
+                            presence_disabled_for_token = None;
+                            match presence_res {
+                                Ok(()) => {
+                                    let was_degraded = chat_err_backoff.is_degraded()
+                                        || channel_err_backoff.is_degraded()
+                                        || presence_err_backoff.is_degraded();
+                                    presence_err_backoff.record_success();
+                                    let now_degraded = chat_err_backoff.is_degraded()
+                                        || channel_err_backoff.is_degraded()
+                                        || presence_err_backoff.is_degraded();
+                                    if was_degraded && !now_degraded {
+                                        let _ = event_tx.send(CoreEvent::SyncStateChanged {
+                                            busy: false,
+                                            summary: "Synced".to_string(),
+                                        });
+                                    }
+                                }
+                                Err(err) => match classify_sync_error(&err) {
+                                    SyncErrorKind::Forbidden403 => {
+                                        presence_disabled_for_token = Some(token_fp);
+                                    }
+                                    SyncErrorKind::Unauthorized401 => {
+                                        bg_shared.pause_auth(
+                                            now,
+                                            Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS),
+                                        );
+                                    }
+                                    SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
                                         let was_degraded = chat_err_backoff.is_degraded()
                                             || channel_err_backoff.is_degraded()
                                             || presence_err_backoff.is_degraded();
-                                        presence_err_backoff.record_success();
+                                        presence_err_backoff.record_transient_failure(now);
                                         let now_degraded = chat_err_backoff.is_degraded()
                                             || channel_err_backoff.is_degraded()
                                             || presence_err_backoff.is_degraded();
-                                        if was_degraded && !now_degraded {
+                                        if !was_degraded && now_degraded {
                                             let _ = event_tx.send(CoreEvent::SyncStateChanged {
                                                 busy: false,
-                                                summary: "Synced".to_string(),
+                                                summary: POLL_RETRY_SUMMARY.to_string(),
                                             });
                                         }
                                     }
-                                    Err(err) => match classify_sync_error(&err) {
-                                        SyncErrorKind::Forbidden403 => {
-                                            presence_disabled_for_token = Some(token_fp);
-                                        }
-                                        SyncErrorKind::Unauthorized401 => {
-                                            bg_shared.pause_auth(
-                                                now,
-                                                Duration::from_secs(AUTH_EXPIRY_PAUSE_SECS),
-                                            );
-                                        }
-                                        SyncErrorKind::Transient | SyncErrorKind::NotFound404 => {
-                                            let was_degraded = chat_err_backoff.is_degraded()
-                                                || channel_err_backoff.is_degraded()
-                                                || presence_err_backoff.is_degraded();
-                                            presence_err_backoff.record_transient_failure(now);
-                                            let now_degraded = chat_err_backoff.is_degraded()
-                                                || channel_err_backoff.is_degraded()
-                                                || presence_err_backoff.is_degraded();
-                                            if !was_degraded && now_degraded {
-                                                let _ = event_tx.send(CoreEvent::SyncStateChanged {
-                                                    busy: false,
-                                                    summary: POLL_RETRY_SUMMARY.to_string(),
-                                                });
-                                            }
-                                        }
-                                    },
-                                }
+                                },
                             }
                         }
                     }
@@ -1246,7 +1266,7 @@ fn maybe_shrink_on_idle_async(idle_duration: Duration, was_idle: &mut bool, stor
     }
 }
 
-fn save_initial_history_cursor_if_absent(
+pub(crate) fn save_initial_history_cursor_if_absent(
     storage: &Storage,
     conv_key: &str,
     msgs: &[MessageItem],
@@ -1910,6 +1930,10 @@ impl ChannelRotationState {
         self.polled_in_round.insert(conv_key.to_string());
     }
 
+    pub(crate) fn unmark_polled(&mut self, conv_key: &str) {
+        self.polled_in_round.remove(conv_key);
+    }
+
     #[cfg(test)]
     pub(crate) fn select_next_batch(
         &mut self,
@@ -2022,8 +2046,7 @@ async fn poll_channels_tier3_rotating(
     }
 
     let mut picked_this_tick: HashSet<String> = HashSet::with_capacity(BACKGROUND_CHANNEL_BATCH_SIZE);
-    let mut any_summary_changed = false;
-    let mut first_fatal_err: Option<anyhow::Error> = None;
+    let mut batch: Vec<ChannelPollCandidate> = Vec::with_capacity(BACKGROUND_CHANNEL_BATCH_SIZE);
 
     for _ in 0..BACKGROUND_CHANNEL_BATCH_SIZE {
         let Some(cand) = rotation.take_next(&candidates, &picked_this_tick) else {
@@ -2035,26 +2058,49 @@ async fn poll_channels_tier3_rotating(
                 .as_ref()
                 .is_some_and(|t| t.conv_key() == cand.conv_key)
         });
+        picked_this_tick.insert(cand.conv_key.clone());
         if now_active {
-            picked_this_tick.insert(cand.conv_key);
             continue;
         }
 
         rotation.mark_polled(&cand.conv_key);
-        picked_this_tick.insert(cand.conv_key.clone());
-        match refresh_channel_delta_once(
-            graph,
-            storage,
-            event_tx,
-            &cand.team_id,
-            &cand.channel_id,
-            &cand.conv_key,
-            &cand.conv_title,
-            true,
-            live_focus_rx,
-        )
-        .await
-        {
+        batch.push(cand);
+    }
+
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let mut any_summary_changed = false;
+    let mut first_auth_err: Option<anyhow::Error> = None;
+    let mut first_transient_err: Option<anyhow::Error> = None;
+
+    let mut stream = futures::stream::iter(batch)
+        .map(|cand| {
+            let graph = graph.clone();
+            let storage = storage.clone();
+            let event_tx = event_tx.clone();
+            let live_focus_rx = live_focus_rx.cloned();
+            async move {
+                let res = refresh_channel_delta_once(
+                    &graph,
+                    &storage,
+                    &event_tx,
+                    &cand.team_id,
+                    &cand.channel_id,
+                    &cand.conv_key,
+                    &cand.conv_title,
+                    true,
+                    live_focus_rx.as_ref(),
+                )
+                .await;
+                (cand.conv_key, res)
+            }
+        })
+        .buffer_unordered(BACKGROUND_CHANNEL_BATCH_SIZE);
+
+    while let Some((conv_key, res)) = stream.next().await {
+        match res {
             Ok(outcome) => {
                 any_summary_changed |= outcome.any_summary_changed;
             }
@@ -2063,11 +2109,19 @@ async fn poll_channels_tier3_rotating(
                 // team was left): drop it from the rotation until the next full teams refresh
                 // and keep polling the rest of the batch.
                 SyncErrorKind::Forbidden403 | SyncErrorKind::NotFound404 => {
-                    restricted_channels.insert(cand.conv_key);
+                    restricted_channels.insert(conv_key);
                 }
-                SyncErrorKind::Unauthorized401 | SyncErrorKind::Transient => {
-                    first_fatal_err = Some(err);
-                    break;
+                SyncErrorKind::Unauthorized401 => {
+                    rotation.unmark_polled(&conv_key);
+                    if first_auth_err.is_none() {
+                        first_auth_err = Some(err);
+                    }
+                }
+                SyncErrorKind::Transient => {
+                    rotation.unmark_polled(&conv_key);
+                    if first_transient_err.is_none() {
+                        first_transient_err = Some(err);
+                    }
                 }
             },
         }
@@ -2078,7 +2132,7 @@ async fn poll_channels_tier3_rotating(
         let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
     }
 
-    if let Some(err) = first_fatal_err {
+    if let Some(err) = first_auth_err.or(first_transient_err) {
         return Err(err);
     }
     Ok(())
@@ -2112,66 +2166,95 @@ async fn refresh_all_conversations_with_cache(
     );
     let mut first_err: Option<anyhow::Error> = chats_res.err();
 
-    match teams_res {
-        Ok(fetched) => {
-            let teams = run_storage(storage, move |st| st.upsert_joined_teams(&fetched)).await?;
-            let existing_convs = run_storage(storage, |st| st.list_conversations()).await?;
-            let empty_restricted = HashSet::new();
-            let mut candidates = build_channel_poll_candidates(
-                &teams,
-                &existing_convs,
-                config_pinned,
-                None,
-                &empty_restricted,
-            );
-            // Ensure the currently focused channel is always prioritized inside the refresh budget.
-            let initial_live_active = live_focus_rx
-                .and_then(|rx| rx.borrow().target.as_ref().map(ConversationTarget::conv_key))
-                .or_else(|| fallback_active_conv_key.map(str::to_string));
-            if let Some(ref active_key) = initial_live_active {
-                if let Some(pos) = candidates.iter().position(|c| &c.conv_key == active_key) {
-                    let active_cand = candidates.remove(pos);
-                    candidates.insert(0, active_cand);
-                }
-            }
+    let presence_fut = async {
+        if let Some(p_cache) = presence_cache {
+            let _ = poll_presences_tier3_with_cache(graph, storage, event_tx, p_cache).await;
+        }
+    };
 
-            // Explicit refresh also reconciles joined channels via delta (prioritizing active,
-            // pinned, and recently active channels) so new posts, @me mentions, deletions, and
-            // unread counts surface without focusing each channel.
-            for cand in candidates.into_iter().take(MAX_REFRESH_CHANNELS) {
-                let live_active = live_focus_rx
+    let teams_fut = async {
+        match teams_res {
+            Ok(fetched) => {
+                let teams =
+                    run_storage(storage, move |st| st.upsert_joined_teams(&fetched)).await?;
+                let _ = event_tx.send(CoreEvent::TeamsUpdated(teams.clone()));
+                let existing_convs = run_storage(storage, |st| st.list_conversations()).await?;
+                let empty_restricted = HashSet::new();
+                let mut candidates = build_channel_poll_candidates(
+                    &teams,
+                    &existing_convs,
+                    config_pinned,
+                    None,
+                    &empty_restricted,
+                );
+                // Ensure the currently focused channel is always prioritized inside the refresh budget.
+                let initial_live_active = live_focus_rx
                     .and_then(|rx| rx.borrow().target.as_ref().map(ConversationTarget::conv_key))
                     .or_else(|| fallback_active_conv_key.map(str::to_string));
-                let is_active = live_active.as_deref() == Some(cand.conv_key.as_str());
-                let _ = refresh_channel_delta_once(
-                    graph,
-                    storage,
-                    event_tx,
-                    &cand.team_id,
-                    &cand.channel_id,
-                    &cand.conv_key,
-                    &cand.conv_title,
-                    !is_active,
-                    live_focus_rx,
-                )
-                .await;
-            }
+                if let Some(ref active_key) = initial_live_active {
+                    if let Some(pos) = candidates.iter().position(|c| &c.conv_key == active_key) {
+                        let active_cand = candidates.remove(pos);
+                        candidates.insert(0, active_cand);
+                    }
+                }
 
-            let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
-            let _ = event_tx.send(CoreEvent::TeamsUpdated(teams));
-            let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
-        }
-        Err(err) => {
-            if let Some(prev) = first_err.take() {
-                first_err = Some(anyhow::anyhow!("{prev}; Teams refresh failed: {err}"));
-            } else {
-                first_err = Some(err);
-            }
-        }
-    }
+                // Explicit refresh reconciles up to MAX_REFRESH_CHANNELS via delta with bounded
+                // concurrency so new posts, @me mentions, deletions, and unread counts surface
+                // quickly without a 20-RTT serial waterfall.
+                const REFRESH_CHANNEL_CONCURRENCY: usize = 5;
+                let fallback_active = fallback_active_conv_key.map(str::to_string);
+                futures::stream::iter(candidates.into_iter().take(MAX_REFRESH_CHANNELS))
+                    .map(|cand| {
+                        let graph = graph.clone();
+                        let storage = storage.clone();
+                        let event_tx = event_tx.clone();
+                        let live_focus_rx = live_focus_rx.cloned();
+                        let fallback_active = fallback_active.clone();
+                        async move {
+                            let live_active = live_focus_rx
+                                .as_ref()
+                                .and_then(|rx| {
+                                    rx.borrow().target.as_ref().map(ConversationTarget::conv_key)
+                                })
+                                .or(fallback_active);
+                            let is_active = live_active.as_deref() == Some(cand.conv_key.as_str());
+                            let _ = refresh_channel_delta_once(
+                                &graph,
+                                &storage,
+                                &event_tx,
+                                &cand.team_id,
+                                &cand.channel_id,
+                                &cand.conv_key,
+                                &cand.conv_title,
+                                !is_active,
+                                live_focus_rx.as_ref(),
+                            )
+                            .await;
+                        }
+                    })
+                    .buffer_unordered(REFRESH_CHANNEL_CONCURRENCY)
+                    .for_each(|()| async {})
+                    .await;
 
-    if let Some(p_cache) = presence_cache {
-        let _ = poll_presences_tier3_with_cache(graph, storage, event_tx, p_cache).await;
+                let all_convs = run_storage(storage, |st| st.list_conversations()).await?;
+                let _ = event_tx.send(CoreEvent::ConversationsUpdated(all_convs));
+                Ok(None)
+            }
+            Err(err) => Ok(Some(err)),
+        }
+    };
+
+    let (teams_stage_res, ()) = tokio::join!(teams_fut, presence_fut);
+    let teams_err = match teams_stage_res {
+        Ok(err_opt) => err_opt,
+        Err(db_err) => return Err(db_err),
+    };
+    if let Some(err) = teams_err {
+        if let Some(prev) = first_err.take() {
+            first_err = Some(anyhow::anyhow!("{prev}; Teams refresh failed: {err}"));
+        } else {
+            first_err = Some(err);
+        }
     }
 
     if let Some(err) = first_err {
@@ -5420,6 +5503,311 @@ mod tests {
         .unwrap();
         assert_eq!(gone_hits.load(Ordering::SeqCst), 1);
         assert_eq!(live_hits.load(Ordering::SeqCst), 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_all_conversations_overlaps_channel_deltas_and_presence_and_emits_teams_early() {
+        use axum::{routing::{get, post}, Json, Router};
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(3));
+        let b_ch1 = Arc::clone(&barrier);
+        let b_ch2 = Arc::clone(&barrier);
+        let b_pres = Arc::clone(&barrier);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let ch1_delta = format!("{base}/teams/t1/channels/ch1/messages/delta?state=ok");
+        let ch2_delta = format!("{base}/teams/t1/channels/ch2/messages/delta?state=ok");
+
+        let app = Router::new()
+            .route(
+                "/v1.0/me/chats",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "c-dm",
+                            "chatType": "oneOnOne",
+                            "members": [
+                                { "userId": "me", "displayName": "Me" },
+                                { "userId": "peer-1", "displayName": "Alice" }
+                            ]
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "t1", "displayName": "Eng" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "responses": [{
+                            "id": "0",
+                            "status": 200,
+                            "body": {
+                                "value": [
+                                    { "id": "ch1", "displayName": "General" },
+                                    { "id": "ch2", "displayName": "Alerts" }
+                                ]
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages/delta",
+                get(move || {
+                    let barrier = Arc::clone(&b_ch1);
+                    let link = ch1_delta.clone();
+                    async move {
+                        barrier.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "m-ch1",
+                                "createdDateTime": "2026-11-20T06:00:00Z",
+                                "messageType": "message",
+                                "from": { "user": { "id": "peer-1", "displayName": "Alice" } },
+                                "body": { "contentType": "text", "content": "hello ch1" }
+                            }],
+                            "@odata.deltaLink": link
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch2/messages/delta",
+                get(move || {
+                    let barrier = Arc::clone(&b_ch2);
+                    let link = ch2_delta.clone();
+                    async move {
+                        barrier.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "m-ch2",
+                                "createdDateTime": "2026-11-20T06:01:00Z",
+                                "messageType": "message",
+                                "from": { "user": { "id": "peer-1", "displayName": "Alice" } },
+                                "body": { "contentType": "text", "content": "hello ch2" }
+                            }],
+                            "@odata.deltaLink": link
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/communications/getPresencesByUserId",
+                post(move || {
+                    let barrier = Arc::clone(&b_pres);
+                    async move {
+                        barrier.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "peer-1",
+                                "availability": "Available",
+                                "activity": "Available"
+                            }]
+                        }))
+                    }
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let graph = regression_graph(addr);
+        let storage = Storage::open_in_memory().unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut chat_cache = ChatPollCache::new();
+        let mut chat_cache_seeded = false;
+        let mut chats_cursor_initialized = false;
+        let mut rolling_cursor = 0usize;
+        let pinned = HashSet::new();
+        let mut presence_cache = PresencePollCache::new();
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            refresh_all_conversations_with_cache(
+                &graph,
+                &storage,
+                &event_tx,
+                &mut chat_cache,
+                &mut chat_cache_seeded,
+                &mut chats_cursor_initialized,
+                &mut rolling_cursor,
+                &pinned,
+                None,
+                None,
+                Some(&mut presence_cache),
+            ),
+        )
+        .await
+        .expect("channel deltas and presence polling must execute concurrently")
+        .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+        let teams_pos = events
+            .iter()
+            .position(|e| matches!(e, CoreEvent::TeamsUpdated(_)))
+            .expect("TeamsUpdated event must be emitted");
+        let last_convs_pos = events
+            .iter()
+            .rposition(|e| matches!(e, CoreEvent::ConversationsUpdated(_)))
+            .expect("ConversationsUpdated event must be emitted");
+        assert!(
+            teams_pos < last_convs_pos,
+            "TeamsUpdated should be emitted before final post-delta ConversationsUpdated"
+        );
+        assert!(events.iter().any(|e| matches!(e, CoreEvent::PresenceUpdated(_))));
+        assert!(storage.get_message("chan:t1:ch1", "m-ch1").unwrap().is_some());
+        assert!(storage.get_message("chan:t1:ch2", "m-ch2").unwrap().is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn poll_channels_tier3_rotating_runs_batch_concurrently_and_unmarks_transient_failures() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use tokio::sync::Barrier;
+
+        // 5 channels in batch 1 (out of 6 total) so the round does not wrap yet and we can
+        // verify ch3 (transient 500) is unmarked while ch1/ch2/ch4/ch5 stay marked polled.
+        let barrier = Arc::new(Barrier::new(5));
+        let ok_handler = |id: &'static str, base: String, barrier: Arc<Barrier>| {
+            move || {
+                let barrier = Arc::clone(&barrier);
+                let link = format!("{base}/teams/t1/channels/{id}/messages/delta?s=1");
+                async move {
+                    barrier.wait().await;
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": format!("m-{id}"),
+                            "createdDateTime": "2026-11-20T07:00:00Z",
+                            "messageType": "message",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "text", "content": format!("msg {id}") }
+                        }],
+                        "@odata.deltaLink": link
+                    }))
+                }
+            }
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let b3 = Arc::clone(&barrier);
+
+        let app = Router::new()
+            .route(
+                "/v1.0/teams/t1/channels/ch1/messages/delta",
+                get(ok_handler("ch1", base.clone(), Arc::clone(&barrier))),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch2/messages/delta",
+                get(ok_handler("ch2", base.clone(), Arc::clone(&barrier))),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch3/messages/delta",
+                get(move || {
+                    let barrier = Arc::clone(&b3);
+                    async move {
+                        barrier.wait().await;
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": { "code": "InternalServerError", "message": "boom" }
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch4/messages/delta",
+                get(ok_handler("ch4", base.clone(), Arc::clone(&barrier))),
+            )
+            .route(
+                "/v1.0/teams/t1/channels/ch5/messages/delta",
+                get(ok_handler("ch5", base.clone(), Arc::clone(&barrier))),
+            );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let graph = regression_graph(addr);
+        let storage = Storage::open_in_memory().unwrap();
+        let mk_ch = |id: &str, name: &str| crate::models::ChannelSummary {
+            id: id.to_string(),
+            team_id: "t1".to_string(),
+            team_name: "Eng".to_string(),
+            display_name: name.to_string(),
+            description: None,
+            membership_type: "standard".to_string(),
+            web_url: None,
+        };
+        storage
+            .upsert_teams(&[TeamSummary {
+                id: "t1".to_string(),
+                display_name: "Eng".to_string(),
+                description: None,
+                channels: vec![
+                    mk_ch("ch1", "01-Alpha"),
+                    mk_ch("ch2", "02-Beta"),
+                    mk_ch("ch3", "03-Gamma"),
+                    mk_ch("ch4", "04-Delta"),
+                    mk_ch("ch5", "05-Epsilon"),
+                    mk_ch("ch6", "06-Zeta"),
+                ],
+            }])
+            .unwrap();
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let pinned = HashSet::new();
+        let mut rotation = ChannelRotationState::default();
+        let mut restricted = HashSet::new();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(3),
+            poll_channels_tier3_rotating(
+                &graph,
+                &storage,
+                &event_tx,
+                None,
+                &pinned,
+                None,
+                &mut rotation,
+                &mut restricted,
+            ),
+        )
+        .await
+        .expect("channel rotation batch must execute concurrently");
+        assert!(res.is_err(), "transient 500 must be surfaced to backoff tracker");
+        assert!(storage.get_message("chan:t1:ch1", "m-ch1").unwrap().is_some());
+        assert!(storage.get_message("chan:t1:ch2", "m-ch2").unwrap().is_some());
+        assert!(storage.get_message("chan:t1:ch4", "m-ch4").unwrap().is_some());
+        assert!(storage.get_message("chan:t1:ch5", "m-ch5").unwrap().is_some());
+        assert!(rotation.polled_in_round.contains("chan:t1:ch1"));
+        assert!(rotation.polled_in_round.contains("chan:t1:ch2"));
+        assert!(rotation.polled_in_round.contains("chan:t1:ch4"));
+        assert!(rotation.polled_in_round.contains("chan:t1:ch5"));
+        assert!(
+            !rotation.polled_in_round.contains("chan:t1:ch3"),
+            "failed channel must be unmarked so it retries on the next tick"
+        );
+        assert!(restricted.is_empty());
 
         server.abort();
     }

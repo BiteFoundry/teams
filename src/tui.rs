@@ -1097,6 +1097,7 @@ pub async fn run_with_persona(
         ui_tx.clone(),
     );
     app.load_cached_teams();
+    app.select_initial_cached_conversation(&mut ui);
     draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
 
     spawn_sync_supervisor(

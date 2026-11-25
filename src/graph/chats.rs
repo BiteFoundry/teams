@@ -162,14 +162,25 @@ impl GraphClient {
             return Ok(page.value.into_iter().map(Into::into).collect());
         }
 
-        let escaped = q.replace('\'', "''");
-        let filter = format!("startswith(displayName,'{escaped}') or startswith(mail,'{escaped}')");
-        let path = format!(
-            "/users?$filter={}&$top={limit}&$select=id,displayName,mail,userPrincipalName",
-            urlencoding::encode(&filter)
-        );
-        if let Ok(page) = self.get_json::<GraphListPage<GraphUser>>(&path).await {
-            return Ok(page.value.into_iter().map(Into::into).collect());
+        if !self
+            .users_filter_unsupported
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let escaped = q.replace('\'', "''");
+            let filter =
+                format!("startswith(displayName,'{escaped}') or startswith(mail,'{escaped}')");
+            let path = format!(
+                "/users?$filter={}&$top={limit}&$select=id,displayName,mail,userPrincipalName",
+                urlencoding::encode(&filter)
+            );
+            match self.get_json::<GraphListPage<GraphUser>>(&path).await {
+                Ok(page) => return Ok(page.value.into_iter().map(Into::into).collect()),
+                Err(err) if is_users_filter_unsupported(&err) => {
+                    self.users_filter_unsupported
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(err) => return Err(err),
+            }
         }
 
         // Fallback when `$filter` is unsupported or restricted in the tenant
@@ -785,6 +796,21 @@ fn map_graph_chat_detailed(chat: GraphChat, my_user_id: Option<&str>) -> (Conver
     )
 }
 
+fn is_users_filter_unsupported(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    if matches!(super::extract_graph_http_status(&msg), Some(401 | 403)) {
+        return false;
+    }
+    if matches!(super::extract_graph_http_status(&msg), Some(400 | 501)) {
+        return true;
+    }
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("request_unsupportedquery")
+        || lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("filter")
+}
+
 /// `user@odata.bind` URL for a chat member given as an object id or a UPN/email.
 ///
 /// The key is an OData string literal inside a URL: a single quote is doubled (`'` → `''`)
@@ -1334,5 +1360,123 @@ mod tests {
         assert!(res.next_link.is_none());
         assert!(!res.eof, "a cut first page is not the end of the list");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn search_users_memoizes_filter_unsupported_and_skips_fallback_on_403() {
+        use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // 1) Server rejects `$filter` with 400 Request_UnsupportedQuery and supports plain `$top`.
+        let filter_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let fh = Arc::clone(&filter_hits);
+        let bh = Arc::clone(&fallback_hits);
+        let router = Router::new().route(
+            "/v1.0/users",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let fh = Arc::clone(&fh);
+                let bh = Arc::clone(&bh);
+                async move {
+                    if q.contains_key("$filter") {
+                        fh.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "code": "Request_UnsupportedQuery",
+                                    "message": "Unsupported query"
+                                }
+                            })),
+                        )
+                    } else {
+                        bh.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "value": [
+                                    { "id": "u1", "displayName": "Alice Smith", "mail": "alice@example.com" },
+                                    { "id": "u2", "displayName": "Bob Jones", "mail": "bob@example.com" }
+                                ]
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tokens = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tokens.clone());
+        let client = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me");
+
+        let r1 = client.search_users("ali", 10).await.unwrap();
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].display_name, "Alice Smith");
+        let r2 = client.search_users("bob", 10).await.unwrap();
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].display_name, "Bob Jones");
+
+        assert_eq!(
+            filter_hits.load(Ordering::SeqCst),
+            1,
+            "$filter failure should be memoized after the first unsupported error"
+        );
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 2);
+        server.abort();
+
+        // 2) Server returns 403 Forbidden: must NOT issue a wasted second fallback call.
+        let forbidden_hits = Arc::new(AtomicUsize::new(0));
+        let f403 = Arc::clone(&forbidden_hits);
+        let router_403 = Router::new().route(
+            "/v1.0/users",
+            get(move || {
+                let f403 = Arc::clone(&f403);
+                async move {
+                    f403.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": { "code": "Authorization_RequestDenied", "message": "Missing User.ReadBasic.All" }
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = tokio::spawn(async move {
+            let _ = axum::serve(listener2, router_403).await;
+        });
+        let mut cfg2 = crate::config::AppConfig::default();
+        cfg2.graph_base_url = format!("http://{addr2}/v1.0");
+        let auth2 = crate::auth::AuthManager::from_tokens(cfg2.clone(), tokens);
+        let client2 = GraphClient::new(cfg2, auth2).unwrap().with_my_user_id("me");
+
+        assert!(client2.search_users("ali", 10).await.is_err());
+        assert_eq!(
+            forbidden_hits.load(Ordering::SeqCst),
+            1,
+            "403 Forbidden must return immediately without a fallback request"
+        );
+        server2.abort();
     }
 }

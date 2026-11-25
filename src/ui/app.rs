@@ -183,6 +183,7 @@ pub enum UiMsg {
         presences: HashMap<String, PresenceStatus>,
         scope_warning: Option<String>,
     },
+    PeerPresencesLoaded(HashMap<String, PresenceStatus>),
     MessagesLoaded {
         req_seq: u64,
         conv_key: String,
@@ -600,6 +601,12 @@ pub struct AppState {
     pub html_server: bitefoundry_html::NativeHtmlServer,
     /// `(conv_key, read_at_rfc3339)` last marked read while active, guarding against stale Lane 2 unread flips.
     pub active_marked_read_at: Option<(String, String)>,
+    /// Conversations already warmed (or opened) in this session to avoid duplicate neighbor prefetch.
+    pub prefetched_convs: HashSet<String>,
+    /// Rate-limit timestamp for interactive neighbor prefetch.
+    pub last_prefetch_at: Option<Instant>,
+    /// Concurrency cap for background interactive neighbor prefetch.
+    pub prefetch_sem: Arc<tokio::sync::Semaphore>,
     pub ui_tx: mpsc::UnboundedSender<UiMsg>,
 }
 
@@ -614,6 +621,7 @@ impl AppState {
     ) -> Self {
         let download_dir = config.resolved_download_dir();
         let drafts = config::load_drafts();
+        let my_user_id = graph.my_user_id().unwrap_or_default().to_string();
         Self {
             config,
             auth,
@@ -621,7 +629,7 @@ impl AppState {
             storage,
             sync_ctrl,
             my_profile: None,
-            my_user_id: String::new(),
+            my_user_id,
             my_presence: None,
             conversations: Vec::new(),
             teams: Vec::new(),
@@ -675,6 +683,9 @@ impl AppState {
             image_raw_bytes: 0,
             html_server: bitefoundry_html::NativeHtmlServer::new(),
             active_marked_read_at: None,
+            prefetched_convs: HashSet::new(),
+            last_prefetch_at: None,
+            prefetch_sem: Arc::new(tokio::sync::Semaphore::new(2)),
             ui_tx,
         }
     }
@@ -901,37 +912,16 @@ impl AppState {
                 .iter()
                 .filter_map(|c| c.peer_user_id.clone())
                 .collect();
-            let presences = if !peer_ids.is_empty() {
-                let fetched = graph
-                    .get_presences_by_user_ids(&peer_ids)
-                    .await
-                    .unwrap_or_default();
-                let write_storage = storage.clone();
-                let fetched_for_db = fetched.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_storage.upsert_presences(&fetched_for_db);
-                    write_storage.get_presences()
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_else(|| {
-                    fetched
-                        .into_iter()
-                        .map(|p| (p.user_id.clone(), p))
-                        .collect()
-                })
-            } else {
-                cached_presences
-            };
 
+            // Emit bootstrap results immediately with cached presences so the UI unlocks
+            // conversations/teams and starts active-room sync without waiting on peer presence RTT.
             let _ = tx.send(UiMsg::BootstrapDone {
                 me,
                 presence,
                 conversations,
                 teams,
                 mentions,
-                presences,
+                presences: cached_presences,
                 scope_warning,
             });
             if let Some(label) = task_label {
@@ -940,6 +930,29 @@ impl AppState {
                     error: None,
                     toast: None,
                 });
+            }
+
+            if !peer_ids.is_empty() {
+                if let Ok(fetched) = graph.get_presences_by_user_ids(&peer_ids).await {
+                    if !fetched.is_empty() {
+                        let write_storage = storage.clone();
+                        let fetched_for_db = fetched.clone();
+                        let presences = tokio::task::spawn_blocking(move || {
+                            let _ = write_storage.upsert_presences(&fetched_for_db);
+                            write_storage.get_presences()
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_else(|| {
+                            fetched
+                                .into_iter()
+                                .map(|p| (p.user_id.clone(), p))
+                                .collect()
+                        });
+                        let _ = tx.send(UiMsg::PeerPresencesLoaded(presences));
+                    }
+                }
             }
         });
     }
@@ -986,8 +999,23 @@ impl AppState {
         self.spawn_teams_bootstrap(Some(task_label));
     }
 
+    pub fn select_initial_cached_conversation(&mut self, ui: &mut UiState) {
+        if self.active_conv_key.is_some() || self.active_target.is_some() {
+            return;
+        }
+        if let Some(first) = self
+            .conversations
+            .iter()
+            .find(|c| c.kind != ConversationKind::Channel)
+            .or_else(|| self.conversations.first())
+            .cloned()
+        {
+            self.select_conversation_internal(ui, first.target, true, false);
+        }
+    }
+
     pub fn select_conversation(&mut self, ui: &mut UiState, target: ConversationTarget) {
-        self.select_conversation_internal(ui, target, true);
+        self.select_conversation_internal(ui, target, true, true);
     }
 
     pub fn history_back(&mut self, ui: &mut UiState) {
@@ -997,7 +1025,7 @@ impl AppState {
         ui.conv_history_pos -= 1;
         let key = ui.conv_history[ui.conv_history_pos].clone();
         if let Some(target) = self.target_for_conv_key(&key) {
-            self.select_conversation_internal(ui, target, false);
+            self.select_conversation_internal(ui, target, false, true);
         }
     }
 
@@ -1008,7 +1036,7 @@ impl AppState {
         ui.conv_history_pos += 1;
         let key = ui.conv_history[ui.conv_history_pos].clone();
         if let Some(target) = self.target_for_conv_key(&key) {
-            self.select_conversation_internal(ui, target, false);
+            self.select_conversation_internal(ui, target, false, true);
         }
     }
 
@@ -1042,6 +1070,7 @@ impl AppState {
         ui: &mut UiState,
         target: ConversationTarget,
         record_history: bool,
+        allow_prefetch: bool,
     ) {
         let new_key = target.conv_key();
         if self.active_conv_key.as_deref() == Some(&new_key) {
@@ -1146,6 +1175,8 @@ impl AppState {
                 .is_none_or(|t| t.elapsed() >= MEMBER_CACHE_TTL);
         self.loading_messages = need_messages_fetch;
 
+        self.prefetched_convs.insert(new_key.clone());
+
         if tokio::runtime::Handle::try_current().is_err() {
             self.loading_messages = false;
             return;
@@ -1172,7 +1203,9 @@ impl AppState {
             };
             let msgs_fut = async {
                 if need_messages_fetch {
-                    Some(graph.list_messages(&target, 60).await)
+                    // Fetch a single Graph page (`$top=50`, Graph's max page size) instead of
+                    // requesting 60 messages across 2 sequential round-trips.
+                    Some(graph.list_messages_page(&target, 50, None).await)
                 } else {
                     None
                 }
@@ -1187,17 +1220,23 @@ impl AppState {
             let (msgs_res_opt, members_res_opt, _, _) =
                 tokio::join!(msgs_fut, members_fut, mark_read_fut, chat_read_fut);
 
-            let fetched_msgs = msgs_res_opt.and_then(Result::ok);
+            let fetched_page = msgs_res_opt.and_then(Result::ok);
             let fetched_members = members_res_opt.and_then(Result::ok);
 
-            if fetched_msgs.is_some() || fetched_members.is_some() {
+            if fetched_page.is_some() || fetched_members.is_some() {
                 let db_conv_key = conv_key.clone();
-                let had_msgs = fetched_msgs.is_some();
+                let had_msgs = fetched_page.is_some();
                 let (messages, members) = tokio::task::spawn_blocking(move || {
-                    if let Some(ref msgs) = fetched_msgs {
+                    if let Some((ref msgs, next_link)) = fetched_page {
                         if !msgs.is_empty() {
                             let _ = storage.upsert_messages(msgs);
                         }
+                        let _ = sync::save_initial_history_cursor_if_absent(
+                            &storage,
+                            &db_conv_key,
+                            msgs,
+                            next_link,
+                        );
                     }
                     if let Some(ref members) = fetched_members {
                         let _ = storage.replace_members(&db_conv_key, members);
@@ -1240,6 +1279,158 @@ impl AppState {
                     clear_loading: true,
                 });
             }
+        });
+
+        if allow_prefetch {
+            self.maybe_prefetch_neighbors(ui, &new_key);
+        }
+    }
+
+    /// Bounded, rate-limited background prefetch of up to 2 uncached adjacent conversations in the
+    /// visible nav pane. Triggered ONLY on interactive conversation navigation (never on startup
+    /// auto-selection or periodic polling ticks) so automated polling budgets stay untouched.
+    fn maybe_prefetch_neighbors(&mut self, ui: &UiState, active_key: &str) {
+        const MAX_PREFETCH_NEIGHBORS: usize = 2;
+        const PREFETCH_COOLDOWN: Duration = Duration::from_secs(3);
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if self
+            .last_prefetch_at
+            .is_some_and(|t| t.elapsed() < PREFETCH_COOLDOWN)
+        {
+            return;
+        }
+
+        let rows = nav_pane::nav_rows_cached(self, ui);
+        let mut visible_keys: Vec<String> = Vec::new();
+        let mut seen_visible: HashSet<String> = HashSet::new();
+        for row in rows.iter() {
+            let key = match row {
+                NavRow::Chat { conv_key, .. } | NavRow::TeamChannel { conv_key, .. } => conv_key,
+                _ => continue,
+            };
+            if seen_visible.insert(key.clone()) {
+                visible_keys.push(key.clone());
+            }
+        }
+        let Some(pos) = visible_keys.iter().position(|k| k == active_key) else {
+            return;
+        };
+
+        let mut targets: Vec<(String, ConversationTarget)> =
+            Vec::with_capacity(MAX_PREFETCH_NEIGHBORS);
+        for delta in [1isize, -1, 2, -2] {
+            if targets.len() >= MAX_PREFETCH_NEIGHBORS {
+                break;
+            }
+            let idx = pos as isize + delta;
+            if idx < 0 || (idx as usize) >= visible_keys.len() {
+                continue;
+            }
+            let neighbor_key = &visible_keys[idx as usize];
+            if neighbor_key == active_key || self.prefetched_convs.contains(neighbor_key) {
+                continue;
+            }
+            if let Some(target) = self.target_for_conv_key(neighbor_key) {
+                targets.push((neighbor_key.clone(), target));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+
+        self.last_prefetch_at = Some(Instant::now());
+        for (key, _) in &targets {
+            self.prefetched_convs.insert(key.clone());
+        }
+
+        let sem = Arc::clone(&self.prefetch_sem);
+        let graph = self.graph.clone();
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = sem.try_acquire_owned() else {
+                return;
+            };
+            let check_storage = storage.clone();
+            let uncached: Vec<(String, ConversationTarget)> = tokio::task::spawn_blocking(move || {
+                targets
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        check_storage
+                            .list_root_messages(key, 1, None)
+                            .map(|m| m.is_empty())
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default();
+
+            if uncached.is_empty() {
+                return;
+            }
+
+            let mut chat_ids: Vec<String> = Vec::new();
+            let mut channel_targets: Vec<(String, ConversationTarget)> = Vec::new();
+            for (key, target) in uncached {
+                match target {
+                    ConversationTarget::Chat { chat_id } => chat_ids.push(chat_id),
+                    ConversationTarget::Channel { .. } => channel_targets.push((key, target)),
+                }
+            }
+
+            let chats_fut = async {
+                if chat_ids.is_empty() {
+                    return;
+                }
+                if let Ok(results) = graph.batch_fetch_chat_messages(&chat_ids, 20).await {
+                    let all_msgs: Vec<MessageItem> = results
+                        .into_iter()
+                        .filter_map(|(_, msgs_opt)| msgs_opt)
+                        .flatten()
+                        .collect();
+                    if !all_msgs.is_empty() {
+                        let st = storage.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = st.upsert_messages(&all_msgs);
+                        })
+                        .await;
+                    }
+                }
+            };
+
+            let channels_fut = async {
+                if channel_targets.is_empty() {
+                    return;
+                }
+                let futs = channel_targets.into_iter().map(|(conv_key, target)| {
+                    let graph = graph.clone();
+                    let storage = storage.clone();
+                    async move {
+                        if let Ok((msgs, next_link)) =
+                            graph.list_messages_page(&target, 50, None).await
+                        {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if !msgs.is_empty() {
+                                    let _ = storage.upsert_messages(&msgs);
+                                }
+                                let _ = sync::save_initial_history_cursor_if_absent(
+                                    &storage,
+                                    &conv_key,
+                                    &msgs,
+                                    next_link,
+                                );
+                            })
+                            .await;
+                        }
+                    }
+                });
+                futures::future::join_all(futs).await;
+            };
+
+            tokio::join!(chats_fut, channels_fut);
         });
     }
 
@@ -3133,7 +3324,7 @@ impl AppState {
                         .or_else(|| self.conversations.first())
                         .cloned()
                     {
-                        self.select_conversation(ui, first.target);
+                        self.select_conversation_internal(ui, first.target, true, false);
                     }
                 }
             }
@@ -3150,6 +3341,9 @@ impl AppState {
                 ui.poll_retrying = false;
                 let mut fetched_mentions_or_deleted = false;
                 if self.active_conv_key.as_deref() == Some(&conv_key) {
+                    if parent_msg_id.is_none() {
+                        self.loading_messages = false;
+                    }
                     self.tail_message_updated = false;
                     let prev_len = self.messages.len();
                     let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
@@ -3419,9 +3613,12 @@ impl AppState {
 
                 if self.active_conv_key.is_none() {
                     if let Some(first) = self.conversations.first().cloned() {
-                        self.select_conversation(ui, first.target);
+                        self.select_conversation_internal(ui, first.target, true, false);
                     }
                 }
+            }
+            UiMsg::PeerPresencesLoaded(presences) => {
+                self.presences.extend(presences);
             }
             UiMsg::MessagesLoaded {
                 req_seq,
@@ -3453,6 +3650,9 @@ impl AppState {
                         {
                             ui.pending_append_anchor = Some(ui.chat_scroll.offset);
                         }
+                    }
+                    if self.cached_history_exhausted(&conv_key) {
+                        self.oldest_reached = true;
                     }
                     if !members.is_empty() {
                         self.members = members;
@@ -3951,7 +4151,7 @@ impl AppState {
                         .or_else(|| self.conversations.first())
                         .cloned()
                     {
-                        self.select_conversation(ui, first.target);
+                        self.select_conversation_internal(ui, first.target, true, false);
                     } else {
                         self.sync_ctrl.set_focus(
                             self.active_target.clone(),
@@ -5976,5 +6176,365 @@ pub(super) mod tests {
         );
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_emits_before_peer_presence_and_delivers_peer_presences_async() {
+        use axum::{routing::{get, post}, Json, Router};
+        use tokio::sync::Notify;
+
+        let release_presence = Arc::new(Notify::new());
+        let rel_clone = Arc::clone(&release_presence);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": "me-1",
+                        "displayName": "Me",
+                        "mail": "me@example.com"
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/presence",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "id": "me-1",
+                        "availability": "Available",
+                        "activity": "Available"
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/chats",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "c-dm",
+                            "chatType": "oneOnOne",
+                            "members": [
+                                { "userId": "me-1", "displayName": "Me" },
+                                { "userId": "peer-1", "displayName": "Alice" }
+                            ]
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async { Json(serde_json::json!({ "value": [] })) }),
+            )
+            .route(
+                "/v1.0/communications/getPresencesByUserId",
+                post(move || {
+                    let release = Arc::clone(&rel_clone);
+                    async move {
+                        release.notified().await;
+                        Json(serde_json::json!({
+                            "value": [{
+                                "id": "peer-1",
+                                "availability": "Busy",
+                                "activity": "InACall"
+                            }]
+                        }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg.clone(), auth.clone())
+            .unwrap()
+            .with_my_user_id("me-1");
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(crate::sync::FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new(cfg, auth, graph, storage, sync_ctrl, ui_tx);
+        assert_eq!(app.my_user_id, "me-1");
+        let mut ui = UiState::new();
+        app.spawn_teams_bootstrap(None);
+
+        // BootstrapDone must arrive while getPresencesByUserId is still blocked on Notify.
+        let first_msg = tokio::time::timeout(Duration::from_secs(2), ui_rx.recv())
+            .await
+            .expect("BootstrapDone must not block behind peer presence RTT")
+            .unwrap();
+        assert!(matches!(first_msg, UiMsg::BootstrapDone { .. }));
+        app.handle_ui_msg(&mut ui, first_msg);
+        assert_eq!(app.conversations.len(), 1);
+        assert!(!app.presences.contains_key("peer-1"));
+
+        // Releasing peer presence delivers PeerPresencesLoaded asynchronously (ignoring any
+        // MembersLoaded/MessagesLoaded emitted by auto-selecting the first conversation).
+        release_presence.notify_one();
+        let peer_msg = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg = ui_rx.recv().await.unwrap();
+                if matches!(msg, UiMsg::PeerPresencesLoaded(_)) {
+                    break msg;
+                }
+                app.handle_ui_msg(&mut ui, msg);
+            }
+        })
+        .await
+        .expect("PeerPresencesLoaded should arrive once presence finishes");
+        app.handle_ui_msg(&mut ui, peer_msg);
+        assert_eq!(
+            app.presences.get("peer-1").map(|p| p.availability.as_str()),
+            Some("Busy")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn select_conversation_fetches_single_50_page_and_interactive_prefetch_warms_uncached_neighbors() {
+        use axum::{routing::{get, post}, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let c1_msg_hits = Arc::new(AtomicUsize::new(0));
+        let batch_hits = Arc::new(AtomicUsize::new(0));
+        let batch_urls = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let c1_hits_cl = Arc::clone(&c1_msg_hits);
+        let batch_hits_cl = Arc::clone(&batch_hits);
+        let batch_urls_cl = Arc::clone(&batch_urls);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let c1_next = format!("{base}/chats/c1/messages?page=2");
+
+        let router = Router::new()
+            .route(
+                "/v1.0/chats/c1/messages",
+                get(move || {
+                    let hits = Arc::clone(&c1_hits_cl);
+                    let next = c1_next.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let vals: Vec<serde_json::Value> = (0..50)
+                            .map(|i| {
+                                serde_json::json!({
+                                    "id": format!("c1-m{i:02}"),
+                                    "messageType": "message",
+                                    "createdDateTime": format!("2026-11-20T01:{:02}:00Z", i),
+                                    "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                    "body": { "contentType": "text", "content": format!("msg {i}") }
+                                })
+                            })
+                            .collect();
+                        Json(serde_json::json!({ "value": vals, "@odata.nextLink": next }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/chats/{id}/members",
+                get(|| async { Json(serde_json::json!({ "value": [] })) }),
+            )
+            .route(
+                "/v1.0/chats/{id}/markChatReadForUser",
+                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(payload): Json<serde_json::Value>| {
+                    let hits = Arc::clone(&batch_hits_cl);
+                    let urls = Arc::clone(&batch_urls_cl);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                        let mut responses = Vec::new();
+                        for r in reqs {
+                            let id = r["id"].as_str().unwrap_or("").to_string();
+                            let url = r["url"].as_str().unwrap_or("").to_string();
+                            urls.lock().unwrap().push(url.clone());
+                            let chat_id = url
+                                .strip_prefix("/chats/")
+                                .and_then(|s| s.split('/').next())
+                                .unwrap_or("unknown");
+                            responses.push(serde_json::json!({
+                                "id": id,
+                                "status": 200,
+                                "body": {
+                                    "value": [{
+                                        "id": format!("{chat_id}-warm-1"),
+                                        "messageType": "message",
+                                        "createdDateTime": "2026-11-20T02:00:00Z",
+                                        "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                                        "body": { "contentType": "text", "content": "prefetched" }
+                                    }]
+                                }
+                            }));
+                        }
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = base;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg.clone(), auth.clone())
+            .unwrap()
+            .with_my_user_id("me-1");
+        let storage = Storage::open_in_memory().unwrap();
+        let mk_chat = |id: &str, title: &str, ts: &str| ConversationSummary {
+            conv_key: format!("chat:{id}"),
+            target: ConversationTarget::Chat {
+                chat_id: id.into(),
+            },
+            kind: ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: title.into(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: Some(ts.into()),
+            pinned: false,
+            peer_user_id: Some(format!("peer-{id}")),
+            web_url: None,
+        };
+        storage
+            .upsert_conversations(&[
+                mk_chat("c0", "Zero", "2026-11-20T05:00:00Z"),
+                mk_chat("c1", "One", "2026-11-20T04:00:00Z"),
+                mk_chat("c2", "Two", "2026-11-20T03:00:00Z"),
+                mk_chat("c3", "Three", "2026-11-20T02:00:00Z"),
+            ])
+            .unwrap();
+        // Pre-cache c0 and c2 so auto-select renders c0 immediately and prefetch skips cached c2.
+        storage
+            .upsert_messages(&[
+                make_test_msg("chat:c0", "c0-m1", "2026-11-20T05:00:00Z", "cached c0"),
+                make_test_msg("chat:c2", "c2-m1", "2026-11-20T03:00:00Z", "cached c2"),
+            ])
+            .unwrap();
+
+        let (focus_tx, _focus_rx) = tokio::sync::watch::channel(crate::sync::FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+
+        let mut app = AppState::new(cfg, auth, graph, storage.clone(), sync_ctrl, ui_tx);
+        let mut ui = UiState::new();
+        app.load_cached_teams();
+
+        // 1) Initial cached auto-selection renders c0 immediately without prefetch.
+        app.select_initial_cached_conversation(&mut ui);
+        assert_eq!(app.active_conv_key.as_deref(), Some("chat:c0"));
+        assert_eq!(app.messages.len(), 1);
+        assert!(!app.loading_messages);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            batch_hits.load(Ordering::SeqCst),
+            0,
+            "startup auto-selection must not trigger speculative prefetch"
+        );
+
+        // 2) Interactive switch to cold c1 fetches exactly 1 Graph page ($top=50) and saves cursor,
+        //    while prefetching uncached neighbor c3 (skipping already-cached c0 and c2).
+        app.select_conversation(
+            &mut ui,
+            ConversationTarget::Chat {
+                chat_id: "c1".into(),
+            },
+        );
+        let loaded = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let msg = ui_rx.recv().await.unwrap();
+                if matches!(&msg, UiMsg::MessagesLoaded { conv_key, .. } if conv_key == "chat:c1") {
+                    break msg;
+                }
+                app.handle_ui_msg(&mut ui, msg);
+            }
+        })
+        .await
+        .expect("MessagesLoaded for chat:c1 should arrive");
+        app.handle_ui_msg(&mut ui, loaded);
+        assert_eq!(app.messages.len(), 50);
+        assert_eq!(
+            c1_msg_hits.load(Ordering::SeqCst),
+            1,
+            "cold conversation open must issue 1 single $top=50 page, not 2 sequential pages"
+        );
+        let cursor = storage
+            .get_sync_cursor(&SyncCursor::history_scope("chat:c1"))
+            .unwrap()
+            .expect("initial history cursor must be saved on cold open");
+        assert!(cursor.delta_link.as_deref().is_some_and(|l| l.contains("page=2")));
+
+        // Wait briefly for background neighbor prefetch to populate c3 in SQLite.
+        let mut warmed = false;
+        for _ in 0..40 {
+            if !storage.list_root_messages("chat:c3", 10, None).unwrap().is_empty() {
+                warmed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(warmed, "uncached adjacent chat c3 should be warmed in SQLite");
+        assert_eq!(batch_hits.load(Ordering::SeqCst), 1);
+        let fetched_urls = batch_urls.lock().unwrap().clone();
+        assert_eq!(fetched_urls.len(), 1, "already-cached neighbors c0/c2 must not be fetched");
+        assert!(fetched_urls[0].contains("/chats/c3/messages"));
+
+        // 3) Switching to c3 now shows cached messages immediately with loading_messages == false,
+        //    and respects the 3s prefetch cooldown (still 1 batch hit total).
+        app.select_conversation(
+            &mut ui,
+            ConversationTarget::Chat {
+                chat_id: "c3".into(),
+            },
+        );
+        assert!(!app.loading_messages);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].msg_id, "c3-warm-1");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(batch_hits.load(Ordering::SeqCst), 1);
+
+        server.abort();
     }
 }

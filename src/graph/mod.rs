@@ -54,6 +54,7 @@ pub struct GraphClient {
     my_user_id: Option<String>,
     cached_my_user_id: Arc<OnceLock<String>>,
     chats_orderby_unsupported: Arc<AtomicBool>,
+    users_filter_unsupported: Arc<AtomicBool>,
     resolve_user_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -74,6 +75,7 @@ impl GraphClient {
             my_user_id: None,
             cached_my_user_id: Arc::new(OnceLock::new()),
             chats_orderby_unsupported: Arc::new(AtomicBool::new(false)),
+            users_filter_unsupported: Arc::new(AtomicBool::new(false)),
             resolve_user_mutex: Arc::new(tokio::sync::Mutex::new(())),
         })
     }

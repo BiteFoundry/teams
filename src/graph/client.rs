@@ -535,26 +535,50 @@ impl GraphClient {
             "$batch is retried as idempotent; only GET sub-requests are allowed"
         );
         let url = self.resolve_url("/$batch");
+        if requests.len() <= MAX_BATCH_SIZE {
+            return self.execute_batch_chunk(&url, requests).await;
+        }
+        const MAX_CONCURRENT_BATCH_CHUNKS: usize = 4;
+        let chunks: Vec<Vec<BatchSubRequest>> = requests
+            .chunks(MAX_BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let client = self.clone();
+        let mut chunk_stream = futures::stream::iter(chunks)
+            .map(|chunk| {
+                let client = client.clone();
+                let url = url.clone();
+                async move { client.execute_batch_chunk(&url, &chunk).await }
+            })
+            .buffered(MAX_CONCURRENT_BATCH_CHUNKS);
         let mut all = Vec::with_capacity(requests.len());
-        for chunk in requests.chunks(MAX_BATCH_SIZE) {
-            let payload = serde_json::json!({ "requests": chunk });
-            let resp = self
-                .execute_with_retry(
-                    Method::POST,
-                    &url,
-                    RequestBody::Json(payload),
-                    &[],
-                    true,
-                    STANDARD_REQUEST_TIMEOUT,
-                    RetryClass::Idempotent,
-                )
-                .await?;
-            let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
-            let env: BatchResponseEnvelope = serde_json::from_slice(&bytes)
-                .with_context(|| format!("Failed to deserialize Graph JSON ({url})"))?;
-            all.extend(env.responses);
+        while let Some(res) = chunk_stream.next().await {
+            all.extend(res?);
         }
         Ok(all)
+    }
+
+    async fn execute_batch_chunk(
+        &self,
+        url: &str,
+        chunk: &[BatchSubRequest],
+    ) -> Result<Vec<BatchSubResponse>> {
+        let payload = serde_json::json!({ "requests": chunk });
+        let resp = self
+            .execute_with_retry(
+                Method::POST,
+                url,
+                RequestBody::Json(payload),
+                &[],
+                true,
+                STANDARD_REQUEST_TIMEOUT,
+                RetryClass::Idempotent,
+            )
+            .await?;
+        let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
+        let env: BatchResponseEnvelope = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to deserialize Graph JSON ({url})"))?;
+        Ok(env.responses)
     }
 
     async fn execute_with_retry(
@@ -1655,5 +1679,79 @@ mod tests {
         assert_eq!(r3.as_deref(), Some("single-flight-u1"));
         assert_eq!(r4.as_deref(), Some("single-flight-u1"));
         assert_eq!(me_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_executes_multiple_chunks_concurrently_and_preserves_order() {
+        use axum::{routing::post, Json, Router};
+        use tokio::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b_clone = Arc::clone(&barrier);
+
+        let app = Router::new().route(
+            "/v1.0/$batch",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let barrier = Arc::clone(&b_clone);
+                async move {
+                    // Both chunks MUST be in flight simultaneously or this barrier deadlocks.
+                    barrier.wait().await;
+                    let reqs = payload["requests"].as_array().cloned().unwrap_or_default();
+                    let responses: Vec<serde_json::Value> = reqs
+                        .into_iter()
+                        .map(|r| {
+                            let id = r["id"].as_str().unwrap_or("").to_string();
+                            serde_json::json!({
+                                "id": id,
+                                "status": 200,
+                                "body": { "echo": id }
+                            })
+                        })
+                        .collect();
+                    Json(serde_json::json!({ "responses": responses }))
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("u1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap().with_my_user_id("u1");
+
+        let sub_reqs: Vec<BatchSubRequest> = (0..25)
+            .map(|i| BatchSubRequest {
+                id: i.to_string(),
+                method: "GET".to_string(),
+                url: format!("/teams/t{i}/channels"),
+                body: None,
+                headers: None,
+            })
+            .collect();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), client.batch(&sub_reqs))
+            .await
+            .expect("batch chunks must overlap concurrently instead of running serially")
+            .unwrap();
+        let ids: Vec<String> = res.into_iter().map(|r| r.id).collect();
+        let expected: Vec<String> = (0..25).map(|i| i.to_string()).collect();
+        assert_eq!(ids, expected, "chunk response ordering must be preserved");
+        server.abort();
     }
 }

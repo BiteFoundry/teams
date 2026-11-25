@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use futures::StreamExt;
 use serde::Deserialize;
 
 use super::{
@@ -136,43 +137,74 @@ impl GraphClient {
             }
         }
 
-        let mut summaries = Vec::with_capacity(teams.len());
-        let mut channel_errors = Vec::new();
-        for (idx, team) in teams.into_iter().enumerate() {
-            let team_name = team
-                .display_name
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| team.id.clone());
-            let channels = match channels_by_idx.remove(&idx) {
-                Some((raw_channels, next_link)) => {
-                    self.collect_team_channels_from_page(
-                        &team.id,
-                        &team_name,
-                        raw_channels,
-                        next_link,
-                    )
-                    .await?
+        const TEAM_CHANNEL_FOLLOWUP_CONCURRENCY: usize = 6;
+        let work: Vec<_> = teams
+            .into_iter()
+            .enumerate()
+            .map(|(idx, team)| {
+                let team_id = team.id;
+                let team_name = team
+                    .display_name
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| team_id.clone());
+                let description = team.description.filter(|s| !s.trim().is_empty());
+                let page = channels_by_idx.remove(&idx);
+                let failed_status = failed.remove(&idx).and_then(|(status, _)| status);
+                (team_id, team_name, description, page, failed_status)
+            })
+            .collect();
+
+        let client = self.clone();
+        let mut stream = futures::stream::iter(work)
+            .map(|(team_id, team_name, description, page, failed_status)| {
+                let client = client.clone();
+                async move {
+                    let (channels, channel_error) = match page {
+                        Some((raw_channels, next_link)) => {
+                            let channels = client
+                                .collect_team_channels_from_page(
+                                    &team_id,
+                                    &team_name,
+                                    raw_channels,
+                                    next_link,
+                                )
+                                .await?;
+                            (channels, None)
+                        }
+                        None => match client.list_team_channels(&team_id, &team_name).await {
+                            Ok(channels) => (channels, None),
+                            Err(err) => (
+                                Vec::new(),
+                                Some(TeamChannelError {
+                                    team_id: team_id.clone(),
+                                    display_name: team_name.clone(),
+                                    status: failed_status,
+                                    error: format!("{err:#}"),
+                                }),
+                            ),
+                        },
+                    };
+                    Ok::<_, anyhow::Error>((
+                        TeamSummary {
+                            id: team_id,
+                            display_name: team_name,
+                            description,
+                            channels,
+                        },
+                        channel_error,
+                    ))
                 }
-                None => match self.list_team_channels(&team.id, &team_name).await {
-                    Ok(channels) => channels,
-                    Err(err) => {
-                        let (status, _) = failed.remove(&idx).unwrap_or((None, String::new()));
-                        channel_errors.push(TeamChannelError {
-                            team_id: team.id.clone(),
-                            display_name: team_name.clone(),
-                            status,
-                            error: format!("{err:#}"),
-                        });
-                        Vec::new()
-                    }
-                },
-            };
-            summaries.push(TeamSummary {
-                id: team.id,
-                display_name: team_name,
-                description: team.description.filter(|s| !s.trim().is_empty()),
-                channels,
-            });
+            })
+            .buffered(TEAM_CHANNEL_FOLLOWUP_CONCURRENCY);
+
+        let mut summaries = Vec::new();
+        let mut channel_errors = Vec::new();
+        while let Some(res) = stream.next().await {
+            let (summary, err) = res?;
+            if let Some(err) = err {
+                channel_errors.push(err);
+            }
+            summaries.push(summary);
         }
 
         Ok(JoinedTeams {
@@ -805,9 +837,11 @@ impl GraphClient {
         if !matches!(target, ConversationTarget::Channel { .. }) {
             bail!("Subject edits require a team channel root post.");
         }
-        let my_id = self.require_my_user_id().await?;
         let path = message_item_path(target, msg_id, None);
-        let original: GraphChatMessage = self.get_json(&path).await?;
+        let (my_id, original) = tokio::try_join!(
+            self.require_my_user_id(),
+            self.get_json::<GraphChatMessage>(&path),
+        )?;
         if original.id != msg_id
             || original.reply_to_id.is_some()
             || original.deleted_date_time.is_some()
@@ -1369,5 +1403,144 @@ mod tests {
         assert_eq!(replies.len(), 50);
         assert_eq!(replies.first().unwrap().msg_id, "rep-10");
         assert_eq!(replies.last().unwrap().msg_id, "rep-59");
+    }
+
+    #[tokio::test]
+    async fn list_joined_teams_with_channels_overlaps_pagination_and_fallback_preserving_order() {
+        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Barrier;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}/v1.0");
+        let t1_page2 = format!("{base}/teams/t1/channels?page=2");
+        let t1_page2_for_batch = t1_page2.clone();
+
+        // Both t1's pagination follow-up AND t2's fallback must arrive together to pass the barrier.
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "t1", "displayName": "Team One" },
+                            { "id": "t2", "displayName": "Team Two" },
+                            { "id": "t3", "displayName": "Team Three" }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move || {
+                    let next = t1_page2_for_batch.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "responses": [
+                                {
+                                    "id": "0",
+                                    "status": 200,
+                                    "body": {
+                                        "value": [{ "id": "c1a", "displayName": "General" }],
+                                        "@odata.nextLink": next
+                                    }
+                                },
+                                {
+                                    "id": "1",
+                                    "status": 500,
+                                    "body": { "error": { "code": "InternalServerError", "message": "retry direct" } }
+                                },
+                                {
+                                    "id": "2",
+                                    "status": 403,
+                                    "body": { "error": { "code": "Forbidden", "message": "denied" } }
+                                }
+                            ]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t1/channels",
+                get(move || {
+                    let barrier = Arc::clone(&b1);
+                    async move {
+                        barrier.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{ "id": "c1b", "displayName": "Random" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t2/channels",
+                get(move || {
+                    let barrier = Arc::clone(&b2);
+                    async move {
+                        barrier.wait().await;
+                        Json(serde_json::json!({
+                            "value": [{ "id": "c2a", "displayName": "Design" }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t3/channels",
+                get(|| async {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": { "code": "Forbidden", "message": "denied" }
+                        })),
+                    )
+                }),
+            );
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = base;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        let client = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1");
+
+        let joined = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.list_joined_teams_with_channels(),
+        )
+        .await
+        .expect("per-team channel pagination and fallback must overlap concurrently")
+        .unwrap();
+
+        let team_ids: Vec<&str> = joined.teams.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(team_ids, vec!["t1", "t2", "t3"]);
+        let t1_ch: Vec<&str> = joined.teams[0].channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(t1_ch, vec!["c1a", "c1b"]);
+        let t2_ch: Vec<&str> = joined.teams[1].channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(t2_ch, vec!["c2a"]);
+        assert!(joined.teams[2].channels.is_empty());
+        assert_eq!(joined.channel_errors.len(), 1);
+        assert_eq!(joined.channel_errors[0].team_id, "t3");
+        assert_eq!(joined.channel_errors[0].status, Some(403));
+
+        server.abort();
     }
 }

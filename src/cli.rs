@@ -29,7 +29,7 @@ use crate::{
     parser, resolver,
     serve::{self, ServeOptions},
     storage::Storage,
-    sync, tui, updater,
+    tui, updater,
 };
 
 const DELETE_JSON_REQUIRES_YES: &str = "Deleting with --json requires passing --yes.";
@@ -1680,9 +1680,6 @@ async fn cmd_tui(cfg: &mut AppConfig, persona: Persona) -> Result<()> {
     }
 
     let (auth, graph, storage) = open_runtime(cfg, true).await?;
-    if storage.list_conversations()?.is_empty() {
-        let _ = sync::bootstrap_conversations(&graph, &storage).await;
-    }
     tui::run(cfg.clone(), auth, graph, storage).await
 }
 
@@ -2019,10 +2016,11 @@ async fn cmd_doctor(
         if let Some(uid) = user_id {
             graph = graph.with_my_user_id(uid);
         }
-        match graph.get_me().await {
+        let (me_res, presence_res) = tokio::join!(graph.get_me(), graph.get_my_presence());
+        match me_res {
             Ok(me) => {
                 probe_me = Some(serde_json::to_value(&me)?);
-                match graph.get_my_presence().await {
+                match presence_res {
                     Ok(p) => probe_presence = Some(serde_json::to_value(&p)?),
                     Err(err) => {
                         let wrapped = wrap_graph_permission_error(&graph, err).await;
@@ -5076,14 +5074,13 @@ pub(crate) async fn build_quote_reply(
     }
     let msg = match storage.get_message(&conv.conv_key, msg_id).ok().flatten() {
         Some(m) => Some(m),
-        None => {
-            if let Ok(msgs) = graph.list_messages(&conv.target, 50).await {
-                let _ = storage.upsert_messages(&msgs);
-                msgs.into_iter().find(|m| m.msg_id == msg_id)
-            } else {
-                None
+        None => match graph.get_message(&conv.target, msg_id, None).await {
+            Ok(m) => {
+                let _ = storage.upsert_messages(std::slice::from_ref(&m));
+                Some(m)
             }
-        }
+            Err(_) => None,
+        },
     };
     msg.map(|m| QuotedReply {
         msg_id: m.msg_id,
@@ -7154,5 +7151,109 @@ mod tests {
             "chat:19:group-general-sync@thread.v2"
         );
         assert!(unv["error"]["candidates"][0].get("team_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn build_quote_reply_uses_cache_and_targets_single_message_on_miss() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let item_hits = Arc::new(AtomicUsize::new(0));
+        let list_hits = Arc::new(AtomicUsize::new(0));
+        let ih = Arc::clone(&item_hits);
+        let lh = Arc::clone(&list_hits);
+
+        let router = Router::new()
+            .route(
+                "/v1.0/chats/c1/messages/m-old",
+                get(move || {
+                    let ih = Arc::clone(&ih);
+                    async move {
+                        ih.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({
+                            "id": "m-old",
+                            "messageType": "message",
+                            "createdDateTime": "2026-10-01T10:00:00Z",
+                            "from": { "user": { "id": "u2", "displayName": "Alice" } },
+                            "body": { "contentType": "text", "content": "older message body" }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/chats/c1/messages",
+                get(move || {
+                    let lh = Arc::clone(&lh);
+                    async move {
+                        lh.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = AuthManager::from_tokens(cfg.clone(), tok);
+        let graph = GraphClient::new(cfg, auth).unwrap().with_my_user_id("me");
+        let storage = Storage::open_in_memory().unwrap();
+        let conv = ConversationSummary {
+            conv_key: "chat:c1".into(),
+            target: ConversationTarget::Chat {
+                chat_id: "c1".into(),
+            },
+            kind: ConversationKind::OneOnOne,
+            team_id: None,
+            team_name: None,
+            title: "Alice".into(),
+            topic: None,
+            unread_count: 0,
+            last_read_at: None,
+            last_msg_id: None,
+            last_msg_author: None,
+            last_msg_preview: None,
+            last_updated_at: None,
+            pinned: false,
+            peer_user_id: Some("u2".into()),
+            web_url: None,
+        };
+
+        // First call (cache miss): must issue 1 targeted GET /messages/m-old and 0 list calls.
+        let q1 = build_quote_reply(&storage, &graph, &conv, "m-old")
+            .await
+            .expect("quoted reply should be built via targeted GET");
+        assert_eq!(q1.msg_id, "m-old");
+        assert_eq!(q1.author_name, "Alice");
+        assert_eq!(q1.preview_plain, "older message body");
+        assert_eq!(item_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(list_hits.load(Ordering::SeqCst), 0);
+
+        // Second call (now cached in SQLite): must make 0 additional Graph calls.
+        let q2 = build_quote_reply(&storage, &graph, &conv, "m-old")
+            .await
+            .expect("cached quote should succeed");
+        assert_eq!(q2.msg_id, "m-old");
+        assert_eq!(item_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(list_hits.load(Ordering::SeqCst), 0);
+
+        server.abort();
     }
 }
