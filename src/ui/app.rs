@@ -603,6 +603,9 @@ pub struct AppState {
     pub active_marked_read_at: Option<(String, String)>,
     /// Conversations already warmed (or opened) in this session to avoid duplicate neighbor prefetch.
     pub prefetched_convs: HashSet<String>,
+    /// Channels whose root page was fetched with `$expand=replies` in this session. Delta sync
+    /// carries no replies, so cached roots are refreshed once per session to fix reply counts.
+    pub reply_hydrated_convs: HashSet<String>,
     /// Rate-limit timestamp for interactive neighbor prefetch.
     pub last_prefetch_at: Option<Instant>,
     /// Concurrency cap for background interactive neighbor prefetch.
@@ -684,6 +687,7 @@ impl AppState {
             html_server: bitefoundry_html::NativeHtmlServer::new(),
             active_marked_read_at: None,
             prefetched_convs: HashSet::new(),
+            reply_hydrated_convs: HashSet::new(),
             last_prefetch_at: None,
             prefetch_sem: Arc::new(tokio::sync::Semaphore::new(2)),
             ui_tx,
@@ -1168,6 +1172,12 @@ impl AppState {
 
         const MEMBER_CACHE_TTL: Duration = Duration::from_secs(300);
         let need_messages_fetch = self.messages.is_empty();
+        // Cached channel roots may come only from delta sync, which never carries replies, so
+        // their `↳ N replies` pills stay hidden. Refresh one `$expand=replies` page in the
+        // background on the first open this session; a cold open fetches that page anyway.
+        let need_reply_hydration = target.is_channel()
+            && self.reply_hydrated_convs.insert(new_key.clone())
+            && !need_messages_fetch;
         let need_members_fetch = self.members.is_empty()
             || self
                 .member_fetched_at
@@ -1202,7 +1212,7 @@ impl AppState {
                 }
             };
             let msgs_fut = async {
-                if need_messages_fetch {
+                if need_messages_fetch || need_reply_hydration {
                     // Fetch a single Graph page (`$top=50`, Graph's max page size) instead of
                     // requesting 60 messages across 2 sequential round-trips.
                     Some(graph.list_messages_page(&target, 50, None).await)
@@ -2124,7 +2134,7 @@ impl AppState {
     }
 
     pub fn load_older_chats(&mut self) {
-        if self.loading_older_chats || self.chats_oldest_reached {
+        if self.loading_older_chats {
             return;
         }
         let cursor = self
@@ -2132,39 +2142,59 @@ impl AppState {
             .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
             .ok()
             .flatten();
-        if cursor.as_ref().is_some_and(|c| c.is_history_eof()) {
-            self.chats_oldest_reached = true;
+        // The stored cursor decides, not the cached flag: a fresh page-1 sync can replace a
+        // stale EOF with a nextLink, and the flag would otherwise block that page for good.
+        self.chats_oldest_reached = cursor.as_ref().is_some_and(SyncCursor::is_history_eof);
+        if self.chats_oldest_reached {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         self.loading_older_chats = true;
-        let saved_next_link = cursor.and_then(|c| c.delta_link);
+        let saved_next_link = cursor
+            .and_then(|c| c.delta_link)
+            .filter(|link| !link.trim().is_empty());
         let fallback_target_count = self.conversations.len() + 50;
         let graph = self.graph.clone();
         let storage = self.storage.clone();
         let tx = self.ui_tx.clone();
 
         tokio::spawn(async move {
-            let res: anyhow::Result<(Vec<ConversationSummary>, Option<String>, bool)> =
-                if let Some(ref link) = saved_next_link {
-                    graph
-                        .list_chats_page(50, Some(link))
-                        .await
-                        .map(|(chats, next)| {
-                            let eof = next.is_none();
-                            (chats, next, eof)
+            let mut paged: Option<anyhow::Result<(Vec<ConversationSummary>, Option<String>, bool)>> =
+                None;
+            if let Some(ref link) = saved_next_link {
+                match graph.list_chats_page(50, Some(link)).await {
+                    Ok((chats, next)) => {
+                        let eof = next.is_none();
+                        paged = Some(Ok((chats, next, eof)));
+                    }
+                    Err(err) if is_expired_page_link_error(&err) => {
+                        // An expired `$skiptoken` fails the same way on every retry: drop the
+                        // cursor and let the count-based listing below take over.
+                        let clear_storage = storage.clone();
+                        let dead_link = link.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            clear_storage.delete_sync_cursor_with_link(
+                                SyncCursor::CHATS_LIST_SCOPE,
+                                &dead_link,
+                            )
                         })
-                } else {
-                    graph
-                        .list_chats(fallback_target_count)
-                        .await
-                        .map(|chats| {
-                            let eof = chats.len() < fallback_target_count;
-                            (chats, None, eof)
-                        })
-                };
+                        .await;
+                    }
+                    Err(err) => paged = Some(Err(err)),
+                }
+            }
+            let res = match paged {
+                Some(res) => res,
+                None => graph
+                    .list_chats(fallback_target_count)
+                    .await
+                    .map(|chats| {
+                        let eof = chats.len() < fallback_target_count;
+                        (chats, None, eof)
+                    }),
+            };
 
             match res {
                 Ok((chats, next_link, reached_eof)) => {
@@ -3329,7 +3359,11 @@ impl AppState {
                 }
             }
             CoreEvent::TeamsUpdated(teams) => {
+                // Fewer teams or channels shorten the Teams tab: keep the selected row when it
+                // still exists, otherwise clamp so the selection never points past the list.
+                let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
                 self.teams = teams;
+                preserve_nav_selection(self, ui, prev_row);
             }
             CoreEvent::MessagesUpdated {
                 conv_key,
@@ -3766,6 +3800,21 @@ impl AppState {
                             );
                             thread.replies = std::mem::take(&mut existing.replies);
                         }
+                    }
+                    // The channel view shows `↳ N replies` from its own copy of the root, which
+                    // delta sync leaves at 0: carry the loaded thread's count over to it.
+                    let confirmed_replies = thread
+                        .replies
+                        .iter()
+                        .filter(|r| !r.deleted && !r.msg_id.starts_with("optimistic-"))
+                        .count();
+                    let reply_count = thread.root.reply_count.max(confirmed_replies);
+                    if let Some(root) = self
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.msg_id == thread.root.msg_id && m.parent_msg_id.is_none())
+                    {
+                        root.reply_count = reply_count;
                     }
                     let target_reply_id = self.pending_thread_reply_id.take();
                     self.active_thread = Some(thread);
@@ -4276,6 +4325,14 @@ fn clamp_thread_selection(thread: Option<&ThreadView>, selected_idx: &mut Option
             Some(sel.min(total - 1))
         };
     }
+}
+
+/// A saved page link that Graph no longer accepts (an expired `$skiptoken`): 400 or 410.
+fn is_expired_page_link_error(err: &anyhow::Error) -> bool {
+    matches!(
+        crate::graph::extract_graph_http_status(&format!("{err:#}")),
+        Some(400 | 410)
+    )
 }
 
 pub(crate) fn preserve_nav_selection(
@@ -6534,6 +6591,361 @@ pub(super) mod tests {
         assert_eq!(app.messages[0].msg_id, "c3-warm-1");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(batch_hits.load(Ordering::SeqCst), 1);
+
+        server.abort();
+    }
+
+    fn mock_graph_auth(cfg: &AppConfig) -> AuthManager {
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        AuthManager::from_tokens(cfg.clone(), tok)
+    }
+
+    /// An app wired to a mock Graph at base_url, keeping the UiMsg receiver for the test.
+    fn make_mock_graph_app(
+        base_url: &str,
+    ) -> (AppState, UiState, mpsc::UnboundedReceiver<UiMsg>) {
+        let mut cfg = AppConfig::default();
+        cfg.graph_base_url = base_url.to_string();
+        let auth = mock_graph_auth(&cfg);
+        let graph = GraphClient::new(cfg.clone(), auth.clone())
+            .unwrap()
+            .with_my_user_id("me-1");
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) =
+            tokio::sync::watch::channel(crate::sync::FocusTarget::default());
+        let (nudge_tx, _nudge_rx) = mpsc::unbounded_channel();
+        let sync_ctrl = SyncController::from_channels(focus_tx, nudge_tx, false);
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        let app = AppState::new(cfg.clone(), auth, graph, storage, sync_ctrl, ui_tx);
+        let ui = UiState::from_config(&cfg);
+        (app, ui, ui_rx)
+    }
+
+    // Track 5: delta sync leaves channel roots at reply_count 0, so a loaded thread must carry
+    // its count back to the root the channel view draws the reply pill from.
+    #[tokio::test]
+    async fn thread_loaded_backfills_reply_count_into_channel_root() {
+        let (mut app, mut ui) = make_test_app();
+        let conv = "chan:t1:ch1";
+        app.active_conv_key = Some(conv.to_string());
+        app.active_target = Some(ConversationTarget::Channel {
+            team_id: "t1".into(),
+            channel_id: "ch1".into(),
+        });
+        let root = make_test_msg(conv, "root-1", "2026-11-20T00:00:00Z", "root");
+        let other = make_test_msg(conv, "root-2", "2026-11-20T00:10:00Z", "other");
+        app.messages = vec![root.clone(), other];
+        let reply = |id: &str, minute: u32| {
+            let mut r = make_test_msg(conv, id, &format!("2026-11-20T00:0{minute}:00Z"), id);
+            r.parent_msg_id = Some("root-1".into());
+            r
+        };
+
+        // 1) Graph's count on the fetched root covers replies beyond the loaded window.
+        app.open_thread_by_id_with_reply(&mut ui, "root-1".into(), None);
+        let mut fetched_root = root.clone();
+        fetched_root.reply_count = 5;
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ThreadLoaded {
+                req_seq: app.thread_req_seq,
+                conv_key: conv.to_string(),
+                root_msg_id: "root-1".into(),
+                thread: ThreadView {
+                    conv_key: conv.to_string(),
+                    root: fetched_root,
+                    replies: vec![reply("rep-1", 1), reply("rep-2", 2)],
+                },
+            },
+        );
+        assert_eq!(app.messages[0].reply_count, 5);
+        assert_eq!(app.messages[1].reply_count, 0, "other roots keep their count");
+
+        // 2) A root still at 0 (delta-sourced) takes the number of live replies loaded.
+        app.messages[0].reply_count = 0;
+        app.open_thread_by_id_with_reply(&mut ui, "root-1".into(), None);
+        let mut deleted = reply("rep-3", 3);
+        deleted.deleted = true;
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ThreadLoaded {
+                req_seq: app.thread_req_seq,
+                conv_key: conv.to_string(),
+                root_msg_id: "root-1".into(),
+                thread: ThreadView {
+                    conv_key: conv.to_string(),
+                    root: root.clone(),
+                    replies: vec![reply("rep-1", 1), reply("rep-2", 2), deleted],
+                },
+            },
+        );
+        assert_eq!(app.messages[0].reply_count, 2);
+        assert_eq!(app.messages[1].reply_count, 0);
+
+        // 3) A stale load for an older request leaves the count alone.
+        app.messages[0].reply_count = 0;
+        app.open_thread_by_id_with_reply(&mut ui, "root-1".into(), None);
+        app.handle_ui_msg(
+            &mut ui,
+            UiMsg::ThreadLoaded {
+                req_seq: app.thread_req_seq.wrapping_sub(1),
+                conv_key: conv.to_string(),
+                root_msg_id: "root-1".into(),
+                thread: ThreadView {
+                    conv_key: conv.to_string(),
+                    root: root.clone(),
+                    replies: vec![reply("rep-1", 1)],
+                },
+            },
+        );
+        assert_eq!(app.messages[0].reply_count, 0);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    // Track 5: a channel cached only from delta sync shows no reply pills; the first open this
+    // session refreshes one $expand=replies page in the background, and later opens do not.
+    #[tokio::test]
+    async fn channel_open_hydrates_delta_cached_reply_counts_once_per_session() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let page_hits = Arc::new(AtomicUsize::new(0));
+        let page_hits_c = Arc::clone(&page_hits);
+        let router = Router::new().route(
+            "/v1.0/teams/t1/channels/ch1/messages",
+            get(move || {
+                let hits = Arc::clone(&page_hits_c);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let reply = |id: &str, ts: &str| {
+                        serde_json::json!({
+                            "id": id,
+                            "messageType": "message",
+                            "createdDateTime": ts,
+                            "from": { "user": { "id": "u2", "displayName": "Bob" } },
+                            "body": { "contentType": "text", "content": id }
+                        })
+                    };
+                    Json(serde_json::json!({
+                        "value": [{
+                            "id": "root-1",
+                            "messageType": "message",
+                            "createdDateTime": "2026-11-20T00:00:00Z",
+                            "from": { "user": { "id": "u1", "displayName": "Alice" } },
+                            "body": { "contentType": "text", "content": "root" },
+                            "replies": [
+                                reply("rep-1", "2026-11-20T00:01:00Z"),
+                                reply("rep-2", "2026-11-20T00:02:00Z")
+                            ]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (mut app, mut ui, mut ui_rx) = make_mock_graph_app(&format!("http://{addr}/v1.0"));
+        let conv = "chan:t1:ch1";
+        // The delta-synced root: no replies cached, so its count is 0.
+        app.storage
+            .upsert_messages(&[make_test_msg(conv, "root-1", "2026-11-20T00:00:00Z", "root")])
+            .unwrap();
+        let channel = ConversationTarget::Channel {
+            team_id: "t1".into(),
+            channel_id: "ch1".into(),
+        };
+
+        app.select_conversation(&mut ui, channel.clone());
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].reply_count, 0);
+        assert!(!app.loading_messages, "cached roots render without a loading state");
+        let loaded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let msg = ui_rx.recv().await.unwrap();
+                if matches!(&msg, UiMsg::MessagesLoaded { conv_key, .. } if conv_key == conv) {
+                    break msg;
+                }
+                app.handle_ui_msg(&mut ui, msg);
+            }
+        })
+        .await
+        .expect("the reply hydration page should load");
+        app.handle_ui_msg(&mut ui, loaded);
+        assert_eq!(page_hits.load(Ordering::SeqCst), 1);
+        let root = app
+            .messages
+            .iter()
+            .find(|m| m.msg_id == "root-1")
+            .expect("root stays in the channel view");
+        assert_eq!(root.reply_count, 2);
+        assert_eq!(
+            app.storage.get_message(conv, "root-1").unwrap().unwrap().reply_count,
+            2
+        );
+
+        // Reopening the hydrated channel in the same session does not fetch the page again.
+        app.select_conversation(
+            &mut ui,
+            ConversationTarget::Chat {
+                chat_id: "c-other".into(),
+            },
+        );
+        app.select_conversation(&mut ui, channel);
+        assert_eq!(app.messages[0].reply_count, 2);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(page_hits.load(Ordering::SeqCst), 1);
+
+        server.abort();
+    }
+
+    // Track 5: the stored CHATS_LIST_SCOPE cursor decides paging, not the cached flag, and an
+    // expired $skiptoken is dropped instead of being retried forever.
+    #[tokio::test]
+    async fn load_older_chats_recovers_from_stale_eof_and_expired_skiptoken() {
+        use axum::{extract::RawQuery, http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dead_hits = Arc::new(AtomicUsize::new(0));
+        let list_hits = Arc::new(AtomicUsize::new(0));
+        let dead_hits_c = Arc::clone(&dead_hits);
+        let list_hits_c = Arc::clone(&list_hits);
+        let router = Router::new().route(
+            "/v1.0/me/chats",
+            get(move |RawQuery(q): RawQuery| {
+                let dead_hits = Arc::clone(&dead_hits_c);
+                let list_hits = Arc::clone(&list_hits_c);
+                async move {
+                    if q.unwrap_or_default().contains("skiptoken=dead") {
+                        dead_hits.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": { "code": "BadRequest", "message": "Invalid skip token." }
+                            })),
+                        );
+                    }
+                    list_hits.fetch_add(1, Ordering::SeqCst);
+                    // A full page of 50 chats with no nextLink.
+                    let chats: Vec<serde_json::Value> = (0..50)
+                        .map(|i| {
+                            serde_json::json!({
+                                "id": format!("c-{i:02}"),
+                                "chatType": "group",
+                                "topic": format!("Chat {i:02}"),
+                                "members": []
+                            })
+                        })
+                        .collect();
+                    (StatusCode::OK, Json(serde_json::json!({ "value": chats })))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base = format!("http://{addr}/v1.0");
+        let (mut app, mut ui, mut ui_rx) = make_mock_graph_app(&base);
+        let chats_cursor =
+            |app: &AppState| app.storage.get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE).unwrap();
+        let save_cursor = |app: &AppState, delta_link: Option<String>, oldest: Option<&str>| {
+            app.storage
+                .save_sync_cursor(&SyncCursor {
+                    scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
+                    delta_link,
+                    oldest_msg_ts: oldest.map(str::to_string),
+                    synced_at: Utc::now().to_rfc3339(),
+                })
+                .unwrap();
+        };
+        async fn next_older_chats_msg(ui_rx: &mut mpsc::UnboundedReceiver<UiMsg>) -> UiMsg {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let msg = ui_rx.recv().await.unwrap();
+                    if matches!(&msg, UiMsg::OlderChatsLoaded { .. } | UiMsg::OlderChatsFailed) {
+                        break msg;
+                    }
+                }
+            })
+            .await
+            .expect("older chats load should finish")
+        }
+        let loaded_summary = |msg: &UiMsg| match msg {
+            UiMsg::OlderChatsLoaded {
+                conversations,
+                reached_eof,
+            } => (conversations.len(), *reached_eof),
+            _ => panic!("expected OlderChatsLoaded"),
+        };
+
+        // 1) A stored EOF ends paging without a request.
+        save_cursor(&app, None, Some(SyncCursor::HISTORY_EOF));
+        app.load_older_chats();
+        assert!(app.chats_oldest_reached);
+        assert!(!app.loading_older_chats);
+        assert_eq!(list_hits.load(Ordering::SeqCst), 0);
+
+        // 2) A fresh page-1 sync replaced that EOF with a nextLink (the stored EOF timestamp
+        //    stays beside it): the cached flag must not block the link. The link has expired
+        //    (400), so the cursor is dropped and the count-based listing loads chats instead.
+        let dead_link = format!("{base}/me/chats?$skiptoken=dead");
+        save_cursor(&app, Some(dead_link.clone()), None);
+        app.load_older_chats();
+        assert!(app.loading_older_chats);
+        let loaded = next_older_chats_msg(&mut ui_rx).await;
+        assert_eq!(loaded_summary(&loaded), (50, false));
+        assert_eq!(dead_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(list_hits.load(Ordering::SeqCst), 1);
+        // Clearing only the link would have revived the old EOF and stopped paging for good.
+        let cursor = chats_cursor(&app);
+        assert!(
+            cursor.as_ref().is_none_or(|c| !c.is_history_eof()
+                && c.delta_link.as_deref() != Some(dead_link.as_str())),
+            "the dead cursor must be gone, not turned back into EOF: {cursor:?}"
+        );
+        app.handle_ui_msg(&mut ui, loaded);
+        assert!(!app.loading_older_chats);
+        assert!(!app.chats_oldest_reached);
+        assert_eq!(app.conversations.len(), 50);
+
+        // 3) Paging continues without the dead link: no second request for it.
+        app.load_older_chats();
+        assert!(app.loading_older_chats);
+        let again = next_older_chats_msg(&mut ui_rx).await;
+        assert_eq!(loaded_summary(&again), (50, true));
+        assert_eq!(dead_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(list_hits.load(Ordering::SeqCst), 2);
+        assert!(chats_cursor(&app).is_some_and(|c| c.is_history_eof()));
+        app.handle_ui_msg(&mut ui, again);
+        assert!(app.chats_oldest_reached);
+
+        // 4) A cursor whose link was replaced meanwhile is not deleted by a stale expiry.
+        let fresh = format!("{base}/me/chats?$skiptoken=fresh");
+        save_cursor(&app, Some(fresh.clone()), None);
+        assert!(!app
+            .storage
+            .delete_sync_cursor_with_link(SyncCursor::CHATS_LIST_SCOPE, &dead_link)
+            .unwrap());
+        assert_eq!(
+            chats_cursor(&app).and_then(|c| c.delta_link).as_deref(),
+            Some(fresh.as_str())
+        );
 
         server.abort();
     }

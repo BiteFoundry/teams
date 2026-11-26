@@ -197,6 +197,12 @@ impl Keymap {
         map.bind(Some(Focus::Nav), Right, M::NONE, Action::NavExpandOrOpen);
         map.bind(
             Some(Focus::Nav),
+            Char(' '),
+            M::NONE,
+            Action::NavToggleCollapse,
+        );
+        map.bind(
+            Some(Focus::Nav),
             Char('l'),
             M::NONE,
             Action::NavExpandOrOpen,

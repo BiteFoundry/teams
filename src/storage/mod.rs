@@ -493,6 +493,15 @@ impl Storage {
         repo::save_sync_cursor(&conn, cursor)
     }
 
+    /// Drops a cursor whose page link Graph no longer accepts. `save_sync_cursor` keeps the
+    /// stored `oldest_msg_ts` when given none, so clearing only the link could bring back an
+    /// old EOF; deleting the row returns the scope to "no cursor". A cursor whose link was
+    /// replaced in the meantime is left alone.
+    pub fn delete_sync_cursor_with_link(&self, scope_key: &str, delta_link: &str) -> Result<bool> {
+        let conn = self.lock_conn()?;
+        repo::delete_sync_cursor_with_link(&conn, scope_key, delta_link)
+    }
+
     pub(crate) fn apply_channel_delta(
         &self,
         expected: Option<&SyncCursor>,
@@ -1834,5 +1843,60 @@ mod tests {
         storage.replace_members("chat:c1", &[]).unwrap();
         assert!(storage.list_members("chat:c1").unwrap().is_empty());
         assert_eq!(storage.list_members("chat:c2").unwrap().len(), 1);
+    }
+
+    // Track 5: channel delta sync returns roots without $expand=replies (reply count 0); the
+    // count stored from an expanded page must survive both unchanged and edited roots.
+    #[test]
+    fn test_delta_root_upsert_preserves_hydrated_reply_count() {
+        let storage = Storage::open_in_memory().unwrap();
+        let conv_key = "chan:team-1:ch-1";
+        let mut hydrated = sample_msg(
+            conv_key,
+            "root-1",
+            None,
+            "Alice",
+            "Kickoff",
+            Some("Plan"),
+            "2026-11-20T09:00:00Z",
+        );
+        hydrated.reply_count = 4;
+        storage.upsert_messages(&[hydrated.clone()]).unwrap();
+        let stored_count = || {
+            storage
+                .get_message(conv_key, "root-1")
+                .unwrap()
+                .unwrap()
+                .reply_count
+        };
+        assert_eq!(stored_count(), 4);
+
+        // Delta repeats the root unchanged except for the missing replies.
+        let mut delta_same = hydrated.clone();
+        delta_same.reply_count = 0;
+        storage.upsert_messages(&[delta_same]).unwrap();
+        assert_eq!(stored_count(), 4);
+
+        // Delta carries an edit: the row is rewritten, the count is kept.
+        let mut delta_edited = hydrated.clone();
+        delta_edited.reply_count = 0;
+        delta_edited.body_plain = "Kickoff (edited)".to_string();
+        delta_edited.body_html = "<p>Kickoff (edited)</p>".to_string();
+        delta_edited.last_modified_at = Some("2026-11-20T10:00:00Z".to_string());
+        storage.upsert_messages(&[delta_edited]).unwrap();
+        let stored = storage.get_message(conv_key, "root-1").unwrap().unwrap();
+        assert_eq!(stored.body_plain, "Kickoff (edited)");
+        assert_eq!(stored.reply_count, 4);
+        let roots = storage.list_root_messages(conv_key, 80, None).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].reply_count, 4, "the channel view reads the preserved count");
+
+        // A later expanded page with more replies still raises the count.
+        hydrated.reply_count = 6;
+        hydrated.body_plain = "Kickoff (edited)".to_string();
+        hydrated.body_html = "<p>Kickoff (edited)</p>".to_string();
+        hydrated.last_modified_at = Some("2026-11-20T10:00:00Z".to_string());
+        storage.upsert_messages(&[hydrated]).unwrap();
+        assert_eq!(stored_count(), 6);
     }
 }

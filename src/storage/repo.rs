@@ -1359,6 +1359,17 @@ pub fn get_sync_cursor(conn: &Connection, scope_key: &str) -> Result<Option<Sync
     .map_err(Into::into)
 }
 
+/// Deletes `scope_key`'s cursor if it still holds `delta_link`; returns whether it did.
+pub fn delete_sync_cursor_with_link(
+    conn: &Connection,
+    scope_key: &str,
+    delta_link: &str,
+) -> Result<bool> {
+    let mut stmt = conn
+        .prepare_cached("DELETE FROM sync_cursors WHERE scope_key = ?1 AND delta_link = ?2")?;
+    Ok(stmt.execute(params![scope_key, delta_link])? > 0)
+}
+
 pub fn save_sync_cursor(conn: &Connection, cursor: &SyncCursor) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "

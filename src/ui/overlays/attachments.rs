@@ -83,10 +83,13 @@ pub fn rows_from(messages: &[MessageItem], scope: MessageScope) -> Vec<Attachmen
             continue;
         }
         for (attach_index, att) in msg.effective_attachments().iter().enumerate() {
-            if att
-                .content_type
-                .to_ascii_lowercase()
-                .contains("card.adaptive")
+            // A quoted-reply reference points at another message: there is no file to
+            // preview or download, so listing it would only lead to a failed download.
+            if att.is_message_reference()
+                || att
+                    .content_type
+                    .to_ascii_lowercase()
+                    .contains("card.adaptive")
             {
                 continue;
             }
@@ -111,6 +114,14 @@ pub fn rows(app: &AppState) -> Vec<AttachmentRow> {
     let mut all = rows_from(&app.messages, MessageScope::Chat);
     if let Some(thread) = &app.active_thread {
         all.extend(rows_from(&thread.replies, MessageScope::ThreadReply));
+        // A thread opened from Activity or search can have a root outside the loaded channel
+        // window; when the window has it, its files are already listed as chat rows.
+        if !app.messages.iter().any(|m| m.msg_id == thread.root.msg_id) {
+            all.extend(rows_from(
+                std::slice::from_ref(&thread.root),
+                MessageScope::ThreadRoot,
+            ));
+        }
     }
     all
 }
@@ -303,5 +314,118 @@ impl AttachmentsState {
             )),
             Rect::new(inner.x, hint_y.saturating_add(1), inner.width, 1),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AttachmentInfo, ThreadView};
+    use crate::ui::app::tests::make_test_app;
+
+    fn msg_with(conv_key: &str, msg_id: &str, attachments: Vec<AttachmentInfo>) -> MessageItem {
+        MessageItem {
+            msg_key: MessageItem::make_msg_key(conv_key, msg_id),
+            conv_key: conv_key.to_string(),
+            msg_id: msg_id.to_string(),
+            parent_msg_id: None,
+            reply_to_id: None,
+            reply_to_author: None,
+            reply_to_preview: None,
+            subject: None,
+            author_id: Some("u1".to_string()),
+            author_name: "Alice".to_string(),
+            is_me: false,
+            created_at: "2026-11-20T00:00:00Z".to_string(),
+            last_modified_at: None,
+            deleted: false,
+            importance: "normal".to_string(),
+            message_type: "message".to_string(),
+            body_html: "<p>see attached</p>".to_string(),
+            body_plain: "see attached".to_string(),
+            attachments,
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+            reply_count: 0,
+            web_url: None,
+        }
+    }
+
+    fn attachment(id: &str, content_type: &str, name: Option<&str>) -> AttachmentInfo {
+        AttachmentInfo {
+            id: id.to_string(),
+            content_type: content_type.to_string(),
+            content_url: Some(format!("https://contoso.sharepoint.com/{id}")),
+            name: name.map(str::to_string),
+            content_json: None,
+            thumbnail_url: None,
+        }
+    }
+
+    // Track 5: a quoted-reply reference is not a file, so the attachments list skips it.
+    #[test]
+    fn rows_from_skips_message_references_and_cards() {
+        let msg = msg_with(
+            "chat:c1",
+            "m1",
+            vec![
+                attachment("quoted", "messageReference", None),
+                attachment("card", "application/vnd.microsoft.card.adaptive", None),
+                attachment("file", "reference", Some("report.pdf")),
+            ],
+        );
+        let rows = rows_from(std::slice::from_ref(&msg), MessageScope::Chat);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "report.pdf");
+        assert_eq!(rows[0].attach_index, 2, "the index still points into the message");
+    }
+
+    // Track 5: a thread opened outside the loaded channel window lists its root's files once.
+    #[tokio::test]
+    async fn rows_include_active_thread_root_attachments_once() {
+        let (mut app, _ui) = make_test_app();
+        let conv = "chan:t1:ch1";
+        let root = msg_with(
+            conv,
+            "root-1",
+            vec![attachment("plan", "reference", Some("plan.docx"))],
+        );
+        let mut reply = msg_with(
+            conv,
+            "rep-1",
+            vec![attachment("sheet", "reference", Some("numbers.xlsx"))],
+        );
+        reply.parent_msg_id = Some("root-1".to_string());
+        app.active_thread = Some(ThreadView {
+            conv_key: conv.to_string(),
+            root: root.clone(),
+            replies: vec![reply],
+        });
+
+        // Root outside the channel window: it is listed from the thread.
+        app.messages = Vec::new();
+        let names: Vec<(String, MessageScope)> =
+            rows(&app).into_iter().map(|r| (r.name, r.scope)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("numbers.xlsx".to_string(), MessageScope::ThreadReply),
+                ("plan.docx".to_string(), MessageScope::ThreadRoot),
+            ]
+        );
+
+        // Root inside the window: listed once, as a chat row.
+        app.messages = vec![root];
+        let names: Vec<(String, MessageScope)> =
+            rows(&app).into_iter().map(|r| (r.name, r.scope)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("plan.docx".to_string(), MessageScope::Chat),
+                ("numbers.xlsx".to_string(), MessageScope::ThreadReply),
+            ]
+        );
+
+        app.sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }
 }

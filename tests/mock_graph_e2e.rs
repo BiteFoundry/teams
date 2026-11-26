@@ -447,7 +447,9 @@ async fn batch_handler(
     let mut responses = Vec::with_capacity(reqs.len());
     for req in reqs {
         let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("")
+            // Channel listings are requested from `/allChannels`; answer them like `/channels`.
+            .replace("/allChannels", "/channels");
         if url.contains("/teams/team-dev/channels") {
             responses.push(json!({
                 "id": req_id,
@@ -2389,7 +2391,9 @@ async fn e2e_built_cli_hyphen_inputs_markdown_lists_and_partial_edit_mock_graph(
                     .into_iter()
                     .map(|req| {
                         let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-                        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("")
+                            // Channel listings are requested from `/allChannels`; answer them like `/channels`.
+                            .replace("/allChannels", "/channels");
                         if url.contains("/teams/team-dev/channels") {
                             json!({
                                 "id": req_id,
@@ -3124,7 +3128,9 @@ async fn regression_teams_bug_11_slash_resolution_and_joined_teams_403() {
                         .into_iter()
                         .map(|req| {
                             let req_id = req.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-                            let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                            let url = req.get("url").and_then(|v| v.as_str()).unwrap_or("")
+                                // Channel listings are requested from `/allChannels`; answer them like `/channels`.
+                                .replace("/allChannels", "/channels");
                             if url.contains("/teams/t-ui/channels") {
                                 json!({
                                     "id": req_id,
@@ -6065,7 +6071,9 @@ async fn regression_teams_bug_15_team_channels_pagination() {
                     .into_iter()
                     .map(|req| {
                         let req_id = req["id"].as_str().unwrap_or("0");
-                        let url = req["url"].as_str().unwrap_or("");
+                        let url = req["url"].as_str().unwrap_or("")
+                            // Channel listings are requested from `/allChannels`; answer them like `/channels`.
+                            .replace("/allChannels", "/channels");
                         if url.contains("/teams/t-many/channels") {
                             json!({
                                 "id": req_id,
@@ -6556,7 +6564,9 @@ async fn regression_teams_bug_17_batch_channel_failure_keeps_cache() {
                     .into_iter()
                     .map(|req| {
                         let req_id = req["id"].as_str().unwrap_or("0");
-                        let url = req["url"].as_str().unwrap_or("");
+                        let url = req["url"].as_str().unwrap_or("")
+                            // Channel listings are requested from `/allChannels`; answer them like `/channels`.
+                            .replace("/allChannels", "/channels");
                         if url.contains("/teams/team-a/channels") {
                             json!({
                                 "id": req_id,
@@ -7198,7 +7208,9 @@ async fn regression_teams_bug_19_members_and_channels_paging() {
                     .into_iter()
                     .map(|req| {
                         let req_id = req["id"].as_str().unwrap_or("0");
-                        let url = req["url"].as_str().unwrap_or("");
+                        let url = req["url"].as_str().unwrap_or("")
+                            // Channel listings are requested from `/allChannels`; answer them like `/channels`.
+                            .replace("/allChannels", "/channels");
                         if url.contains("/teams/team-big/channels") {
                             let chs: Vec<Value> = (0..55)
                                 .map(|i| {

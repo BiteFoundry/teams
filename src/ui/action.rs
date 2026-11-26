@@ -47,6 +47,8 @@ pub enum Action {
     NavLast,
     NavCollapseOrParent,
     NavExpandOrOpen,
+    /// Collapses an expanded team header or expands a collapsed one; other rows ignore it.
+    NavToggleCollapse,
     TogglePinSelected,
     ToggleUnreadFilter,
     JumpNextUnread,
@@ -537,6 +539,15 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                     app.select_nav_row(ui, ui.nav_selected);
                 }
                 _ => {}
+            }
+        }
+        Action::NavToggleCollapse => {
+            if let Some(NavRow::TeamHeader { team_id, .. }) =
+                nav_pane::nav_row_at(app, ui, ui.nav_selected)
+            {
+                if !ui.collapsed_team_ids.remove(&team_id) {
+                    ui.collapsed_team_ids.insert(team_id);
+                }
             }
         }
         Action::TogglePinSelected => {
@@ -1713,11 +1724,10 @@ fn maybe_load_older_chats(app: &mut AppState, ui: &UiState) {
     if len == 0 {
         return;
     }
-    if ui.nav_selected + 1 >= len
-        && app.conversations.len() >= 40
-        && !app.chats_oldest_reached
-        && !app.loading_older_chats
-    {
+    // Pagination state decides, not the chat count: a short first page can still have a
+    // nextLink, and `load_older_chats` rereads the stored cursor (a fresh page-1 sync can
+    // replace a stale EOF), so the cached `chats_oldest_reached` flag is not checked here.
+    if ui.nav_selected + 1 >= len && !app.loading_older_chats {
         app.load_older_chats();
     }
 }
@@ -4069,6 +4079,127 @@ mod tests {
             ui.overlays.last(),
             Some(Overlay::Links(l)) if l.links.len() == 1 && l.links[0].url == "https://second.example.com"
         ));
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    fn track5_team(id: &str, name: &str, channels: &[(&str, &str)]) -> crate::models::TeamSummary {
+        crate::models::TeamSummary {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            description: None,
+            channels: channels
+                .iter()
+                .map(|(ch_id, ch_name)| crate::models::ChannelSummary {
+                    id: ch_id.to_string(),
+                    team_id: id.to_string(),
+                    team_name: name.to_string(),
+                    display_name: ch_name.to_string(),
+                    description: None,
+                    membership_type: "standard".to_string(),
+                    web_url: None,
+                })
+                .collect(),
+        }
+    }
+
+    // Track 5: Space on a team header collapses or expands it; on other rows it does nothing.
+    #[tokio::test]
+    async fn space_toggles_team_header_collapse_in_nav() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let keymap = crate::ui::keymap::Keymap::default_teams();
+        assert_eq!(
+            keymap.resolve(
+                Focus::Nav,
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
+            ),
+            Some(Action::NavToggleCollapse)
+        );
+
+        let (mut app, mut ui) = test_app_and_ui();
+        app.teams = vec![
+            track5_team("t1", "Core", &[("ch1", "General"), ("ch2", "Random")]),
+            track5_team("t2", "Infra", &[("ch3", "Alerts")]),
+        ];
+        ui.active_nav_tab = nav_pane::TAB_TEAMS;
+        ui.nav_unread_only = false;
+        ui.collapsed_team_ids.clear();
+        ui.set_focus(Focus::Nav);
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 5);
+
+        ui.nav_selected = 0;
+        assert!(matches!(
+            nav_pane::nav_row_at(&app, &ui, 0),
+            Some(NavRow::TeamHeader { ref team_id, .. }) if team_id == "t1"
+        ));
+        dispatch(Action::NavToggleCollapse, &mut app, &mut ui);
+        assert!(ui.collapsed_team_ids.contains("t1"));
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 3);
+        dispatch(Action::NavToggleCollapse, &mut app, &mut ui);
+        assert!(!ui.collapsed_team_ids.contains("t1"));
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 5);
+
+        // A channel row is not a header: nothing collapses.
+        ui.nav_selected = 1;
+        assert!(matches!(
+            nav_pane::nav_row_at(&app, &ui, 1),
+            Some(NavRow::TeamChannel { .. })
+        ));
+        dispatch(Action::NavToggleCollapse, &mut app, &mut ui);
+        assert!(ui.collapsed_team_ids.is_empty());
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 5);
+
+        app.sync_ctrl.request(SyncCommand::Shutdown);
+    }
+
+    // Track 5: a TeamsUpdated that shortens the Teams tab must not leave the selection past
+    // the last row; a row that still exists keeps the selection.
+    #[tokio::test]
+    async fn teams_updated_keeps_or_clamps_nav_selection() {
+        let (mut app, mut ui) = test_app_and_ui();
+        app.teams = vec![
+            track5_team("t1", "Core", &[("ch1", "General"), ("ch2", "Random")]),
+            track5_team("t2", "Infra", &[("ch3", "Alerts"), ("ch4", "Oncall")]),
+        ];
+        ui.active_nav_tab = nav_pane::TAB_TEAMS;
+        ui.nav_unread_only = false;
+        ui.collapsed_team_ids.clear();
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 6);
+
+        // Alerts (row 4) survives a refresh that drops team t1: it is now row 1.
+        ui.nav_selected = 4;
+        app.handle_core_event(
+            &mut ui,
+            crate::models::CoreEvent::TeamsUpdated(vec![track5_team(
+                "t2",
+                "Infra",
+                &[("ch3", "Alerts"), ("ch4", "Oncall")],
+            )]),
+        );
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 3);
+        assert_eq!(ui.nav_selected, 1);
+        assert!(matches!(
+            nav_pane::nav_row_at(&app, &ui, ui.nav_selected),
+            Some(NavRow::TeamChannel { ref conv_key, .. }) if conv_key == "chan:t2:ch3"
+        ));
+
+        // The selected row (Oncall, row 2) disappears with a shorter list: clamp in range.
+        ui.nav_selected = 2;
+        app.handle_core_event(
+            &mut ui,
+            crate::models::CoreEvent::TeamsUpdated(vec![track5_team("t1", "Core", &[("ch1", "General")])]),
+        );
+        let rows = nav_pane::nav_row_count(&app, &ui);
+        assert_eq!(rows, 2);
+        assert!(ui.nav_selected < rows, "selection {} past {rows} rows", ui.nav_selected);
+        assert!(nav_pane::nav_row_at(&app, &ui, ui.nav_selected).is_some());
+
+        // Every team gone: the selection resets to 0.
+        ui.nav_selected = 1;
+        app.handle_core_event(&mut ui, crate::models::CoreEvent::TeamsUpdated(Vec::new()));
+        assert_eq!(nav_pane::nav_row_count(&app, &ui), 0);
+        assert_eq!(ui.nav_selected, 0);
 
         app.sync_ctrl.request(SyncCommand::Shutdown);
     }

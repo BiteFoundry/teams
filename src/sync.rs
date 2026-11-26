@@ -455,7 +455,7 @@ pub async fn bootstrap_conversations(graph: &GraphClient, storage: &Storage) -> 
     let page = chats_res?;
     run_storage(storage, move |st| {
         st.upsert_conversations_with_null_topics(&page.chats, &page.explicit_null_topic_keys)?;
-        save_initial_chats_list_cursor_if_absent(st, page.next_link)
+        save_initial_chats_list_cursor(st, page.next_link)
     })
     .await?;
     if let Ok(fetched) = teams_res {
@@ -1292,27 +1292,37 @@ pub(crate) fn save_initial_history_cursor_if_absent(
     Ok(())
 }
 
-fn save_initial_chats_list_cursor_if_absent(
-    storage: &Storage,
-    next_link: Option<String>,
-) -> Result<()> {
-    if storage
+/// Records the chat-list cursor from a fresh page-1 `/me/chats` response.
+///
+/// A stored link to a later page is kept, so page 1 never rewinds pagination. A stored
+/// `HISTORY_EOF` or a cleared (expired) link is replaced: page 1 shows what Graph has now,
+/// and an EOF saved when the list was shorter would otherwise hide older chats for good.
+fn save_initial_chats_list_cursor(storage: &Storage, next_link: Option<String>) -> Result<()> {
+    let next_link = next_link
+        .map(|link| link.trim().to_string())
+        .filter(|link| !link.is_empty());
+    let keep_existing = storage
         .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)?
-        .is_none()
-    {
-        let oldest_msg_ts = if next_link.is_none() {
-            Some(SyncCursor::HISTORY_EOF.to_string())
-        } else {
-            None
-        };
-        storage.save_sync_cursor(&SyncCursor {
-            scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
-            delta_link: next_link,
-            oldest_msg_ts,
-            synced_at: chrono::Utc::now().to_rfc3339(),
-        })?;
+        .is_some_and(|cursor| {
+            cursor
+                .delta_link
+                .as_deref()
+                .is_some_and(|link| !link.trim().is_empty())
+        });
+    if keep_existing {
+        return Ok(());
     }
-    Ok(())
+    let oldest_msg_ts = if next_link.is_none() {
+        Some(SyncCursor::HISTORY_EOF.to_string())
+    } else {
+        None
+    };
+    storage.save_sync_cursor(&SyncCursor {
+        scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
+        delta_link: next_link,
+        oldest_msg_ts,
+        synced_at: chrono::Utc::now().to_rfc3339(),
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1732,7 +1742,7 @@ async fn poll_chats_tier2_with_rolling_cache(
                 st.upsert_conversations_with_null_topics(&to_upsert, &explicit_null_topic_keys)?;
             }
             if save_cursor {
-                save_initial_chats_list_cursor_if_absent(st, next_link)?;
+                save_initial_chats_list_cursor(st, next_link)?;
             }
             Ok(())
         })
@@ -2800,7 +2810,7 @@ mod tests {
 
         // 4) CHATS_LIST_SCOPE saves initial next_link and does not overwrite existing cursor
         let chats_next = "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=chats2";
-        save_initial_chats_list_cursor_if_absent(&storage, Some(chats_next.to_string())).unwrap();
+        save_initial_chats_list_cursor(&storage, Some(chats_next.to_string())).unwrap();
         let chats_cursor = storage
             .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
             .unwrap()
@@ -2808,7 +2818,7 @@ mod tests {
         assert_eq!(chats_cursor.delta_link.as_deref(), Some(chats_next));
         assert!(!chats_cursor.is_history_eof());
 
-        save_initial_chats_list_cursor_if_absent(&storage, None).unwrap();
+        save_initial_chats_list_cursor(&storage, None).unwrap();
         let chats_preserved = storage
             .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
             .unwrap()
@@ -3681,7 +3691,8 @@ mod tests {
                         for sub in req["requests"].as_array().cloned().unwrap_or_default() {
                             let id = sub["id"].as_str().unwrap_or("0").to_string();
                             let url = sub["url"].as_str().unwrap_or("");
-                            if url.contains("/teams/t1/channels") {
+                            // Channel listings are requested from `/allChannels`.
+                            if url.contains("/teams/t1/channels") || url.contains("/teams/t1/allChannels") {
                                 responses.push(serde_json::json!({
                                     "id": id,
                                     "status": 200,
@@ -5810,5 +5821,56 @@ mod tests {
         assert!(restricted.is_empty());
 
         server.abort();
+    }
+
+    // Track 5: a fresh page-1 /me/chats response must be able to replace a stale EOF (saved
+    // when the list was shorter) and a cleared, expired link; a later-page link is kept.
+    #[test]
+    fn chats_list_cursor_page_one_replaces_stale_eof_and_cleared_link() {
+        let storage = Storage::open_in_memory().unwrap();
+        let cursor = |storage: &Storage| {
+            storage
+                .get_sync_cursor(SyncCursor::CHATS_LIST_SCOPE)
+                .unwrap()
+                .expect("chat-list cursor saved")
+        };
+        let save = |delta_link: Option<&str>, oldest: Option<&str>| {
+            storage
+                .save_sync_cursor(&SyncCursor {
+                    scope_key: SyncCursor::CHATS_LIST_SCOPE.to_string(),
+                    delta_link: delta_link.map(str::to_string),
+                    oldest_msg_ts: oldest.map(str::to_string),
+                    synced_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .unwrap();
+        };
+        let page2 = "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=page2";
+
+        // 1) Stored EOF + page 1 now has a nextLink: paging resumes.
+        save(None, Some(SyncCursor::HISTORY_EOF));
+        save_initial_chats_list_cursor(&storage, Some(page2.to_string())).unwrap();
+        let resumed = cursor(&storage);
+        assert_eq!(resumed.delta_link.as_deref(), Some(page2));
+        assert!(!resumed.is_history_eof());
+
+        // 2) A link saved by later paging is not rewound by another page-1 response.
+        let page5 = "https://graph.microsoft.com/v1.0/me/chats?$skiptoken=page5";
+        save(Some(page5), None);
+        save_initial_chats_list_cursor(&storage, Some(page2.to_string())).unwrap();
+        assert_eq!(cursor(&storage).delta_link.as_deref(), Some(page5));
+        save_initial_chats_list_cursor(&storage, None).unwrap();
+        assert_eq!(cursor(&storage).delta_link.as_deref(), Some(page5));
+
+        // 3) An expired link cleared by load_older_chats is replaced by the fresh nextLink.
+        save(None, None);
+        save_initial_chats_list_cursor(&storage, Some(page2.to_string())).unwrap();
+        assert_eq!(cursor(&storage).delta_link.as_deref(), Some(page2));
+
+        // 4) A blank nextLink counts as none: page 1 is the whole list.
+        save(Some("   "), None);
+        save_initial_chats_list_cursor(&storage, Some("  ".to_string())).unwrap();
+        let eof = cursor(&storage);
+        assert!(eof.is_history_eof());
+        assert_eq!(eof.delta_link, None);
     }
 }

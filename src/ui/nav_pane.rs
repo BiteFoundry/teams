@@ -76,7 +76,7 @@ pub enum NavRow {
     TeamChannel {
         conv_key: String,
         display_name: String,
-        is_private: bool,
+        membership: ChannelMembership,
         unread: i32,
     },
     ActivityMention {
@@ -87,6 +87,37 @@ pub enum NavRow {
         preview: String,
         created_at: String,
     },
+}
+
+/// Who can see a channel, from Graph's `membershipType`; it picks the row's icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelMembership {
+    Standard,
+    Private,
+    /// Shared with people outside the team, including channels another team shares in.
+    Shared,
+}
+
+impl ChannelMembership {
+    pub fn from_membership_type(membership_type: &str) -> Self {
+        let kind = membership_type.trim();
+        if kind.eq_ignore_ascii_case("standard") {
+            Self::Standard
+        } else if kind.eq_ignore_ascii_case("shared") {
+            Self::Shared
+        } else {
+            Self::Private
+        }
+    }
+
+    /// The icon cell drawn before the channel name.
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Standard => "  # ",
+            Self::Private => "  🔒 ",
+            Self::Shared => "  ⇄ ",
+        }
+    }
 }
 
 impl NavRow {
@@ -183,7 +214,7 @@ fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
                     h.write_str(&ch.team_id);
                     h.write_str(&ch.id);
                     h.write_str(&ch.display_name);
-                    h.write_hash(&(!ch.membership_type.eq_ignore_ascii_case("standard")));
+                    h.write_hash(&ChannelMembership::from_membership_type(&ch.membership_type));
                 }
             }
             let mut chan_conv_count = 0usize;
@@ -399,11 +430,12 @@ fn build_nav_rows_uncached(app: &AppState, ui: &UiState) -> Vec<NavRow> {
                         if ui.nav_unread_only && unread <= 0 {
                             continue;
                         }
-                        let is_private = !ch.membership_type.eq_ignore_ascii_case("standard");
                         rows.push(NavRow::TeamChannel {
                             conv_key,
                             display_name: ch.display_name.clone(),
-                            is_private,
+                            membership: ChannelMembership::from_membership_type(
+                                &ch.membership_type,
+                            ),
                             unread,
                         });
                     }
@@ -481,7 +513,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
                         "No chats yet"
                     }
                 }
-                TAB_TEAMS => "No teams joined",
+                TAB_TEAMS => {
+                    if ui.nav_unread_only {
+                        "No unread channels"
+                    } else {
+                        "No teams joined"
+                    }
+                }
                 TAB_ACTIVITY => "No @mentions yet",
                 _ => "No items",
             };
@@ -912,15 +950,12 @@ fn render_nav_row(
         }
         NavRow::TeamChannel {
             display_name,
-            is_private,
+            membership,
             unread,
             ..
         } => {
-            let (icon, icon_w) = if *is_private {
-                ("  🔒 ", 5usize)
-            } else {
-                ("  # ", 4usize)
-            };
+            let icon = membership.icon();
+            let icon_w = UnicodeWidthStr::width(icon);
             let badge = if *unread > 0 {
                 format!(" ({unread})")
             } else {
@@ -1334,6 +1369,69 @@ mod tests {
         let t4 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&t3, &t4));
         assert_eq!(t4.len(), 3);
+
+        sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
+    }
+
+    // Track 5: shared channels (including ones shared into the team via /allChannels) get
+    // their own icon instead of the private lock.
+    #[test]
+    fn channel_membership_picks_shared_icon_apart_from_private_lock() {
+        assert_eq!(
+            ChannelMembership::from_membership_type("standard"),
+            ChannelMembership::Standard
+        );
+        assert_eq!(
+            ChannelMembership::from_membership_type("private"),
+            ChannelMembership::Private
+        );
+        assert_eq!(
+            ChannelMembership::from_membership_type(" Shared "),
+            ChannelMembership::Shared
+        );
+        assert_eq!(
+            ChannelMembership::from_membership_type("unknownFutureValue"),
+            ChannelMembership::Private
+        );
+        assert_eq!(ChannelMembership::Standard.icon(), "  # ");
+        assert_eq!(ChannelMembership::Private.icon(), "  🔒 ");
+        assert_eq!(ChannelMembership::Shared.icon(), "  ⇄ ");
+        assert_ne!(ChannelMembership::Shared.icon(), ChannelMembership::Private.icon());
+    }
+
+    #[tokio::test]
+    async fn teams_tab_rows_mark_shared_channels() {
+        let (mut app, mut ui, sync_ctrl) = make_populated_test_state();
+        app.teams[1].channels.push(crate::models::ChannelSummary {
+            id: "ch-shared".to_string(),
+            team_id: "t2".to_string(),
+            team_name: "Infra".to_string(),
+            display_name: "Partner Room".to_string(),
+            description: None,
+            membership_type: "shared".to_string(),
+            web_url: None,
+        });
+        ui.active_nav_tab = TAB_TEAMS;
+        let rows = build_nav_rows(&app, &ui);
+        let membership_of = |name: &str| {
+            rows.iter().find_map(|r| match r {
+                NavRow::TeamChannel {
+                    display_name,
+                    membership,
+                    ..
+                } if display_name == name => Some(*membership),
+                _ => None,
+            })
+        };
+        assert_eq!(membership_of("General"), Some(ChannelMembership::Standard));
+        assert_eq!(membership_of("Secret"), Some(ChannelMembership::Private));
+        assert_eq!(membership_of("Partner Room"), Some(ChannelMembership::Shared));
+
+        // The cached rows are rebuilt when only the membership type changes.
+        let before = nav_rows_cached(&app, &ui);
+        app.teams[1].channels[1].membership_type = "private".to_string();
+        let after = nav_rows_cached(&app, &ui);
+        assert!(!Arc::ptr_eq(&before, &after));
 
         sync_ctrl.request(crate::sync::SyncCommand::Shutdown);
     }

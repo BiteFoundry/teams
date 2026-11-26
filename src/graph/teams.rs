@@ -63,6 +63,24 @@ impl GraphChannel {
     }
 }
 
+/// `/teams/{id}/allChannels` also returns channels shared into the team from other teams.
+const ALL_CHANNELS_SEGMENT: &str = "allChannels";
+/// `/teams/{id}/channels` returns only the team's own channels.
+const OWN_CHANNELS_SEGMENT: &str = "channels";
+
+fn team_channels_url(team_id: &str, segment: &str) -> String {
+    format!(
+        "/teams/{}/{segment}?$select=id,displayName,description,membershipType,webUrl",
+        urlencoding::encode(team_id)
+    )
+}
+
+/// `/allChannels` is unavailable (403: shared channels not permitted, 404: not supported)
+/// rather than failing transiently, so `/channels` is the listing to use.
+fn all_channels_unavailable(status: Option<u16>) -> bool {
+    matches!(status, Some(403 | 404))
+}
+
 impl GraphClient {
     pub async fn list_joined_teams_with_channels(&self) -> Result<JoinedTeams> {
         let mut next_url = Some("/me/joinedTeams?$select=id,displayName,description".to_string());
@@ -86,10 +104,7 @@ impl GraphClient {
             .map(|(idx, team)| BatchSubRequest {
                 id: idx.to_string(),
                 method: "GET".to_string(),
-                url: format!(
-                    "/teams/{}/channels?$select=id,displayName,description,membershipType,webUrl",
-                    urlencoding::encode(&team.id)
-                ),
+                url: team_channels_url(&team.id, ALL_CHANNELS_SEGMENT),
                 body: None,
                 headers: None,
             })
@@ -171,18 +186,28 @@ impl GraphClient {
                                 .await?;
                             (channels, None)
                         }
-                        None => match client.list_team_channels(&team_id, &team_name).await {
-                            Ok(channels) => (channels, None),
-                            Err(err) => (
-                                Vec::new(),
-                                Some(TeamChannelError {
-                                    team_id: team_id.clone(),
-                                    display_name: team_name.clone(),
-                                    status: failed_status,
-                                    error: format!("{err:#}"),
-                                }),
-                            ),
-                        },
+                        None => {
+                            // A 403/404 from `/allChannels` means this tenant or team cannot
+                            // list shared channels: go straight to `/channels` instead of
+                            // asking `/allChannels` again.
+                            let fetched = if all_channels_unavailable(failed_status) {
+                                client.list_own_team_channels(&team_id, &team_name).await
+                            } else {
+                                client.list_team_channels(&team_id, &team_name).await
+                            };
+                            match fetched {
+                                Ok(channels) => (channels, None),
+                                Err(err) => (
+                                    Vec::new(),
+                                    Some(TeamChannelError {
+                                        team_id: team_id.clone(),
+                                        display_name: team_name.clone(),
+                                        status: failed_status,
+                                        error: format!("{err:#}"),
+                                    }),
+                                ),
+                            }
+                        }
                     };
                     Ok::<_, anyhow::Error>((
                         TeamSummary {
@@ -242,16 +267,39 @@ impl GraphClient {
         Ok(channels)
     }
 
+    /// Lists a team's channels including the shared channels other teams share into it
+    /// (`/allChannels`), falling back to the team's own channels (`/channels`) when Graph
+    /// answers 403/404 for `/allChannels`.
     pub async fn list_team_channels(
         &self,
         team_id: &str,
         team_name: &str,
     ) -> Result<Vec<ChannelSummary>> {
-        let initial_url = format!(
-            "/teams/{}/channels?$select=id,displayName,description,membershipType,webUrl",
-            urlencoding::encode(team_id)
-        );
-        self.collect_team_channels_from_page(team_id, team_name, Vec::new(), Some(initial_url))
+        let all_url = team_channels_url(team_id, ALL_CHANNELS_SEGMENT);
+        match self
+            .collect_team_channels_from_page(team_id, team_name, Vec::new(), Some(all_url))
+            .await
+        {
+            Ok(channels) => Ok(channels),
+            Err(err)
+                if all_channels_unavailable(crate::graph::extract_graph_http_status(&format!(
+                    "{err:#}"
+                ))) =>
+            {
+                self.list_own_team_channels(team_id, team_name).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The team's own channels only (`/channels`), without incoming shared channels.
+    async fn list_own_team_channels(
+        &self,
+        team_id: &str,
+        team_name: &str,
+    ) -> Result<Vec<ChannelSummary>> {
+        let own_url = team_channels_url(team_id, OWN_CHANNELS_SEGMENT);
+        self.collect_team_channels_from_page(team_id, team_name, Vec::new(), Some(own_url))
             .await
     }
 
@@ -1540,6 +1588,262 @@ mod tests {
         assert_eq!(joined.channel_errors.len(), 1);
         assert_eq!(joined.channel_errors[0].team_id, "t3");
         assert_eq!(joined.channel_errors[0].status, Some(403));
+
+        server.abort();
+    }
+
+    fn track5_channel_client(base: String) -> GraphClient {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.graph_base_url = base;
+        let tok = crate::auth::StoredTokens {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: 9_999_999_999,
+            client_id: "c".into(),
+            tenant_id: "t".into(),
+            user_id: Some("me-1".into()),
+            user_display_name: None,
+            user_email: None,
+            auth_mode: "access_token".into(),
+        };
+        let auth = crate::auth::AuthManager::from_tokens(cfg.clone(), tok);
+        GraphClient::new(cfg, auth).unwrap().with_my_user_id("me-1")
+    }
+
+    // Track 5: /allChannels lists channels shared into the team; 403/404 falls back to
+    // /channels, while other errors are not masked by the fallback.
+    #[tokio::test]
+    async fn list_team_channels_uses_all_channels_with_fallback_on_403_404() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let own_hits = Arc::new(AtomicUsize::new(0));
+        let own_hits_shared = Arc::clone(&own_hits);
+        let own_hits_bad = Arc::clone(&own_hits);
+        let router = Router::new()
+            .route(
+                "/v1.0/teams/t-all/allChannels",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "ch-gen", "displayName": "General", "membershipType": "standard" },
+                            { "id": "ch-in", "displayName": "Partner Room", "membershipType": "shared" }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-all/channels",
+                get(move || {
+                    let hits = Arc::clone(&own_hits_shared);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-forbidden/allChannels",
+                get(|| async {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": { "code": "Forbidden", "message": "Shared channels are disabled" }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-forbidden/channels",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "ch-own", "displayName": "General", "membershipType": "standard" }]
+                    }))
+                }),
+            )
+            // t-legacy has no /allChannels route: the mock answers 404.
+            .route(
+                "/v1.0/teams/t-legacy/channels",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "ch-legacy", "displayName": "Ops", "membershipType": "private" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-bad/allChannels",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": { "code": "BadRequest", "message": "bad select" }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-bad/channels",
+                get(move || {
+                    let hits = Arc::clone(&own_hits_bad);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(serde_json::json!({ "value": [] }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = track5_channel_client(format!("http://{addr}/v1.0"));
+
+        let ids = |chs: &[ChannelSummary]| -> Vec<(String, String)> {
+            chs.iter()
+                .map(|c| (c.id.clone(), c.membership_type.clone()))
+                .collect()
+        };
+        let all = client.list_team_channels("t-all", "All").await.unwrap();
+        assert_eq!(
+            ids(&all),
+            vec![
+                ("ch-gen".to_string(), "standard".to_string()),
+                ("ch-in".to_string(), "shared".to_string())
+            ]
+        );
+
+        let forbidden = client
+            .list_team_channels("t-forbidden", "Forbidden")
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(&forbidden),
+            vec![("ch-own".to_string(), "standard".to_string())]
+        );
+
+        let legacy = client.list_team_channels("t-legacy", "Legacy").await.unwrap();
+        assert_eq!(
+            ids(&legacy),
+            vec![("ch-legacy".to_string(), "private".to_string())]
+        );
+
+        let bad = client.list_team_channels("t-bad", "Bad").await;
+        let err = format!("{:#}", bad.expect_err("a 400 is not a missing endpoint"));
+        assert_eq!(crate::graph::extract_graph_http_status(&err), Some(400));
+        assert_eq!(
+            own_hits.load(Ordering::SeqCst),
+            0,
+            "/channels is only asked when /allChannels answers 403/404"
+        );
+
+        server.abort();
+    }
+
+    // Track 5: the joined-teams $batch asks /allChannels; a 403/404 sub-response re-lists the
+    // team's own channels instead of reporting the team as failed.
+    #[tokio::test]
+    async fn joined_teams_batch_requests_all_channels_and_falls_back_per_team() {
+        use axum::{routing::{get, post}, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let batch_urls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let batch_urls_c = Arc::clone(&batch_urls);
+        let router = Router::new()
+            .route(
+                "/v1.0/me/joinedTeams",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [
+                            { "id": "t-all", "displayName": "All" },
+                            { "id": "t-forbidden", "displayName": "Forbidden" },
+                            { "id": "t-legacy", "displayName": "Legacy" }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/$batch",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let urls = Arc::clone(&batch_urls_c);
+                    async move {
+                        let reqs = body["requests"].as_array().cloned().unwrap_or_default();
+                        let responses: Vec<serde_json::Value> = reqs
+                            .iter()
+                            .map(|req| {
+                                let id = req["id"].as_str().unwrap_or("0");
+                                let url = req["url"].as_str().unwrap_or("");
+                                urls.lock().unwrap().push(url.to_string());
+                                if url.contains("/teams/t-all/allChannels") {
+                                    serde_json::json!({
+                                        "id": id,
+                                        "status": 200,
+                                        "body": { "value": [
+                                            { "id": "ch-gen", "displayName": "General", "membershipType": "standard" },
+                                            { "id": "ch-in", "displayName": "Partner Room", "membershipType": "shared" }
+                                        ] }
+                                    })
+                                } else if url.contains("/teams/t-forbidden/") {
+                                    serde_json::json!({
+                                        "id": id,
+                                        "status": 403,
+                                        "body": { "error": { "code": "Forbidden", "message": "denied" } }
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "id": id,
+                                        "status": 404,
+                                        "body": { "error": { "code": "NotFound", "message": "missing" } }
+                                    })
+                                }
+                            })
+                            .collect();
+                        Json(serde_json::json!({ "responses": responses }))
+                    }
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-forbidden/channels",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "ch-own", "displayName": "General" }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1.0/teams/t-legacy/channels",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "value": [{ "id": "ch-legacy", "displayName": "Ops" }]
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = track5_channel_client(format!("http://{addr}/v1.0"));
+
+        let joined = client.list_joined_teams_with_channels().await.unwrap();
+        let urls = batch_urls.lock().unwrap().clone();
+        assert_eq!(urls.len(), 3);
+        assert!(
+            urls.iter().all(|u| u.contains("/allChannels?")),
+            "batch asks /allChannels: {urls:?}"
+        );
+        assert!(joined.channel_errors.is_empty(), "{:?}", joined.channel_errors);
+        let channel_ids = |idx: usize| -> Vec<&str> {
+            joined.teams[idx]
+                .channels
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect()
+        };
+        assert_eq!(channel_ids(0), vec!["ch-gen", "ch-in"]);
+        assert_eq!(joined.teams[0].channels[1].membership_type, "shared");
+        assert_eq!(channel_ids(1), vec!["ch-own"]);
+        assert_eq!(channel_ids(2), vec!["ch-legacy"]);
 
         server.abort();
     }
