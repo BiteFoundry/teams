@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/teams-win32-x64",
-  "version": "0.9.6",
+  "version": "0.9.7",
   "description": "Prebuilt teams binary for Windows x64",
   "repository": {
     "type": "git",
