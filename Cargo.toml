@@ -1,6 +1,6 @@
 [package]
 name = "teams-cli"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2021"
 description = "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTTP API, MCP)"
 repository = "https://github.com/BiteFoundry/teams"
