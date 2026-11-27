@@ -22,10 +22,9 @@ base64 = "0.22"
 bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = "0.28"
 dirs = "5"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-hex = "0.4"
+futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 markup5ever = "0.12"
 notify-rust = "4"
@@ -60,6 +59,8 @@ keyring = { version = "3", features = ["async-secret-service", "async-io", "cryp
 tempfile = "3"
 
 [profile.release]
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = "symbols"

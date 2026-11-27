@@ -4,7 +4,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::{Method, StatusCode};
 use scraper::{Html, Selector};
@@ -535,7 +535,7 @@ impl GraphClient {
             .map(|chunk| chunk.to_vec())
             .collect();
         let client = self.clone();
-        let mut chunk_stream = futures::stream::iter(chunks)
+        let mut chunk_stream = futures_util::stream::iter(chunks)
             .map(|chunk| {
                 let client = client.clone();
                 let url = url.clone();

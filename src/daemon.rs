@@ -371,7 +371,7 @@ impl AsyncWrite for IpcStream {
 fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::hex_encode(bytes)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -509,7 +509,7 @@ fn select_unix_socket_path_with_xdg(config_dir: &Path, xdg_runtime_dir: Option<&
     let canonical = crate::config::canonicalize_existing_ancestor(config_dir);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_os_str().as_bytes());
-    let digest = hex::encode(hasher.finalize());
+    let digest = crate::hex_encode(hasher.finalize());
     let short_hash = &digest[..12];
 
     if let Some(trimmed) = xdg_runtime_dir.map(str::trim).filter(|s| !s.is_empty()) {

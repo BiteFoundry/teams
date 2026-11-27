@@ -1280,7 +1280,7 @@ fn keyring_account_for(config_dir: &Path, default_config_dir: &Path) -> String {
         return KEYRING_DEFAULT_ACCOUNT.to_string();
     }
     let digest = Sha256::digest(dir.as_bytes());
-    format!("profile-{}", &hex::encode(digest)[..16])
+    format!("profile-{}", &crate::hex_encode(digest)[..16])
 }
 
 /// One spelling per directory: absolute, without trailing separators, and on Windows with

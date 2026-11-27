@@ -15,3 +15,15 @@ pub mod sync;
 pub mod tui;
 pub mod ui;
 pub mod updater;
+
+/// Encodes a byte slice as a lowercase hexadecimal string.
+pub fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}

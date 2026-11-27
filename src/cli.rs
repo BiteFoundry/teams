@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Utc};
 use clap::{Parser, Subcommand};
-use futures::stream::{self, StreamExt};
+use futures_util::stream::{self, StreamExt};
 use serde_json::json;
 
 use crate::{

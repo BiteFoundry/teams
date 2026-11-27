@@ -1447,7 +1447,7 @@ impl AppState {
                         }
                     }
                 });
-                futures::future::join_all(futs).await;
+                futures_util::future::join_all(futs).await;
             };
 
             tokio::join!(chats_fut, channels_fut);

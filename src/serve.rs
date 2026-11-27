@@ -502,7 +502,7 @@ fn generate_session_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::hex_encode(bytes)
 }
 
 /// Canonical `scheme://host[:port]` form of a browser origin, or `None` when `raw` is not

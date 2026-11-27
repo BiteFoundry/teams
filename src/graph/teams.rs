@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::{
@@ -170,7 +170,7 @@ impl GraphClient {
             .collect();
 
         let client = self.clone();
-        let mut stream = futures::stream::iter(work)
+        let mut stream = futures_util::stream::iter(work)
             .map(|(team_id, team_name, description, page, failed_status)| {
                 let client = client.clone();
                 async move {

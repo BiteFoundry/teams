@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -440,7 +440,7 @@ async fn current_token_fingerprint(graph: &GraphClient) -> String {
         Some(tokens) => {
             let mut hasher = Sha256::new();
             hasher.update(tokens.access_token.as_bytes());
-            hex::encode(hasher.finalize())
+            crate::hex_encode(hasher.finalize())
         }
         None => String::new(),
     }
@@ -2085,7 +2085,7 @@ async fn poll_channels_tier3_rotating(
     let mut first_auth_err: Option<anyhow::Error> = None;
     let mut first_transient_err: Option<anyhow::Error> = None;
 
-    let mut stream = futures::stream::iter(batch)
+    let mut stream = futures_util::stream::iter(batch)
         .map(|cand| {
             let graph = graph.clone();
             let storage = storage.clone();
@@ -2213,7 +2213,7 @@ async fn refresh_all_conversations_with_cache(
                 // quickly without a 20-RTT serial waterfall.
                 const REFRESH_CHANNEL_CONCURRENCY: usize = 5;
                 let fallback_active = fallback_active_conv_key.map(str::to_string);
-                futures::stream::iter(candidates.into_iter().take(MAX_REFRESH_CHANNELS))
+                futures_util::stream::iter(candidates.into_iter().take(MAX_REFRESH_CHANNELS))
                     .map(|cand| {
                         let graph = graph.clone();
                         let storage = storage.clone();

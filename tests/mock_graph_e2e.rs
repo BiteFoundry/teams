@@ -2209,7 +2209,7 @@ async fn e2e_inline_image_preview_and_self_updater() {
         _ => "teams".to_string(),
     };
     let asset_bytes = b"MOCK-RELEASE-BINARY-V9.9.9".to_vec();
-    let digest = hex::encode(Sha256::digest(&asset_bytes));
+    let digest = teams_cli::hex_encode(Sha256::digest(&asset_bytes));
     let sums_text = format!("{digest}  {asset_name}\n");
 
     let listener = TcpListener::bind("127.0.0.1:0")
