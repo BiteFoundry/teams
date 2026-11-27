@@ -10,10 +10,10 @@
 #     -e TEAMS_TENANT_ID=... \
 #     -e TEAMS_TOKEN_FILE=/data/token \
 #     -v ~/.config/teams:/data/config \
-#     ghcr.io/bitefoundry/teams:0.9.8
+#     ghcr.io/bitefoundry/teams:0.9.9
 FROM debian:bookworm-slim
 
-ARG TEAMS_VERSION=0.9.8
+ARG TEAMS_VERSION=0.9.9
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="teams" \

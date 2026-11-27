@@ -3,7 +3,7 @@
   "name": "io.github.BiteFoundry/teams",
   "title": "Microsoft Teams (TUI, CLI & MCP)",
   "description": "Microsoft Teams MCP server, CLI, and TUI in Rust with local SQLite FTS5 cache.",
-  "version": "0.9.8",
+  "version": "0.9.9",
   "websiteUrl": "https://bitefoundry.dev/#app-teams",
   "repository": {
     "url": "https://github.com/BiteFoundry/teams",
@@ -12,7 +12,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/bitefoundry/teams:0.9.8",
+      "identifier": "ghcr.io/bitefoundry/teams:0.9.9",
       "transport": {
         "type": "stdio"
       },
