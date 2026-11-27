@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -137,13 +137,15 @@ jobs:
     name: publish npm packages
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
+          node-version: 24
 
       - name: Download npm packages
         uses: actions/download-artifact@v4
@@ -192,27 +194,39 @@ jobs:
           test -f dist/teams-linux-x64/bin/teams
           test -f dist/teams-linux-arm64/bin/teams
 
+      - name: Ensure npm supports Trusted Publishing (>= 11.5.1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_version=$(npm --version)
+          echo "npm version: ${npm_version}"
+          if ! node -e '
+            const [maj, min, pat] = process.argv[1].split(".").map(Number);
+            process.exit(maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1))) ? 0 : 1);
+          ' "${npm_version}"; then
+            npm install -g npm@latest
+            echo "upgraded npm version: $(npm --version)"
+          fi
+
       - name: Publish platform packages
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           for dir in dist/teams-*; do
             echo "publishing $(basename "${dir}")"
             chmod +x "${dir}"/bin/*
-            npm publish "./${dir}" --access public
+            npm publish "./${dir}" --provenance --access public
           done
 
       - name: Publish root package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish --provenance --access public
 
   release:
     name: create GitHub release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
