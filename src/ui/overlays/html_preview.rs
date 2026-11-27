@@ -898,6 +898,7 @@ mod tests {
             .join("\n")
     }
 
+    #[cfg(feature = "html-js")]
     #[test]
     fn button_onclick_mutates_dom_via_keyboard_and_click_at_and_raw_toggle() {
         let html = r#"<!DOCTYPE html>
@@ -1079,6 +1080,7 @@ mod tests {
         assert!(text.contains("View Pipeline"));
     }
 
+    #[cfg(all(feature = "svg-graphics", feature = "html-js"))]
     #[test]
     fn inline_svg_renders_halfblocks_in_slot_and_preserves_button_click_coordinates() {
         let html = r##"<!DOCTYPE html>

@@ -419,24 +419,86 @@ impl GraphClient {
     }
 }
 
-/// Decodes an inline `data:image/*` URI locally (rasterizing SVG to PNG) without issuing any HTTP request.
-/// Returns `Ok(None)` when `url` is not a `data:image/` URI.
+/// Decodes an inline `data:image/*` URI locally (rasterizing SVG to PNG when `svg-graphics` is enabled)
+/// without issuing any HTTP request. Returns `Ok(None)` when `url` is not a `data:image/` URI.
 fn try_decode_data_image_url(url: &str) -> Result<Option<(String, Vec<u8>)>> {
     let trimmed = url.trim();
     if trimmed.len() < 11 || !trimmed[..11].eq_ignore_ascii_case("data:image/") {
         return Ok(None);
     }
-    let decoded = bitefoundry_html::graphics::decode_data_image_uri(trimmed)?;
-    if decoded.is_svg {
-        let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
-            &decoded.bytes,
-            bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
-            bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
-            None,
-        )?;
-        Ok(Some(("image/png".to_string(), raster.png_bytes.to_vec())))
-    } else {
-        Ok(Some((decoded.mime, decoded.bytes)))
+    #[cfg(feature = "svg-graphics")]
+    {
+        let decoded = bitefoundry_html::graphics::decode_data_image_uri(trimmed)?;
+        if decoded.is_svg {
+            let raster = bitefoundry_html::graphics::rasterize_svg_to_png(
+                &decoded.bytes,
+                bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
+                bitefoundry_html::graphics::MAX_RASTER_DIM_PX,
+                None,
+            )?;
+            Ok(Some(("image/png".to_string(), raster.png_bytes.to_vec())))
+        } else {
+            Ok(Some((decoded.mime, decoded.bytes)))
+        }
+    }
+    #[cfg(not(feature = "svg-graphics"))]
+    {
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+        const MAX_DATA_URI_BYTES: usize = 8 * 1024 * 1024;
+        if trimmed.len() > MAX_DATA_URI_BYTES * 2 {
+            bail!("data:image URI exceeds maximum allowed size");
+        }
+        let rest = &trimmed[5..];
+        let Some((meta, payload)) = rest.split_once(',') else {
+            bail!("malformed data: URI (missing comma separator)");
+        };
+        let mut parts = meta.split(';');
+        let mime = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if mime == "image/svg+xml" {
+            bail!(
+                "SVG data URI rasterization requires the `svg-graphics` feature (rebuild with `--features svg-graphics`)"
+            );
+        }
+        let supported_raster = matches!(
+            mime.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/jpg"
+                | "image/gif"
+                | "image/webp"
+                | "image/bmp"
+                | "image/x-ms-bmp"
+        );
+        if !supported_raster {
+            bail!("unsupported data URI MIME type: {mime}");
+        }
+        let is_base64 = parts.any(|p| p.trim().eq_ignore_ascii_case("base64"));
+        if !is_base64 {
+            bail!("non-base64 raster data URI is unsupported without the `svg-graphics` feature");
+        }
+        let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        if compact.len() > (MAX_DATA_URI_BYTES * 4) / 3 + 16 {
+            bail!("base64 data URI payload exceeds 8 MiB limit");
+        }
+        let bytes = STANDARD
+            .decode(compact.as_bytes())
+            .or_else(|_| STANDARD_NO_PAD.decode(compact.as_bytes()))
+            .map_err(|e| anyhow!("invalid base64 payload in data URI: {e}"))?;
+        if bytes.is_empty() {
+            bail!("empty data:image payload");
+        }
+        if bytes.len() > MAX_DATA_URI_BYTES {
+            bail!("decoded data:image payload exceeds 8 MiB limit");
+        }
+        let kind = bitefoundry_html::sniff_content_kind(Some(&mime), None, Some(&bytes));
+        if kind != bitefoundry_html::ContentKind::RasterImage {
+            bail!("data:{mime} payload failed raster magic verification (detected {kind:?})");
+        }
+        Ok(Some((mime, bytes)))
     }
 }
 
@@ -1164,7 +1226,8 @@ mod tests {
         let hosted = client.download_hosted_bytes(&data_uri).await.unwrap();
         assert_eq!(hosted, png_bytes);
 
-        // Percent-encoded SVG data URI is also decoded and rasterized to PNG locally.
+        // Percent-encoded SVG data URI is rasterized to PNG when `svg-graphics` is enabled,
+        // or returns a clear feature-gate error when disabled.
         let svg_uri = "data:image/svg+xml,%3Csvg%20width%3D%2216%22%20height%3D%2216%22%3E%3Crect%20width%3D%2216%22%20height%3D%2216%22%20fill%3D%22%23e11d48%22/%3E%3C/svg%3E";
         let svg_att = AttachmentInfo {
             id: "inline-svg".into(),
@@ -1174,9 +1237,21 @@ mod tests {
             content_json: None,
             thumbnail_url: None,
         };
-        let (svg_name, svg_mime, svg_png) = client.fetch_attachment_bytes(&svg_att).await.unwrap();
-        assert_eq!(svg_name, "chart.svg");
-        assert_eq!(svg_mime, "image/png");
-        assert!(svg_png.starts_with(b"\x89PNG"));
+        #[cfg(feature = "svg-graphics")]
+        {
+            let (svg_name, svg_mime, svg_png) = client.fetch_attachment_bytes(&svg_att).await.unwrap();
+            assert_eq!(svg_name, "chart.svg");
+            assert_eq!(svg_mime, "image/png");
+            assert!(svg_png.starts_with(b"\x89PNG"));
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let err = client
+                .fetch_attachment_bytes(&svg_att)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("svg-graphics"), "unexpected error: {err}");
+        }
     }
 }

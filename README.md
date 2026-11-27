@@ -14,7 +14,7 @@
 
 <br />
 
-![teams TUI Demo](https://raw.githubusercontent.com/BiteFoundry/teams/master/assets/demo.gif)
+![teams TUI Demo](https://bitefoundry.dev/assets/demos/teams.gif)
 
 </div>
 

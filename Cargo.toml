@@ -14,23 +14,29 @@ path = "src/lib.rs"
 name = "teams"
 path = "src/main.rs"
 
+[features]
+default = ["html-js", "svg-graphics", "desktop-notify"]
+html-js = ["bitefoundry-html/js"]
+svg-graphics = ["bitefoundry-html/graphics"]
+desktop-notify = ["dep:notify-rust"]
+
 [dependencies]
 anyhow = "1"
 arboard = { version = "3", features = ["image-data"] }
 axum = "0.8"
 base64 = "0.22"
-bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
+bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "72273560cd5b689e66d37c81fc957e422855842d", default-features = false, features = ["serve"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-dirs = "5"
+dirs = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 markup5ever = "0.12"
-notify-rust = "4"
+notify-rust = { version = "4", optional = true }
 open = "5"
 rand = "0.8"
-ratatui = "0.28"
+ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "stream", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

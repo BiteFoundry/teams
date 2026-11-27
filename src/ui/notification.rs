@@ -1,17 +1,20 @@
-//! Desktop notifications via `notify-rust` on a background thread.
+//! Desktop notifications via `notify-rust` on a background thread (when the `desktop-notify` feature is enabled).
 
+#[cfg(any(feature = "desktop-notify", test))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const MAX_BODY_CHARS: usize = 120;
+#[cfg(any(feature = "desktop-notify", test))]
 const MAX_IN_FLIGHT_NOTIFICATIONS: usize = 2;
+#[cfg(feature = "desktop-notify")]
 static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(all(feature = "desktop-notify", target_os = "linux"), test))]
 fn has_non_empty_env(val: Option<&str>) -> bool {
     val.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(all(feature = "desktop-notify", target_os = "linux"), test))]
 fn linux_desktop_notifications_available_with(
     dbus_addr: Option<&str>,
     display: Option<&str>,
@@ -21,6 +24,7 @@ fn linux_desktop_notifications_available_with(
         && (has_non_empty_env(display) || has_non_empty_env(wayland_display))
 }
 
+#[cfg(feature = "desktop-notify")]
 fn desktop_notifications_supported() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -36,10 +40,12 @@ fn desktop_notifications_supported() -> bool {
     }
 }
 
+#[cfg(any(feature = "desktop-notify", test))]
 struct InFlightGuard {
     counter: &'static AtomicUsize,
 }
 
+#[cfg(any(feature = "desktop-notify", test))]
 impl InFlightGuard {
     fn try_acquire(counter: &'static AtomicUsize, limit: usize) -> Option<Self> {
         let mut current = counter.load(Ordering::Relaxed);
@@ -60,6 +66,7 @@ impl InFlightGuard {
     }
 }
 
+#[cfg(any(feature = "desktop-notify", test))]
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
@@ -87,8 +94,10 @@ pub fn chat_body(sender: &str, preview: &str) -> String {
 }
 
 /// Fires a desktop notification on a detached thread; errors are silently ignored.
-/// On headless Linux (missing D-Bus session bus or X11/Wayland display) or when
-/// too many notification threads are already in flight, this returns immediately.
+/// On headless Linux (missing D-Bus session bus or X11/Wayland display), when
+/// `desktop-notify` is disabled, or when too many notification threads are already
+/// in flight, this returns immediately.
+#[cfg(feature = "desktop-notify")]
 pub fn show(summary: &str, body: &str) {
     if !desktop_notifications_supported() {
         return;
@@ -112,6 +121,9 @@ pub fn show(summary: &str, body: &str) {
                 .show();
         });
 }
+
+#[cfg(not(feature = "desktop-notify"))]
+pub fn show(_summary: &str, _body: &str) {}
 
 #[cfg(test)]
 mod tests {
