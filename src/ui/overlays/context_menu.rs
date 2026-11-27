@@ -8,14 +8,11 @@ use ratatui::{
     Frame,
 };
 
-use crate::{
-    models::ConversationKind,
-    ui::{
-        action::Action,
-        app::{AppState, UiState},
-        hitmap::{HitMap, HitTarget, MessageScope},
-        overlays::{OverlayKind, OverlayOutcome},
-    },
+use crate::ui::{
+    action::Action,
+    app::UiState,
+    hitmap::{HitMap, HitTarget, MessageScope},
+    overlays::OverlayOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +34,7 @@ pub struct MenuItem {
 }
 
 impl MenuItem {
-    fn new(label: impl Into<String>, shortcut: Option<&str>, action: Action) -> Self {
+    pub fn new(label: impl Into<String>, shortcut: Option<&str>, action: Action) -> Self {
         Self {
             label: label.into(),
             shortcut: shortcut.map(str::to_string),
@@ -55,131 +52,9 @@ pub struct ContextMenu {
 }
 
 impl ContextMenu {
-    pub fn build(target: ContextTarget, anchor: (u16, u16), app: &AppState, ui: &UiState) -> Self {
-        let items = match target {
-            ContextTarget::NavRow(index) => vec![
-                MenuItem::new("Open", Some("Enter"), Action::SelectNavRow(index)),
-                MenuItem::new("Refresh", Some("F5"), Action::RefreshAll),
-                MenuItem::new(
-                    "New Chat",
-                    Some("Ctrl+N"),
-                    Action::OpenOverlay(OverlayKind::NewChat),
-                ),
-            ],
-            ContextTarget::Message { scope, msg_index } => {
-                let msg = app.message_at(scope, msg_index);
-                let is_channel_root = scope == MessageScope::Chat
-                    && app
-                        .active_conversation()
-                        .is_some_and(|c| c.kind == ConversationKind::Channel)
-                    && msg.is_some_and(|m| m.parent_msg_id.is_none());
-                let eff_att_len = msg
-                    .filter(|m| !m.deleted)
-                    .map_or(0, |m| m.effective_attachments().len());
-                let has_attach = eff_att_len > 0;
-                let is_me = msg.is_some_and(|m| m.is_me);
-
-                let mut items = Vec::new();
-                if is_channel_root {
-                    items.push(MenuItem::new(
-                        "Open Thread",
-                        Some("t"),
-                        Action::OpenThread { msg_index },
-                    ));
-                }
-                items.push(MenuItem::new(
-                    "Reply / Quote",
-                    Some("r"),
-                    Action::ReplyTo { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Add Reaction",
-                    Some("+"),
-                    Action::OpenReactions { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Copy Message",
-                    Some("y"),
-                    Action::CopyMessage { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Inspect HTML / Card",
-                    Some("H"),
-                    Action::OpenHtmlPreviewForMessage { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Extract Links (URLs)",
-                    Some("u"),
-                    Action::OpenLinksForMessage { scope, msg_index },
-                ));
-                items.push(MenuItem::new(
-                    "Toggle Inline Link URLs",
-                    Some("h"),
-                    Action::ToggleShowHrefs,
-                ));
-                if has_attach {
-                    let attach_index = ui.attach_index.min(eff_att_len.saturating_sub(1));
-                    items.push(MenuItem::new(
-                        "Download Attachment",
-                        Some("d"),
-                        Action::DownloadAttachment {
-                            scope,
-                            msg_index,
-                            attach_index,
-                        },
-                    ));
-                }
-                if is_me {
-                    items.push(MenuItem::new(
-                        "Delete Message",
-                        Some("Del"),
-                        Action::RequestDeleteMessage { scope, msg_index },
-                    ));
-                }
-                items
-            }
-            ContextTarget::Composer => vec![
-                MenuItem::new("Send", Some("Enter"), Action::SendMessage),
-                MenuItem::new("Toggle Subject", Some("Ctrl+S"), Action::ToggleSubject),
-                MenuItem::new("External Editor", Some("Ctrl+E"), Action::OpenExternalEditor),
-                MenuItem::new("Cancel Reply", Some("Esc"), Action::CancelReply),
-                MenuItem::new(
-                    "Clear Pending Images",
-                    Some("Ctrl+Shift+X"),
-                    Action::ClearPendingImages,
-                ),
-                MenuItem::new("Clear Draft", None, Action::ClearComposer),
-            ],
-            ContextTarget::Global => vec![
-                MenuItem::new("Search", Some("/"), Action::OpenSearch),
-                MenuItem::new("Browse & Attach File", Some("Ctrl+F"), Action::OpenFilePicker),
-                MenuItem::new(
-                    "New Chat",
-                    Some("Ctrl+N"),
-                    Action::OpenOverlay(OverlayKind::NewChat),
-                ),
-                MenuItem::new(
-                    "Change Presence",
-                    Some("Ctrl+P"),
-                    Action::OpenOverlay(OverlayKind::Presence),
-                ),
-                MenuItem::new("Refresh", Some("F5"), Action::RefreshAll),
-                MenuItem::new(
-                    "Settings",
-                    Some("Ctrl+,"),
-                    Action::OpenOverlay(OverlayKind::Settings),
-                ),
-                MenuItem::new(
-                    "Help",
-                    Some("?"),
-                    Action::OpenOverlay(OverlayKind::Help),
-                ),
-                MenuItem::new("Quit", Some("Ctrl+Q"), Action::QuitConfirm),
-            ],
-        };
-
+    pub fn from_items(context: ContextTarget, anchor: (u16, u16), items: Vec<MenuItem>) -> Self {
         Self {
-            context: target,
+            context,
             anchor,
             items,
             selected: 0,

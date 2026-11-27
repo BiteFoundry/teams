@@ -263,10 +263,6 @@ impl CommandPalette {
         Self::default()
     }
 
-    pub fn new_with_app(_app: &AppState, _ui: &UiState) -> Self {
-        Self::default()
-    }
-
     pub fn filtered(&self, app: &AppState, ui: &UiState) -> Vec<PaletteItem> {
         let raw = self.query.trim();
         let (mode, needle) = if let Some(rest) = raw.strip_prefix('>') {

@@ -14,7 +14,7 @@ use super::app::{AppState, Focus, NarrowPane, UiState};
 use super::composer::{self, ReplyPreview};
 use super::hitmap::{ButtonId, HitTarget, MessageScope};
 use super::nav_pane::{self, NavRow, TAB_CHATS, TAB_COUNT};
-use super::overlays::context_menu::{ContextMenu, ContextTarget};
+use super::overlays::context_menu::ContextTarget;
 use super::overlays::html_preview::{adaptive_card_to_html, HtmlPreviewOverlay};
 use super::overlays::image_preview::ImagePreviewOverlay;
 use super::overlays::links::{self, LinksOverlay};
@@ -1227,7 +1227,7 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                 Focus::Composer => ContextTarget::Composer,
                 Focus::Overlay => ContextTarget::Global,
             };
-            let menu = ContextMenu::build(ctx, (12, 6), app, ui);
+            let menu = app.build_context_menu(ctx, (12, 6), ui);
             ui.push_overlay(Overlay::context_menu(menu));
         }
         Action::OpenConfirm {
@@ -1411,7 +1411,7 @@ fn open_overlay(kind: OverlayKind, app: &mut AppState, ui: &mut UiState) {
     }
     let overlay = match kind {
         OverlayKind::ContextMenu => {
-            Overlay::context_menu(ContextMenu::build(ContextTarget::Global, (10, 5), app, ui))
+            Overlay::context_menu(app.build_context_menu(ContextTarget::Global, (10, 5), ui))
         }
         OverlayKind::CommandPalette => Overlay::command_palette(),
         OverlayKind::Settings => Overlay::settings(),
@@ -2368,7 +2368,7 @@ fn open_context_menu_at(column: u16, row: u16, app: &mut AppState, ui: &mut UiSt
         }
         ContextTarget::Composer | ContextTarget::Global => {}
     }
-    let menu = ContextMenu::build(ctx, (column, row), app, ui);
+    let menu = app.build_context_menu(ctx, (column, row), ui);
     ui.push_overlay(Overlay::context_menu(menu));
 }
 
