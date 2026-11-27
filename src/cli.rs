@@ -27,6 +27,7 @@ use crate::{
         TeamChannelError, TeamSummary, ThreadCoverage, ThreadView, UserProfile,
     },
     parser, resolver,
+    safe_text::{sanitize_terminal_inline, sanitize_terminal_text},
     serve::{self, ServeOptions},
     storage::Storage,
     tui, updater,
@@ -1920,8 +1921,8 @@ async fn cmd_whoami(cfg: &AppConfig, persona: Persona, json_out: bool) -> Result
         println!("persona: {}", persona.bin_name());
         println!(
             "user: {} ({})",
-            display_name.as_deref().unwrap_or("-"),
-            email.as_deref().unwrap_or("-")
+            sanitize_terminal_inline(display_name.as_deref().unwrap_or("-")),
+            sanitize_terminal_inline(email.as_deref().unwrap_or("-"))
         );
         println!("user_id: {}", user_id.as_deref().unwrap_or("-"));
         println!("client_id: {}", tokens.client_id);
@@ -2252,7 +2253,7 @@ fn print_chats_output(chats: &[ConversationSummary], json_out: bool) -> Result<(
                 "{}  [{}] {}{}  {}",
                 c.conv_key,
                 c.kind.as_str(),
-                c.title,
+                sanitize_terminal_inline(&c.title),
                 unread,
                 truncate_single_line(preview, 60)
             );
@@ -2374,7 +2375,11 @@ async fn cmd_new_chat(
             }))?
         );
     } else {
-        println!("Chat created: {} ({})", chat.title, chat.conv_key);
+        println!(
+            "Chat created: {} ({})",
+            sanitize_terminal_inline(&chat.title),
+            chat.conv_key
+        );
         if let Some(msg) = sent_msg {
             println!("Initial message sent: msg_id={}", msg.msg_id);
         }
@@ -2403,12 +2408,12 @@ fn print_teams_output(
         println!("No joined teams found.");
     } else {
         for team in &page.items {
-            println!("{} ({})", team.display_name, team.id);
+            println!("{} ({})", sanitize_terminal_inline(&team.display_name), team.id);
             for ch in &team.channels {
                 println!(
                     "  - {} [{}] ({})",
-                    ch.display_name,
-                    ch.membership_type,
+                    sanitize_terminal_inline(&ch.display_name),
+                    sanitize_terminal_inline(&ch.membership_type),
                     ch.conv_key()
                 );
             }
@@ -2442,13 +2447,13 @@ fn print_channels_output(
             }))?
         );
     } else {
-        println!("# {} ({})", team.display_name, team.id);
+        println!("# {} ({})", sanitize_terminal_inline(&team.display_name), team.id);
         for ch in &page.items {
             println!(
                 "  {}  [{}]  {}",
                 ch.conv_key(),
-                ch.membership_type,
-                ch.display_name
+                sanitize_terminal_inline(&ch.membership_type),
+                sanitize_terminal_inline(&ch.display_name)
             );
         }
         if let Some(ref next) = page.next_cursor {
@@ -2691,7 +2696,7 @@ fn print_read_output(
             serde_json::to_string_pretty(&read_messages_json(conv, res, hint.as_deref()))?
         );
     } else {
-        println!("# {} ({})", conv.title, conv.conv_key);
+        println!("# {} ({})", sanitize_terminal_inline(&conv.title), conv.conv_key);
         if res.messages.is_empty() {
             println!("(No messages)");
         } else {
@@ -2847,7 +2852,12 @@ fn print_thread_output(
             serde_json::to_string_pretty(&thread_json(conv, thread, coverage, hint.as_deref()))?
         );
     } else {
-        println!("# {} ({}) — Thread {}", conv.title, conv.conv_key, thread.root.msg_id);
+        println!(
+            "# {} ({}) — Thread {}",
+            sanitize_terminal_inline(&conv.title),
+            conv.conv_key,
+            thread.root.msg_id
+        );
         let mut display_root = thread.root.clone();
         display_root.reply_count = coverage.reply_total.unwrap_or(0);
         print_message_line(&display_root, "");
@@ -2876,6 +2886,7 @@ fn print_thread_output(
 }
 
 fn format_message_line(msg: &MessageItem, indent: &str) -> String {
+    let author = sanitize_terminal_inline(&msg.author_name);
     if msg.deleted {
         let tag_str = if msg.reply_count > 0 {
             format!(" [💬 {}]", msg.reply_count)
@@ -2884,7 +2895,7 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
         };
         return format!(
             "{indent}[{}] {} ({}){tag_str}: (deleted message)",
-            msg.created_at, msg.author_name, msg.msg_id
+            msg.created_at, author, msg.msg_id
         );
     }
 
@@ -2892,11 +2903,11 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
     let mut tags = Vec::new();
     if let Some(ref subj) = msg.subject {
         if !subj.trim().is_empty() {
-            tags.push(format!("[Subject: {}]", subj.trim()));
+            tags.push(format!("[Subject: {}]", sanitize_terminal_inline(subj.trim())));
         }
     }
     if msg.importance.eq_ignore_ascii_case("high") || msg.importance.eq_ignore_ascii_case("urgent") {
-        tags.push(format!("[Importance:{}]", msg.importance));
+        tags.push(format!("[Importance:{}]", sanitize_terminal_inline(&msg.importance)));
     }
     if msg.reply_count > 0 {
         tags.push(format!("[💬 {}]", msg.reply_count));
@@ -2906,9 +2917,8 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
             .iter()
             .filter(|a| !a.is_message_reference())
             .map(|a| {
-                a.name
-                    .clone()
-                    .unwrap_or_else(|| a.content_type.clone())
+                let raw = a.name.as_deref().unwrap_or(a.content_type.as_str());
+                sanitize_terminal_inline(raw).into_owned()
             })
             .collect();
         if !names.is_empty() {
@@ -2919,12 +2929,18 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
         let reacts: Vec<String> = msg
             .reactions
             .iter()
-            .map(|r| format!("{} {}", reaction_symbol(&r.reaction_type), r.count))
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    sanitize_terminal_inline(reaction_symbol(&r.reaction_type)),
+                    r.count
+                )
+            })
             .collect();
         tags.push(format!("[{}]", reacts.join(" ")));
     }
 
-    let body = if msg.deleted {
+    let raw_body = if msg.deleted {
         "(deleted message)".to_string()
     } else if !msg.body_plain.trim().is_empty() {
         msg.body_plain.trim().to_string()
@@ -2933,9 +2949,14 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
             .trim()
             .to_string()
     };
+    let body = sanitize_terminal_text(&raw_body);
 
     let quote = match (&msg.reply_to_author, &msg.reply_to_preview) {
-        (Some(author), Some(prev)) => format!(" ↩ {author}: {}", truncate_single_line(prev, 40)),
+        (Some(quote_author), Some(prev)) => format!(
+            " ↩ {}: {}",
+            sanitize_terminal_inline(quote_author),
+            truncate_single_line(prev, 40)
+        ),
         _ => String::new(),
     };
 
@@ -2947,7 +2968,7 @@ fn format_message_line(msg: &MessageItem, indent: &str) -> String {
 
     format!(
         "{indent}[{}] {} ({}){quote}{tag_str}: {}",
-        msg.created_at, msg.author_name, msg.msg_id, body
+        msg.created_at, author, msg.msg_id, body
     )
 }
 
@@ -3011,7 +3032,12 @@ async fn cmd_send(
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("Sent: {} ({}) msg_id={}", conv.title, conv.conv_key, sent.msg_id);
+        println!(
+            "Sent: {} ({}) msg_id={}",
+            sanitize_terminal_inline(&conv.title),
+            conv.conv_key,
+            sent.msg_id
+        );
     }
     Ok(())
 }
@@ -3061,7 +3087,10 @@ async fn cmd_reply(
     } else {
         println!(
             "Replied: {} ({}) msg_id={} (to {})",
-            conv.title, conv.conv_key, sent.msg_id, msg_id
+            sanitize_terminal_inline(&conv.title),
+            conv.conv_key,
+            sent.msg_id,
+            msg_id
         );
     }
     Ok(())
@@ -3099,7 +3128,7 @@ async fn cmd_send_file(
     } else {
         println!(
             "File sent: {} ({}) msg_id={} ({})",
-            conv.title,
+            sanitize_terminal_inline(&conv.title),
             conv.conv_key,
             sent.msg_id,
             path.display()
@@ -3217,7 +3246,11 @@ async fn cmd_update_chat(
             "conversation": chat,
         }))?);
     } else {
-        println!("Group chat topic updated: {} ({})", chat.title, chat.conv_key);
+        println!(
+            "Group chat topic updated: {} ({})",
+            sanitize_terminal_inline(&chat.title),
+            chat.conv_key
+        );
     }
     Ok(())
 }
@@ -3271,7 +3304,8 @@ async fn cmd_delete(
     } else {
         Some(prompt(&format!(
             "Delete message {msg_id} in '{}' ({})? Type 'yes' to continue: ",
-            conv.title, conv.conv_key
+            sanitize_terminal_inline(&conv.title),
+            conv.conv_key
         ))?)
     };
     delete_gate(yes, json_out, answer.as_deref())?;
@@ -3389,22 +3423,32 @@ async fn cmd_members(
         } else {
             let returned = payload["returned"].as_u64().unwrap_or(members.len() as u64);
             let header_count = payload["total"].as_u64().unwrap_or(returned);
-            println!("# {} ({}) Members ({})", conv.title, conv.conv_key, header_count);
+            println!(
+                "# {} ({}) Members ({})",
+                sanitize_terminal_inline(&conv.title),
+                conv.conv_key,
+                header_count
+            );
             for m in &members {
                 let role = if m.roles.is_empty() {
                     String::new()
                 } else {
-                    format!(" [{}]", m.roles.join(","))
+                    let roles: Vec<String> = m
+                        .roles
+                        .iter()
+                        .map(|r| sanitize_terminal_inline(r).into_owned())
+                        .collect();
+                    format!(" [{}]", roles.join(","))
                 };
                 let pres = m
                     .presence
                     .as_ref()
-                    .map(|p| format!(" ({})", p.availability))
+                    .map(|p| format!(" ({})", sanitize_terminal_inline(&p.availability)))
                     .unwrap_or_default();
                 println!(
                     "  {}  <{}>{}{}",
-                    m.display_name,
-                    m.email.as_deref().unwrap_or(&m.user_id),
+                    sanitize_terminal_inline(&m.display_name),
+                    sanitize_terminal_inline(m.email.as_deref().unwrap_or(&m.user_id)),
                     role,
                     pres
                 );
@@ -3449,9 +3493,14 @@ async fn cmd_users(
     } else {
         for u in &users {
             if let Some(addr) = u.mail.as_deref().or(u.user_principal_name.as_deref()) {
-                println!("{}  <{addr}>  {}", u.display_name, u.id);
+                println!(
+                    "{}  <{}>  {}",
+                    sanitize_terminal_inline(&u.display_name),
+                    sanitize_terminal_inline(addr),
+                    u.id
+                );
             } else {
-                println!("{}  {}", u.display_name, u.id);
+                println!("{}  {}", sanitize_terminal_inline(&u.display_name), u.id);
             }
         }
     }
@@ -3495,7 +3544,10 @@ async fn cmd_search(
         for hit in &hits {
             println!(
                 "[{}] {} | {}: {}",
-                hit.created_at, hit.conv_title, hit.author_name, hit.snippet
+                hit.created_at,
+                sanitize_terminal_inline(&hit.conv_title),
+                sanitize_terminal_inline(&hit.author_name),
+                sanitize_terminal_inline(&hit.snippet)
             );
         }
     }
@@ -3645,7 +3697,12 @@ async fn cmd_sync(
 
     if !json_out && target.is_some() {
         for conv in &targets {
-            println!("Syncing: {} ({}, target depth {})...", conv.title, conv.conv_key, depth);
+            println!(
+                "Syncing: {} ({}, target depth {})...",
+                sanitize_terminal_inline(&conv.title),
+                conv.conv_key,
+                depth
+            );
         }
     }
 
@@ -4023,7 +4080,11 @@ async fn cmd_presence(
         if json_out {
             println!("{}", serde_json::to_string_pretty(&status)?);
         } else {
-            println!("Current presence: {} ({})", status.availability, status.activity);
+            println!(
+            "Current presence: {} ({})",
+            sanitize_terminal_inline(&status.availability),
+            sanitize_terminal_inline(&status.activity)
+        );
         }
     }
     Ok(())
@@ -5366,8 +5427,8 @@ fn format_unix_ts(ts: i64) -> String {
 }
 
 fn truncate_single_line(input: &str, max_chars: usize) -> String {
-    let single = input.replace(['\r', '\n'], " ");
-    let trimmed = single.trim();
+    let sanitized = sanitize_terminal_inline(input);
+    let trimmed = sanitized.trim();
     if trimmed.chars().count() <= max_chars {
         trimmed.to_string()
     } else {

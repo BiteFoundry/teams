@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod models;
 pub mod parser;
 pub mod resolver;
+pub mod safe_text;
 pub mod serve;
 pub mod storage;
 pub mod sync;

@@ -6,6 +6,17 @@ description = "Microsoft Teams terminal client & AI agent toolkit (CLI, TUI, HTT
 repository = "https://github.com/BiteFoundry/teams"
 license = "MIT"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/teams-{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "teams{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [lib]
 name = "teams_cli"
 path = "src/lib.rs"
