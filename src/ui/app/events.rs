@@ -35,6 +35,7 @@ impl AppState {
                 let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
                 self.apply_active_read_guard(&mut convs);
                 self.conversations = convs;
+                self.bump_conversations_gen();
                 preserve_nav_selection(self, ui, prev_row);
                 if self.daemon_attached
                     && self.active_conv_key.is_none()
@@ -56,6 +57,7 @@ impl AppState {
                 // still exists, otherwise clamp so the selection never points past the list.
                 let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
                 self.teams = teams;
+                self.bump_teams_gen();
                 preserve_nav_selection(self, ui, prev_row);
             }
             CoreEvent::MessagesUpdated {
@@ -138,10 +140,16 @@ impl AppState {
                             self.oldest_reached,
                             &mut ui.chat_scroll.selected_idx,
                         );
+                        if self.tail_message_updated {
+                            self.bump_tail_message_gen();
+                        } else {
+                            self.bump_messages_gen();
+                        }
                     } else {
                         let window = self.messages.len().max(80);
                         if let Ok(msgs) = self.storage.list_root_messages(&conv_key, window, None) {
                             merge_optimistic_messages(&mut self.messages, msgs);
+                            self.bump_messages_gen();
                         }
                     }
                     clamp_chat_selection(self.messages.len(), &mut ui.chat_scroll.selected_idx);
@@ -178,6 +186,7 @@ impl AppState {
                             {
                                 conv.unread_count = 0;
                                 conv.last_read_at = Some(effective_read.clone());
+                                self.bump_conversations_gen();
                             }
                             if tokio::runtime::Handle::try_current().is_ok() {
                                 let mark_storage = self.storage.clone();
@@ -211,6 +220,7 @@ impl AppState {
                                 thread.replies = std::mem::take(&mut existing.replies);
                             }
                             self.active_thread = Some(thread);
+                            self.bump_thread_gen();
                             clamp_thread_selection(
                                 self.active_thread.as_ref(),
                                 &mut ui.thread_scroll.selected_idx,
@@ -240,6 +250,7 @@ impl AppState {
                     if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
                     {
                         self.activity_mentions = mentions;
+                        self.bump_mentions_gen();
                     }
                 }
                 if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
@@ -273,6 +284,7 @@ impl AppState {
                             if is_newer {
                                 conv.last_updated_at = Some(newest_in_event.created_at.clone());
                             }
+                            self.bump_conversations_gen();
                         }
                     }
                 }
@@ -281,11 +293,14 @@ impl AppState {
                 }
             }
             CoreEvent::PresenceUpdated(list) => {
-                for p in list {
-                    if p.user_id == self.my_user_id {
-                        self.my_presence = Some(p.clone());
+                if !list.is_empty() {
+                    for p in list {
+                        if p.user_id == self.my_user_id {
+                            self.my_presence = Some(p.clone());
+                        }
+                        self.presences.insert(p.user_id.clone(), p);
                     }
-                    self.presences.insert(p.user_id.clone(), p);
+                    self.bump_presences_gen();
                 }
             }
         }

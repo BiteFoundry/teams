@@ -364,6 +364,7 @@ pub struct UiState {
     pub kitty_keyboard_supported: bool,
     pub nav_unread_only: bool,
     pub pinned_convs: HashSet<String>,
+    pub nav_prefs_gen: u64,
     /// `(conv_key, last_read_at_iso)` captured right before marking a conversation read so `chat_view` renders the unread divider.
     pub unread_anchor: Option<(String, String)>,
     pub conv_history: Vec<String>,
@@ -436,6 +437,7 @@ impl UiState {
             kitty_keyboard_supported: false,
             nav_unread_only: false,
             pinned_convs: HashSet::new(),
+            nav_prefs_gen: 0,
             unread_anchor: None,
             conv_history: Vec::new(),
             conv_history_pos: 0,
@@ -462,6 +464,11 @@ impl UiState {
         s.pinned_convs = config.pinned_convs.iter().cloned().collect();
         s.graphics_caps = img_preview::detect_graphics_caps(config.image_protocol);
         s
+    }
+
+    #[inline]
+    pub fn bump_nav_prefs_gen(&mut self) {
+        self.nav_prefs_gen = self.nav_prefs_gen.wrapping_add(1);
     }
 
     pub fn focus(&self) -> Focus {

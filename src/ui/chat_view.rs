@@ -208,7 +208,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
     let offset = ui.chat_scroll.offset(height);
     ui.chat_scroll.offset = offset;
 
-    if ui.inline_images {
+    if ui.inline_images && !cached.inline_images.is_empty() {
         let width = (message_area.width as usize).max(12);
         let thumb_cols = width.saturating_sub(4).clamp(24, 72) as u16;
         let thumb_rows = 16u16;
@@ -216,24 +216,19 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut AppState, ui: &mut UiState,
         let inline_bg = AppState::inline_image_bg(&ui.theme);
         let vis_start = offset.saturating_sub(20);
         let vis_end = offset.saturating_add(height).saturating_add(20);
-        let mut to_fetch = Vec::new();
-        for (msg_idx, &(r_start, r_end)) in cached.ranges.iter().enumerate() {
-            if r_end > vis_start && r_start < vis_end {
-                if let Some(msg) = app.messages.get(msg_idx) {
-                    let eff = msg.effective_attachments();
-                    for att in eff.iter() {
-                        if img_preview::is_image_mime_or_name(
-                            &att.content_type,
-                            att.name.as_deref(),
-                        ) {
-                            to_fetch.push((msg.msg_id.clone(), att.clone()));
-                        }
-                    }
+        for (msg_idx, msg_id, att) in cached.inline_images.iter() {
+            if let Some(&(r_start, r_end)) = cached.ranges.get(*msg_idx) {
+                if r_end > vis_start && r_start < vis_end {
+                    app.request_teams_image(
+                        msg_id.clone(),
+                        att.clone(),
+                        thumb_cols,
+                        thumb_rows,
+                        cell_px,
+                        inline_bg,
+                    );
                 }
             }
-        }
-        for (msg_id, att) in to_fetch {
-            app.request_teams_image(msg_id, att, thumb_cols, thumb_rows, cell_px, inline_bg);
         }
     }
 
@@ -685,88 +680,6 @@ pub(crate) fn hash_theme_sig(h: &mut DualHasher, theme: &Theme) {
     h.write_hash(&theme.author_palette);
 }
 
-pub(crate) fn hash_message_sig(h: &mut DualHasher, msg: &MessageItem) {
-    h.write_str(&msg.msg_id);
-    h.write_str(&msg.created_at);
-    match &msg.parent_msg_id {
-        Some(p) => {
-            h.write_hash(&1u8);
-            h.write_str(p);
-        }
-        None => h.write_hash(&0u8),
-    }
-    match &msg.author_id {
-        Some(aid) => {
-            h.write_hash(&1u8);
-            h.write_str(aid);
-        }
-        None => h.write_hash(&0u8),
-    }
-    h.write_str(&msg.author_name);
-    h.write_hash(&msg.is_me);
-    match &msg.last_modified_at {
-        Some(ts) => {
-            h.write_hash(&1u8);
-            h.write_str(ts);
-        }
-        None => h.write_hash(&0u8),
-    }
-    match &msg.reply_to_id {
-        Some(id) => {
-            h.write_hash(&1u8);
-            h.write_str(id);
-        }
-        None => h.write_hash(&0u8),
-    }
-    h.write_hash(&msg.reply_to_author);
-    match &msg.reply_to_preview {
-        Some(p) => {
-            h.write_hash(&1u8);
-            h.write_str(p);
-        }
-        None => h.write_hash(&0u8),
-    }
-    h.write_hash(&msg.deleted);
-    h.write_hash(&msg.reply_count);
-    h.write_hash(&msg.reactions.len());
-    for r in &msg.reactions {
-        h.write_str(&r.reaction_type);
-        h.write_hash(&r.count);
-        h.write_hash(&r.me_reacted);
-    }
-    h.write_hash(&msg.mentions.len());
-    for m in &msg.mentions {
-        h.write_hash(&m.id);
-        h.write_str(&m.user_id);
-        h.write_str(&m.display_name);
-    }
-    let eff_attachments = msg.effective_attachments();
-    h.write_hash(&eff_attachments.len());
-    for att in eff_attachments.iter() {
-        h.write_str(&att.id);
-        match &att.name {
-            Some(name) => {
-                h.write_hash(&1u8);
-                h.write_str(name);
-            }
-            None => h.write_hash(&0u8),
-        }
-        h.write_str(&att.content_type);
-        h.write_hash(&att.content_url);
-        h.write_hash(&att.content_json);
-    }
-    h.write_str(&msg.body_html);
-    h.write_str(&msg.body_plain);
-    match &msg.subject {
-        Some(subj) => {
-            h.write_hash(&1u8);
-            h.write_str(subj);
-        }
-        None => h.write_hash(&0u8),
-    }
-    h.write_str(&msg.importance);
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatLinesSignature {
     prefix: (u64, u64),
@@ -777,12 +690,13 @@ struct ChatLinesSignature {
 fn compute_chat_lines_sig(
     conv_key: Option<&str>,
     view: &ChatRender,
+    messages_gen: u64,
+    messages_prefix_gen: u64,
+    presences_gen: u64,
     density: DensityMode,
     unread_anchor_ts: Option<&str>,
     my_user_id: &str,
     my_display_name: Option<&str>,
-    presences: Option<&HashMap<String, PresenceStatus>>,
-    my_presence: Option<&PresenceStatus>,
     width: usize,
     hyperlinks: bool,
     show_hrefs: bool,
@@ -834,15 +748,11 @@ fn compute_chat_lines_sig(
         }
         None => h.write_hash(&0u8),
     }
-    if let Some(mp) = my_presence {
-        h.write_hash(&1u8);
-        h.write_str(&mp.availability);
-    } else {
-        h.write_hash(&0u8);
-    }
+    h.write_hash(&presences_gen);
     hash_theme_sig(&mut h, theme);
     h.write_hash(&view.messages.len());
-    let Some((tail, prefix)) = view.messages.split_last() else {
+    h.write_hash(&messages_prefix_gen);
+    let Some(tail) = view.messages.last() else {
         let empty = h.finish();
         return ChatLinesSignature {
             prefix: empty,
@@ -853,22 +763,8 @@ fn compute_chat_lines_sig(
     h.write_str(&tail.msg_id);
     h.write_str(&tail.created_at);
     h.write_hash(&tail.is_me);
-    let hash_row = |h: &mut DualHasher, msg: &MessageItem| {
-        hash_message_sig(h, msg);
-        if let (Some(map), Some(aid)) = (presences, msg.author_id.as_deref()) {
-            if let Some(p) = map.get(aid) {
-                h.write_hash(&1u8);
-                h.write_str(&p.availability);
-            } else {
-                h.write_hash(&0u8);
-            }
-        }
-    };
-    for msg in prefix {
-        hash_row(&mut h, msg);
-    }
     let prefix = h.finish();
-    hash_row(&mut h, tail);
+    h.write_hash(&messages_gen);
     ChatLinesSignature {
         prefix,
         full: h.finish(),
@@ -880,6 +776,25 @@ struct ChatStream {
     signature: ChatLinesSignature,
     lines: Arc<Vec<RenderedLine>>,
     ranges: Arc<[(usize, usize)]>,
+    inline_images: Arc<[(usize, String, AttachmentInfo)]>,
+}
+
+fn collect_inline_image_attachments(
+    messages: &[MessageItem],
+    start_index: usize,
+    out: &mut Vec<(usize, String, AttachmentInfo)>,
+) {
+    for (msg_idx, msg) in messages.iter().enumerate().skip(start_index) {
+        if msg.deleted {
+            continue;
+        }
+        let eff = msg.effective_attachments();
+        for att in eff.iter() {
+            if img_preview::is_image_mime_or_name(&att.content_type, att.name.as_deref()) {
+                out.push((msg_idx, msg.msg_id.clone(), att.clone()));
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -924,12 +839,13 @@ fn build_stream_cached(
     let signature = compute_chat_lines_sig(
         app.active_conv_key.as_deref(),
         &view,
+        app.messages_gen,
+        app.messages_prefix_gen,
+        app.presences_gen,
         ui.density,
         active_unread_ts,
         &app.my_user_id,
         my_display_name,
-        Some(&app.presences),
-        app.my_presence.as_ref(),
         width,
         hyperlinks,
         ui.show_hrefs,
@@ -953,16 +869,27 @@ fn build_stream_cached(
 
     let mut out = Vec::new();
     let mut ranges = Vec::with_capacity(view.messages.len());
+    let mut inline_images: Vec<(usize, String, AttachmentInfo)> = Vec::new();
     if let Some(cached) = previous.filter(|cached| {
         tail_message_updated && cached.signature.prefix == signature.prefix && cached.ranges.len() > 1
     }) {
         if let Ok(lines) = Arc::try_unwrap(cached.lines) {
-            ranges.extend_from_slice(&cached.ranges[..cached.ranges.len() - 1]);
+            let prefix_len = cached.ranges.len() - 1;
+            ranges.extend_from_slice(&cached.ranges[..prefix_len]);
+            inline_images.extend(
+                cached
+                    .inline_images
+                    .iter()
+                    .filter(|(idx, _, _)| *idx < prefix_len)
+                    .cloned(),
+            );
             out = lines;
             // The date divider and spacing belong to the following message.
             out.truncate(ranges[ranges.len() - 1].1);
         }
     }
+    let start_index = ranges.len();
+    collect_inline_image_attachments(view.messages, start_index, &mut inline_images);
     if ranges.is_empty() && app.active_conv_key.is_some() {
         if let Some(banner) = build_history_banner_line(
             app.loading_older,
@@ -1004,6 +931,7 @@ fn build_stream_cached(
         signature,
         lines: Arc::new(out),
         ranges: Arc::from(ranges),
+        inline_images: Arc::from(inline_images),
     };
     CHAT_LINES_CACHE.set(Some(cached.clone()));
     cached
@@ -3357,7 +3285,7 @@ mod tests {
 
     #[test]
     fn chat_render_signature_and_line_cache_behavior() {
-        let mut msgs = vec![sample_msg("m1", Some("Weekly Report"), 3)];
+        let msgs = vec![sample_msg("m1", Some("Weekly Report"), 3)];
         let theme = Theme::default();
         let sig_base = {
             let view = ChatRender {
@@ -3368,11 +3296,12 @@ mod tests {
             compute_chat_lines_sig(
                 Some("chan:t1:c1"),
                 &view,
+                1,
+                1,
+                0,
                 DensityMode::Cozy,
                 None,
                 "",
-                None,
-                None,
                 None,
                 80,
                 false,
@@ -3413,11 +3342,12 @@ mod tests {
                 is_channel: true,
                 selected_index: None,
             },
+            1,
+            1,
+            0,
             DensityMode::Cozy,
             None,
             "",
-            None,
-            None,
             None,
             80,
             false,
@@ -3440,11 +3370,12 @@ mod tests {
                 is_channel: true,
                 selected_index: Some(0),
             },
+            1,
+            1,
+            0,
             DensityMode::Compact,
             None,
             "",
-            None,
-            None,
             None,
             80,
             false,
@@ -3466,11 +3397,12 @@ mod tests {
                 is_channel: true,
                 selected_index: Some(0),
             },
+            1,
+            1,
+            0,
             DensityMode::Cozy,
             None,
             "",
-            None,
-            None,
             None,
             100,
             false,
@@ -3485,19 +3417,20 @@ mod tests {
         );
         assert_ne!(sig_base, sig_width);
 
-        msgs[0].reactions[0].me_reacted = false;
-        let sig_react = compute_chat_lines_sig(
+        // Tail-only mutation bumps messages_gen while keeping prefix equal.
+        let sig_tail = compute_chat_lines_sig(
             Some("chan:t1:c1"),
             &ChatRender {
                 messages: &msgs,
                 is_channel: true,
                 selected_index: Some(0),
             },
+            2,
+            1,
+            0,
             DensityMode::Cozy,
             None,
             "",
-            None,
-            None,
             None,
             80,
             false,
@@ -3510,28 +3443,28 @@ mod tests {
             None,
             &theme,
         );
-        assert_ne!(sig_base, sig_react);
+        assert_eq!(sig_base.prefix, sig_tail.prefix);
+        assert_ne!(sig_base.full, sig_tail.full);
 
         cache.insert(sig_compact.full, cached_val.clone());
         cache.insert(sig_width.full, cached_val);
         assert!(cache.get(sig_base.full).is_none());
         assert!(cache.get(sig_width.full).is_some());
 
-        // Changing body_plain or attachment names invalidates the message hash.
-        let orig_msg = msgs[0].clone();
-        msgs[0].body_plain.push('!');
-        let sig_body = compute_chat_lines_sig(
+        // Bumping prefix gen or presences gen invalidates both prefix and full signatures.
+        let sig_prefix = compute_chat_lines_sig(
             Some("chan:t1:c1"),
             &ChatRender {
                 messages: &msgs,
                 is_channel: true,
                 selected_index: None,
             },
+            2,
+            2,
+            0,
             DensityMode::Cozy,
             None,
             "",
-            None,
-            None,
             None,
             80,
             false,
@@ -3544,8 +3477,8 @@ mod tests {
             None,
             &theme,
         );
-        assert_ne!(sig_base, sig_body);
-        msgs[0] = orig_msg;
+        assert_ne!(sig_base.prefix, sig_prefix.prefix);
+        assert_ne!(sig_base.full, sig_prefix.full);
     }
 
     #[test]

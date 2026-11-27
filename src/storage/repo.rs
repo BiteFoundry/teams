@@ -167,8 +167,11 @@ pub(crate) fn upsert_joined_teams_and_prune(
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for team_id in cached_team_ids.iter().filter(|id| !fetched.contains_key(id.as_str())) {
-        tx.execute("DELETE FROM teams WHERE team_id = ?1", params![team_id])?;
+    {
+        let mut del_team = tx.prepare_cached("DELETE FROM teams WHERE team_id = ?1")?;
+        for team_id in cached_team_ids.iter().filter(|id| !fetched.contains_key(id.as_str())) {
+            del_team.execute(params![team_id])?;
+        }
     }
 
     let cached_channels: Vec<(String, String)> = {
@@ -179,14 +182,17 @@ pub(crate) fn upsert_joined_teams_and_prune(
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    for (conv_key, team_id) in &cached_channels {
-        let keep = match fetched.get(team_id.as_str()) {
-            None => false,
-            Some(None) => true,
-            Some(Some(channels)) => channels.contains(conv_key),
-        };
-        if !keep {
-            tx.execute("DELETE FROM conversations WHERE conv_key = ?1", params![conv_key])?;
+    {
+        let mut del_conv = tx.prepare_cached("DELETE FROM conversations WHERE conv_key = ?1")?;
+        for (conv_key, team_id) in &cached_channels {
+            let keep = match fetched.get(team_id.as_str()) {
+                None => false,
+                Some(None) => true,
+                Some(Some(channels)) => channels.contains(conv_key),
+            };
+            if !keep {
+                del_conv.execute(params![conv_key])?;
+            }
         }
     }
 
@@ -401,6 +407,24 @@ pub fn upsert_messages_detailed(
     Ok(outcome)
 }
 
+pub(crate) fn upsert_message_batches_detailed(
+    conn: &mut Connection,
+    batches: &[Vec<MessageItem>],
+) -> Result<Vec<UpsertMessagesOutcome>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.transaction()?;
+    let mut outcomes = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mut outcome = UpsertMessagesOutcome::default();
+        upsert_messages_in_transaction(&tx, batch, Some(&mut outcome))?;
+        outcomes.push(outcome);
+    }
+    tx.commit()?;
+    Ok(outcomes)
+}
+
 fn upsert_messages_inner(
     conn: &mut Connection,
     messages: &[MessageItem],
@@ -487,14 +511,15 @@ fn upsert_messages_in_transaction(
                 reactions_json = excluded.reactions_json,
                 reply_count = MAX(messages.reply_count, excluded.reply_count),
                 web_url = COALESCE(excluded.web_url, messages.web_url)
+            RETURNING rowid
             ",
         )?;
 
-        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM messages_fts WHERE msg_key = ?1")?;
+        let mut fts_del_stmt = tx.prepare_cached("DELETE FROM messages_fts WHERE rowid = ?1")?;
         let mut fts_ins_stmt = tx.prepare_cached(
             "
-            INSERT INTO messages_fts (msg_key, conv_key, author_name, body_plain, subject)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO messages_fts (rowid, msg_key, conv_key, author_name, body_plain, subject)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ",
         )?;
 
@@ -607,33 +632,36 @@ fn upsert_messages_in_transaction(
             let has_mentions_int = i32::from(!msg.mentions.is_empty());
             let created_at_sort = crate::storage::db::normalize_timestamp_sort_key(&msg.created_at);
 
-            msg_stmt.execute(params![
-                msg_key.as_ref(),
-                msg.conv_key,
-                msg.msg_id,
-                msg.parent_msg_id,
-                msg.reply_to_id,
-                msg.reply_to_author,
-                msg.reply_to_preview,
-                msg.subject,
-                msg.author_id,
-                msg.author_name,
-                if msg.is_me { 1i32 } else { 0i32 },
-                msg.created_at,
-                created_at_sort,
-                msg.last_modified_at,
-                deleted_int,
-                msg.importance,
-                msg.message_type,
-                msg.body_html,
-                msg.body_plain,
-                attachments_json.as_ref(),
-                mentions_json.as_ref(),
-                reactions_json.as_ref(),
-                reply_count_i64,
-                msg.web_url,
-                has_mentions_int,
-            ])?;
+            let msg_rowid: i64 = msg_stmt.query_row(
+                params![
+                    msg_key.as_ref(),
+                    msg.conv_key,
+                    msg.msg_id,
+                    msg.parent_msg_id,
+                    msg.reply_to_id,
+                    msg.reply_to_author,
+                    msg.reply_to_preview,
+                    msg.subject,
+                    msg.author_id,
+                    msg.author_name,
+                    if msg.is_me { 1i32 } else { 0i32 },
+                    msg.created_at,
+                    created_at_sort,
+                    msg.last_modified_at,
+                    deleted_int,
+                    msg.importance,
+                    msg.message_type,
+                    msg.body_html,
+                    msg.body_plain,
+                    attachments_json.as_ref(),
+                    mentions_json.as_ref(),
+                    reactions_json.as_ref(),
+                    reply_count_i64,
+                    msg.web_url,
+                    has_mentions_int,
+                ],
+                |row| row.get(0),
+            )?;
             changed_count += 1;
             if let Some(out) = outcome.as_deref_mut() {
                 if !out.changed_ids.iter().any(|id| id == &msg.msg_id) {
@@ -646,10 +674,11 @@ fn upsert_messages_in_transaction(
 
             if !fts_unchanged {
                 if existing.is_some() {
-                    fts_del_stmt.execute(params![msg_key.as_ref()])?;
+                    fts_del_stmt.execute(params![msg_rowid])?;
                 }
                 if !msg.deleted {
                     fts_ins_stmt.execute(params![
+                        msg_rowid,
                         msg_key.as_ref(),
                         msg.conv_key,
                         msg.author_name,

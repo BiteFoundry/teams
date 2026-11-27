@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 const FIRST_PURE_TEAMS_SCHEMA_VERSION: i32 = 52;
-const SCHEMA_USER_VERSION_UNICODE61: i32 = 56;
-const SCHEMA_USER_VERSION_TRIGRAM: i32 = 57;
+const SCHEMA_USER_VERSION_UNICODE61: i32 = 58;
+const SCHEMA_USER_VERSION_TRIGRAM: i32 = 59;
 
 /// Normalizes an RFC3339 timestamp to a fixed-width UTC comparison key with 9 fractional digits
 /// (`YYYY-MM-DDTHH:MM:SS.NNNNNNNNNZ`). Empty or non-RFC3339 values are returned trimmed as-is.
@@ -44,11 +44,13 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         ",
     )
     .context("Failed to configure SQLite PRAGMAs")?;
+    let mut prev_user_version: i32 = 0;
     if !is_memory {
         let _ = conn.execute_batch("PRAGMA mmap_size = 67108864;");
         let user_version: i32 = conn
             .query_row("PRAGMA user_version;", [], |row| row.get(0))
             .unwrap_or(0);
+        prev_user_version = user_version;
         if user_version == SCHEMA_USER_VERSION_TRIGRAM
             || user_version == SCHEMA_USER_VERSION_UNICODE61
         {
@@ -245,7 +247,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
             .context("Failed to add messages.created_at_sort column")?;
         }
         let rows_to_fill: Vec<(String, String)> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare_cached(
                 "SELECT msg_key, created_at FROM messages WHERE created_at_sort = '' AND created_at != ''",
             )?;
             let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
@@ -253,7 +255,7 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         };
         if !rows_to_fill.is_empty() {
             let mut upd =
-                tx.prepare("UPDATE messages SET created_at_sort = ?1 WHERE msg_key = ?2")?;
+                tx.prepare_cached("UPDATE messages SET created_at_sort = ?1 WHERE msg_key = ?2")?;
             for (msg_key, created_at) in rows_to_fill {
                 let sort_key = normalize_timestamp_sort_key(&created_at);
                 upd.execute(rusqlite::params![sort_key, msg_key])?;
@@ -322,6 +324,24 @@ pub fn init_connection(conn: &Connection, is_memory: bool) -> Result<bool> {
         );
         ",
     )?;
+
+    if !is_memory && prev_user_version < SCHEMA_USER_VERSION_UNICODE61 {
+        let tx = conn
+            .unchecked_transaction()
+            .context("Failed to begin messages_fts rowid alignment migration")?;
+        tx.execute_batch(
+            "
+            DELETE FROM messages_fts;
+            INSERT INTO messages_fts (rowid, msg_key, conv_key, author_name, body_plain, subject)
+            SELECT rowid, msg_key, conv_key, author_name, body_plain, COALESCE(subject, '')
+            FROM messages
+            WHERE deleted = 0;
+            ",
+        )
+        .context("Failed to align messages_fts rowids with messages.rowid")?;
+        tx.commit()
+            .context("Failed to commit messages_fts rowid alignment migration")?;
+    }
 
     if !is_memory {
         let version = if messages_trigram {
@@ -674,5 +694,44 @@ mod tests {
             .unwrap();
         assert_eq!(hm1, 1);
         assert_eq!(hm2, 0);
+    }
+
+    #[test]
+    fn test_v57_migration_aligns_fts5_rowids() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("v57_fts_rowid.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            let _ = init_connection(&conn, false).unwrap();
+            // Simulate a v57 database where messages.rowid and messages_fts.rowid diverged.
+            conn.execute_batch(
+                "
+                INSERT INTO messages (
+                    rowid, msg_key, conv_key, msg_id, author_name, created_at, created_at_sort,
+                    importance, message_type, body_html, body_plain, attachments_json, mentions_json, reactions_json
+                ) VALUES
+                    (42, 'chat:c1|m1', 'chat:c1', 'm1', 'Alice', '2026-11-15T10:00:00Z', '2026-11-15T10:00:00.000000000Z',
+                     'normal', 'message', '<p>Quantum deployment</p>', 'Quantum deployment', '[]', '[]', '[]');
+                DELETE FROM messages_fts;
+                INSERT INTO messages_fts (rowid, msg_key, conv_key, author_name, body_plain, subject)
+                VALUES (1, 'chat:c1|m1', 'chat:c1', 'Alice', 'Quantum deployment', '');
+                PRAGMA user_version = 57;
+                ",
+            )
+            .unwrap();
+        }
+
+        // Re-opening upgrades v57 -> v58/v59 and aligns messages_fts.rowid = messages.rowid (42).
+        let conn = Connection::open(&db_path).unwrap();
+        let _ = init_connection(&conn, false).unwrap();
+        let fts_rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM messages_fts WHERE msg_key = 'chat:c1|m1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_rowid, 42);
     }
 }

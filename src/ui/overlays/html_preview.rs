@@ -515,50 +515,68 @@ impl HtmlPreviewOverlay {
 
         let html_theme = Self::html_theme(theme);
         let focused_idx = self.session.focused_control;
-        let (mut lines, graphics, focused_line, total_lines) = {
+        let initial_scroll_y = self.session.scroll_y;
+        let ensure_focus_visible = self.ensure_focus_visible;
+        let vh = viewport_h as usize;
+
+        let (mut visible_lines, graphics, total_lines, vis_top, vis_bot, max_scroll_y) = {
             let rendered = self.session.render(content_w, &html_theme, ui.show_hrefs);
+            let total_lines = rendered.lines.len();
             let focused_line = focused_idx
                 .and_then(|idx| rendered.controls.get(idx))
                 .map(|c| c.line);
-            (
-                rendered.lines.clone(),
-                rendered.graphics.clone(),
-                focused_line,
-                rendered.lines.len(),
-            )
-        };
 
-        let vh = viewport_h as usize;
-        if self.ensure_focus_visible {
-            if let Some(fline) = focused_line {
-                let sy = self.session.scroll_y as usize;
-                if fline < sy {
-                    self.session.scroll_y = fline.min(u16::MAX as usize) as u16;
-                } else if vh > 0 && fline >= sy.saturating_add(vh) {
-                    let target = fline.saturating_sub(vh.saturating_sub(1));
-                    self.session.scroll_y = target.min(u16::MAX as usize) as u16;
+            let mut scroll_y = initial_scroll_y;
+            if ensure_focus_visible {
+                if let Some(fline) = focused_line {
+                    let sy = scroll_y as usize;
+                    if fline < sy {
+                        scroll_y = fline.min(u16::MAX as usize) as u16;
+                    } else if vh > 0 && fline >= sy.saturating_add(vh) {
+                        let target = fline.saturating_sub(vh.saturating_sub(1));
+                        scroll_y = target.min(u16::MAX as usize) as u16;
+                    }
                 }
             }
-            self.ensure_focus_visible = false;
-        }
+            let max_scroll_y = total_lines.saturating_sub(vh).min(u16::MAX as usize) as u16;
+            scroll_y = scroll_y.min(max_scroll_y);
 
-        let max_scroll_y = total_lines.saturating_sub(vh).min(u16::MAX as usize) as u16;
-        self.session.scroll_y = self.session.scroll_y.min(max_scroll_y);
+            let vis_top = scroll_y as usize;
+            let vis_bot = vis_top.saturating_add(vh);
+            let slice_start = vis_top.min(total_lines);
+            let slice_end = vis_bot.min(total_lines);
+            let visible_lines: Vec<Line<'static>> = rendered.lines[slice_start..slice_end].to_vec();
+            let visible_graphics: Vec<_> = rendered
+                .graphics
+                .iter()
+                .filter(|g| {
+                    g.line_count > 0
+                        && g.line_start.saturating_add(g.line_count) > vis_top
+                        && g.line_start < vis_bot
+                })
+                .cloned()
+                .collect();
+            (
+                visible_lines,
+                visible_graphics,
+                total_lines,
+                vis_top,
+                vis_bot,
+                max_scroll_y,
+            )
+        };
+        self.ensure_focus_visible = false;
+        self.session.scroll_y = vis_top.min(u16::MAX as usize) as u16;
 
         let content_area = Rect::new(inner.x, inner.y, content_w, viewport_h);
         self.last_content_area = content_area;
 
-        let vis_top = self.session.scroll_y as usize;
-        let vis_bot = vis_top.saturating_add(vh);
         let bg_rgb = img_preview::color_to_rgb(theme.bg_elevated, (18, 20, 26));
         let mut pixel_skip_rects: Vec<(String, Rect, TerminalImageProtocol)> = Vec::new();
 
         for g in &graphics {
             let g_start = g.line_start;
             let g_end = g.line_start.saturating_add(g.line_count);
-            if g.line_count == 0 || g_end <= vis_top || g_start >= vis_bot {
-                continue;
-            }
             let cache_k = (g.node_id.0, content_w, ui.graphics_caps.protocol);
             let needs_decode = self.graphic_cache.get(&cache_k).is_none_or(|c| {
                 c.cell_px != ui.graphics_caps.cell_px || !Arc::ptr_eq(&c.source_bytes, &g.image_bytes)
@@ -587,12 +605,15 @@ impl HtmlPreviewOverlay {
             let rendered_img = &cached.rendered;
 
             if !rendered_img.protocol.is_pixel() {
-                for offset in 0..g.line_count {
-                    let line_idx = g_start + offset;
-                    if line_idx < lines.len() {
-                        lines[line_idx] = rendered_img
+                let slice_start = g_start.max(vis_top);
+                let slice_end = g_end.min(vis_bot);
+                for doc_line in slice_start..slice_end {
+                    let vis_idx = doc_line - vis_top;
+                    let g_offset = doc_line - g_start;
+                    if vis_idx < visible_lines.len() {
+                        visible_lines[vis_idx] = rendered_img
                             .lines
-                            .get(offset)
+                            .get(g_offset)
                             .cloned()
                             .unwrap_or_default();
                     }
@@ -635,10 +656,7 @@ impl HtmlPreviewOverlay {
             }
         }
 
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.session.scroll_y, 0)),
-            content_area,
-        );
+        frame.render_widget(Paragraph::new(visible_lines), content_area);
 
         if !pixel_skip_rects.is_empty() {
             let buf = frame.buffer_mut();

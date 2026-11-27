@@ -92,14 +92,20 @@ impl AppState {
                 web_url: None,
             };
             if let Some(ref pid) = thread_root_id {
+                let mut pushed_thread = false;
                 if let Some(thread) = self.active_thread.as_mut() {
                     if &thread.root.msg_id == pid {
                         thread.replies.push(optimistic_msg);
                         ui.thread_scroll.bottom();
+                        pushed_thread = true;
                     }
+                }
+                if pushed_thread {
+                    self.bump_thread_gen();
                 }
             } else {
                 self.messages.push(optimistic_msg);
+                self.bump_messages_gen();
                 ui.chat_scroll.bottom();
             }
             Some(opt_id)

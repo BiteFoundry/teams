@@ -275,6 +275,14 @@ impl Storage {
         repo::upsert_messages_detailed(&mut conn, messages)
     }
 
+    pub(crate) fn upsert_message_batches_detailed(
+        &self,
+        batches: &[Vec<MessageItem>],
+    ) -> Result<Vec<repo::UpsertMessagesOutcome>> {
+        let mut conn = self.lock_conn()?;
+        repo::upsert_message_batches_detailed(&mut conn, batches)
+    }
+
     /// Applies an accepted remote edit to a cached message via the standard upsert path
     /// (updating `messages`, `messages_fts`, and `conversations.last_msg_preview`).
     pub fn apply_local_edit(

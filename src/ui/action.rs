@@ -509,6 +509,7 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                     ..
                 }) => {
                     ui.collapsed_team_ids.insert(team_id.clone());
+                    ui.bump_nav_prefs_gen();
                 }
                 Some(NavRow::TeamChannel { .. }) => {
                     if let Some(parent_idx) = rows[..ui.nav_selected]
@@ -530,6 +531,7 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                     ..
                 }) => {
                     ui.collapsed_team_ids.remove(team_id);
+                    ui.bump_nav_prefs_gen();
                 }
                 Some(
                     NavRow::Chat { .. }
@@ -548,6 +550,7 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                 if !ui.collapsed_team_ids.remove(&team_id) {
                     ui.collapsed_team_ids.insert(team_id);
                 }
+                ui.bump_nav_prefs_gen();
             }
         }
         Action::TogglePinSelected => {
@@ -564,12 +567,14 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                     ui.pinned_convs.insert(key.clone());
                     true
                 };
+                ui.bump_nav_prefs_gen();
                 app.config.pinned_convs = ui.pinned_convs.iter().cloned().collect();
                 app.config.pinned_convs.sort();
                 let _ = app.config.save();
                 let _ = app.storage.set_conversation_pinned(&key, pinned_now);
                 if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == key) {
                     conv.pinned = pinned_now;
+                    app.bump_conversations_gen();
                 }
                 super::app::preserve_nav_selection(app, ui, prev_row);
                 ui.info(if pinned_now {
@@ -1161,6 +1166,7 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
                 if let Some(conv) = app.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
                     conv.unread_count = 0;
                     conv.last_read_at = Some(now_ts.clone());
+                    app.bump_conversations_gen();
                 }
                 let _ = app.storage.mark_conversation_read(&conv_key, &now_ts);
                 if tokio::runtime::Handle::try_current().is_ok() {

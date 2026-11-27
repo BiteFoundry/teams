@@ -1161,14 +1161,19 @@ fn format_system_event(detail: Option<&serde_json::Value>) -> Option<String> {
 }
 
 fn extract_quote_from_html(html: &str) -> (Option<String>, Option<String>, Option<String>) {
+    static BLOCKQUOTE_SEL: std::sync::LazyLock<Selector> = std::sync::LazyLock::new(|| {
+        Selector::parse("blockquote[itemid]").expect("valid blockquote selector")
+    });
+    static STRONG_SEL: std::sync::LazyLock<Selector> =
+        std::sync::LazyLock::new(|| Selector::parse("strong").expect("valid strong selector"));
+    static P_SEL: std::sync::LazyLock<Selector> =
+        std::sync::LazyLock::new(|| Selector::parse("p").expect("valid p selector"));
+
     if !html.contains("<blockquote") {
         return (None, None, None);
     }
     let frag = Html::parse_fragment(html);
-    let Ok(bq_sel) = Selector::parse("blockquote[itemid]") else {
-        return (None, None, None);
-    };
-    let Some(bq) = frag.select(&bq_sel).next() else {
+    let Some(bq) = frag.select(&BLOCKQUOTE_SEL).next() else {
         return (None, None, None);
     };
     let item_id = bq
@@ -1178,15 +1183,15 @@ fn extract_quote_from_html(html: &str) -> (Option<String>, Option<String>, Optio
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let author = Selector::parse("strong")
-        .ok()
-        .and_then(|sel| bq.select(&sel).next())
+    let author = bq
+        .select(&STRONG_SEL)
+        .next()
         .map(|el| el.text().collect::<String>().trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let preview = Selector::parse("p")
-        .ok()
-        .and_then(|sel| bq.select(&sel).next())
+    let preview = bq
+        .select(&P_SEL)
+        .next()
         .map(|el| el.text().collect::<String>().trim().to_string())
         .filter(|s| !s.is_empty());
 

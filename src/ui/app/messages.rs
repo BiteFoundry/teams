@@ -36,7 +36,10 @@ impl AppState {
                 scope_warning,
             ),
             UiMsg::PeerPresencesLoaded(presences) => {
-                self.presences.extend(presences);
+                if !presences.is_empty() {
+                    self.presences.extend(presences);
+                    self.bump_presences_gen();
+                }
             }
             UiMsg::MessagesLoaded {
                 req_seq,
@@ -135,6 +138,7 @@ impl AppState {
             UiMsg::ChatCreated(conv) => {
                 if !self.conversations.iter().any(|c| c.conv_key == conv.conv_key) {
                     self.conversations.insert(0, conv.clone());
+                    self.bump_conversations_gen();
                 }
                 self.select_conversation(ui, conv.target);
             }
@@ -219,6 +223,10 @@ impl AppState {
         self.teams = teams;
         self.activity_mentions = mentions;
         self.presences.extend(presences);
+        self.bump_conversations_gen();
+        self.bump_teams_gen();
+        self.bump_mentions_gen();
+        self.bump_presences_gen();
         preserve_nav_selection(self, ui, prev_row);
         self.syncing = false;
         self.sync_summary = "Synced".to_string();
@@ -247,6 +255,7 @@ impl AppState {
                 let prev_len = self.messages.len();
                 let prev_last_id = self.messages.last().map(|m| m.msg_id.clone());
                 merge_optimistic_messages(&mut self.messages, messages);
+                self.bump_messages_gen();
                 clamp_chat_selection(
                     self.messages.len(),
                     &mut ui.chat_scroll.selected_idx,
@@ -364,6 +373,7 @@ impl AppState {
             let prev_row = nav_pane::nav_row_at(self, ui, ui.nav_selected);
             self.apply_active_read_guard(&mut conversations);
             self.conversations = conversations;
+            self.bump_conversations_gen();
             preserve_nav_selection(self, ui, prev_row);
         }
     }
@@ -406,10 +416,14 @@ impl AppState {
                 .iter_mut()
                 .find(|m| m.msg_id == thread.root.msg_id && m.parent_msg_id.is_none())
             {
-                root.reply_count = reply_count;
+                if root.reply_count != reply_count {
+                    root.reply_count = reply_count;
+                    self.bump_messages_gen();
+                }
             }
             let target_reply_id = self.pending_thread_reply_id.take();
             self.active_thread = Some(thread);
+            self.bump_thread_gen();
             if let (Some(target_id), Some(active)) =
                 (target_reply_id.as_deref(), self.active_thread.as_ref())
             {
@@ -487,6 +501,7 @@ impl AppState {
                             thread.replies.push(sent);
                             ui.thread_scroll.bottom();
                         }
+                        self.bump_thread_gen();
                     }
                 }
                 if let Some(root) = self.messages.iter_mut().find(|m| m.msg_id == pid) {
@@ -495,6 +510,7 @@ impl AppState {
                     } else {
                         root.reply_count = root.reply_count.saturating_add(1);
                     }
+                    self.bump_messages_gen();
                 }
             } else if let Some(opt_id) = optimistic_id.as_deref() {
                 if let Some(pos) = self.messages.iter().position(|m| m.msg_id == opt_id) {
@@ -503,12 +519,15 @@ impl AppState {
                     } else {
                         self.messages[pos] = sent;
                     }
+                    self.bump_messages_gen();
                 } else if !self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
                     self.messages.push(sent);
+                    self.bump_messages_gen();
                     ui.chat_scroll.bottom();
                 }
             } else if !self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
                 self.messages.push(sent);
+                self.bump_messages_gen();
                 ui.chat_scroll.bottom();
             }
         }
@@ -528,6 +547,7 @@ impl AppState {
                     if let Some(thread) = self.active_thread.as_mut() {
                         if &thread.root.msg_id == pid {
                             thread.replies.retain(|r| &r.msg_id != opt_id);
+                            self.bump_thread_gen();
                         }
                     }
                     clamp_thread_selection(
@@ -536,6 +556,7 @@ impl AppState {
                     );
                 } else {
                     self.messages.retain(|m| &m.msg_id != opt_id);
+                    self.bump_messages_gen();
                     clamp_chat_selection(
                         self.messages.len(),
                         &mut ui.chat_scroll.selected_idx,
@@ -575,6 +596,7 @@ impl AppState {
                         && !thread.replies.iter().any(|r| r.msg_id == sent.msg_id)
                     {
                         thread.replies.push(sent);
+                        self.bump_thread_gen();
                         ui.thread_scroll.bottom();
                     }
                 }
@@ -584,9 +606,11 @@ impl AppState {
                     } else {
                         root.reply_count = root.reply_count.saturating_add(1);
                     }
+                    self.bump_messages_gen();
                 }
             } else if !self.messages.iter().any(|m| m.msg_id == sent.msg_id) {
                 self.messages.push(sent);
+                self.bump_messages_gen();
                 ui.chat_scroll.bottom();
             }
         }
@@ -600,34 +624,51 @@ impl AppState {
     ) {
         if self.active_conv_key.as_deref() == Some(&conv_key) {
             if let Some(ref pid) = parent_msg_id {
+                let mut thread_changed = false;
                 if let Some(thread) = self.active_thread.as_mut() {
                     for r in &mut thread.replies {
                         if r.msg_id == msg_id {
                             mark_message_deleted_in_memory(r);
+                            thread_changed = true;
                         }
                     }
+                }
+                if thread_changed {
+                    self.bump_thread_gen();
                 }
                 if let Some(root) = self.messages.iter_mut().find(|m| &m.msg_id == pid) {
                     if let Ok(Some(db_root)) = self.storage.get_message(&conv_key, pid) {
                         root.reply_count = db_root.reply_count;
+                        self.bump_messages_gen();
                     }
                 }
             } else {
+                let mut msg_changed = false;
                 for m in &mut self.messages {
                     if m.msg_id == msg_id {
                         mark_message_deleted_in_memory(m);
+                        msg_changed = true;
                     }
                 }
+                if msg_changed {
+                    self.bump_messages_gen();
+                }
+                let mut thread_changed = false;
                 if let Some(thread) = self.active_thread.as_mut() {
                     if thread.root.msg_id == msg_id {
                         mark_message_deleted_in_memory(&mut thread.root);
+                        thread_changed = true;
                     }
+                }
+                if thread_changed {
+                    self.bump_thread_gen();
                 }
             }
         }
         if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == conv_key) {
             if conv.last_msg_id.as_deref() == Some(msg_id.as_str()) {
                 conv.last_msg_preview = Some("(deleted message)".to_string());
+                self.bump_conversations_gen();
             }
         }
         if !self.my_user_id.is_empty()
@@ -639,6 +680,7 @@ impl AppState {
             if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
             {
                 self.activity_mentions = mentions;
+                self.bump_mentions_gen();
             }
         }
     }
@@ -651,27 +693,38 @@ impl AppState {
         added: bool,
     ) {
         if self.active_conv_key.as_deref() == Some(&conv_key) {
-            let my_name = self.my_profile.as_ref().map(|p| p.display_name.as_str());
+            let my_name = self.my_profile.as_ref().map(|p| p.display_name.clone());
+            let mut msg_changed = false;
             if let Some(m) = self.messages.iter_mut().find(|m| m.msg_id == msg_id) {
-                crate::storage::apply_reaction_toggle(m, &reaction_type, added, my_name);
+                crate::storage::apply_reaction_toggle(m, &reaction_type, added, my_name.as_deref());
+                msg_changed = true;
             }
+            if msg_changed {
+                self.bump_messages_gen();
+            }
+            let mut thread_changed = false;
             if let Some(thread) = self.active_thread.as_mut() {
                 if thread.root.msg_id == msg_id {
                     crate::storage::apply_reaction_toggle(
                         &mut thread.root,
                         &reaction_type,
                         added,
-                        my_name,
+                        my_name.as_deref(),
                     );
+                    thread_changed = true;
                 }
                 if let Some(r) = thread.replies.iter_mut().find(|r| r.msg_id == msg_id) {
                     crate::storage::apply_reaction_toggle(
                         r,
                         &reaction_type,
                         added,
-                        my_name,
+                        my_name.as_deref(),
                     );
+                    thread_changed = true;
                 }
+            }
+            if thread_changed {
+                self.bump_thread_gen();
             }
         }
     }
@@ -723,6 +776,7 @@ impl AppState {
         if !uid.is_empty() {
             self.presences.insert(uid, status);
         }
+        self.bump_presences_gen();
     }
 
     fn handle_image_decode_failed(
@@ -848,12 +902,14 @@ impl AppState {
         }
         if let Some(p) = presence {
             self.my_presence = Some(p);
+            self.bump_presences_gen();
         }
         self.emit_scope_warning_once(ui, scope_warning);
         if !self.my_user_id.is_empty() && self.activity_mentions.is_empty() {
             if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50)
             {
                 self.activity_mentions = mentions;
+                self.bump_mentions_gen();
             }
         }
     }

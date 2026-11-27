@@ -52,17 +52,24 @@ pub struct AppState {
     pub my_user_id: String,
     pub my_presence: Option<PresenceStatus>,
     pub conversations: Vec<ConversationSummary>,
+    pub conversations_gen: u64,
     pub teams: Vec<TeamSummary>,
+    pub teams_gen: u64,
     pub active_conv_key: Option<String>,
     pub active_target: Option<ConversationTarget>,
     pub messages: Vec<MessageItem>,
+    pub messages_gen: u64,
+    pub messages_prefix_gen: u64,
     /// A single changed row replaced the last message at the same position.
     pub(crate) tail_message_updated: bool,
     pub active_thread: Option<ThreadView>,
+    pub thread_gen: u64,
     pub activity_mentions: Vec<MessageItem>,
+    pub mentions_gen: u64,
     pub members: Vec<MemberInfo>,
     pub member_fetched_at: HashMap<String, Instant>,
     pub presences: HashMap<String, PresenceStatus>,
+    pub presences_gen: u64,
     pub drafts: HashMap<String, String>,
     pub draft_save_seq: Arc<AtomicU64>,
     pub draft_save_lock: Arc<Mutex<()>>,
@@ -146,16 +153,23 @@ impl AppState {
             my_user_id,
             my_presence: None,
             conversations: Vec::new(),
+            conversations_gen: 0,
             teams: Vec::new(),
+            teams_gen: 0,
             active_conv_key: None,
             active_target: None,
             messages: Vec::new(),
+            messages_gen: 0,
+            messages_prefix_gen: 0,
             tail_message_updated: false,
             active_thread: None,
+            thread_gen: 0,
             activity_mentions: Vec::new(),
+            mentions_gen: 0,
             members: Vec::new(),
             member_fetched_at: HashMap::new(),
             presences: HashMap::new(),
+            presences_gen: 0,
             drafts,
             draft_save_seq: Arc::new(AtomicU64::new(0)),
             draft_save_lock: Arc::new(Mutex::new(())),
@@ -246,18 +260,62 @@ impl AppState {
         }
     }
 
+    #[inline]
+    pub fn bump_messages_gen(&mut self) {
+        self.messages_gen = self.messages_gen.wrapping_add(1);
+        self.messages_prefix_gen = self.messages_prefix_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_tail_message_gen(&mut self) {
+        self.messages_gen = self.messages_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_conversations_gen(&mut self) {
+        self.conversations_gen = self.conversations_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_teams_gen(&mut self) {
+        self.teams_gen = self.teams_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_mentions_gen(&mut self) {
+        self.mentions_gen = self.mentions_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_presences_gen(&mut self) {
+        self.presences_gen = self.presences_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    pub fn bump_thread_gen(&mut self) {
+        self.thread_gen = self.thread_gen.wrapping_add(1);
+    }
+
     pub fn message_at_mut(
         &mut self,
         scope: MessageScope,
         msg_index: usize,
     ) -> Option<&mut MessageItem> {
         match scope {
-            MessageScope::Chat => self.messages.get_mut(msg_index),
-            MessageScope::ThreadRoot => self.active_thread.as_mut().map(|t| &mut t.root),
-            MessageScope::ThreadReply => self
-                .active_thread
-                .as_mut()
-                .and_then(|t| t.replies.get_mut(msg_index)),
+            MessageScope::Chat => {
+                self.bump_messages_gen();
+                self.messages.get_mut(msg_index)
+            }
+            MessageScope::ThreadRoot => {
+                self.bump_thread_gen();
+                self.active_thread.as_mut().map(|t| &mut t.root)
+            }
+            MessageScope::ThreadReply => {
+                self.bump_thread_gen();
+                self.active_thread
+                    .as_mut()
+                    .and_then(|t| t.replies.get_mut(msg_index))
+            }
         }
     }
 

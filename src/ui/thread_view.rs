@@ -23,7 +23,7 @@ use crate::{
     ui::{
         app::{AppState, Focus, UiState},
         chat_view::{
-            apply_selection_to_lines, hash_message_sig, hash_theme_sig, messages_groupable,
+            apply_selection_to_lines, hash_theme_sig, messages_groupable,
             render_message_item_with_ctx, render_scrolled_lines_with_selection, truncate,
             CachedStream, DualHasher, LineSliceCache, MessageRenderCtx, RenderedLine,
             VisibleSelection,
@@ -40,11 +40,11 @@ thread_local! {
 #[allow(clippy::too_many_arguments)]
 fn compute_thread_sig(
     thread: &ThreadView,
+    thread_gen: u64,
+    presences_gen: u64,
     density: DensityMode,
     my_user_id: &str,
     my_display_name: Option<&str>,
-    presences: Option<&HashMap<String, PresenceStatus>>,
-    my_presence: Option<&PresenceStatus>,
     image_cache_gen: u64,
     inline_images: bool,
     cell_px: (u16, u16),
@@ -54,33 +54,10 @@ fn compute_thread_sig(
 ) -> (u64, u64) {
     let mut h = DualHasher::new(0x5448_5245_4144_5f4c);
     h.write_str(&thread.conv_key);
-    hash_message_sig(&mut h, &thread.root);
+    h.write_str(&thread.root.msg_id);
     h.write_hash(&thread.replies.len());
-    for reply in &thread.replies {
-        hash_message_sig(&mut h, reply);
-        if let (Some(map), Some(aid)) = (presences, reply.author_id.as_deref()) {
-            if let Some(p) = map.get(aid) {
-                h.write_hash(&1u8);
-                h.write_str(&p.availability);
-            } else {
-                h.write_hash(&0u8);
-            }
-        }
-    }
-    if let (Some(map), Some(aid)) = (presences, thread.root.author_id.as_deref()) {
-        if let Some(p) = map.get(aid) {
-            h.write_hash(&1u8);
-            h.write_str(&p.availability);
-        } else {
-            h.write_hash(&0u8);
-        }
-    }
-    if let Some(mp) = my_presence {
-        h.write_hash(&1u8);
-        h.write_str(&mp.availability);
-    } else {
-        h.write_hash(&0u8);
-    }
+    h.write_hash(&thread_gen);
+    h.write_hash(&presences_gen);
     h.write_hash(&density);
     h.write_str(my_user_id);
     if let Some(dn) = my_display_name {
@@ -162,6 +139,8 @@ pub fn draw(
 
     let cached = build_thread_stream_cached(
         thread,
+        app.thread_gen,
+        app.presences_gen,
         ui.density,
         &app.my_user_id,
         my_display_name,
@@ -379,24 +358,23 @@ pub fn build_thread_lines(
     _hyperlinks: bool,
 ) -> Vec<RenderedLine> {
     let width = width.max(12);
-    let cached = build_thread_stream_cached(
+    let (mut lines, ranges) = build_thread_lines_uncached(
         thread,
+        None,
         DensityMode::Cozy,
         "",
         None,
         None,
         None,
         None,
-        0,
         (0, 0),
         crate::img_preview::TerminalGraphicsCaps::default().cell_px,
         false,
         theme,
         width,
     );
-    let mut lines = cached.lines.to_vec();
     if let Some(sel_idx) = selected_idx {
-        if let Some(&(start, end)) = cached.ranges.get(sel_idx) {
+        if let Some(&(start, end)) = ranges.get(sel_idx) {
             let (scope, msg_index) = if sel_idx == 0 {
                 (MessageScope::ThreadRoot, 0)
             } else {
@@ -411,6 +389,8 @@ pub fn build_thread_lines(
 #[allow(clippy::too_many_arguments)]
 fn build_thread_stream_cached(
     thread: &ThreadView,
+    thread_gen: u64,
+    presences_gen: u64,
     density: DensityMode,
     my_user_id: &str,
     my_display_name: Option<&str>,
@@ -427,11 +407,11 @@ fn build_thread_stream_cached(
     let width = width.max(12);
     let sig = compute_thread_sig(
         thread,
+        thread_gen,
+        presences_gen,
         density,
         my_user_id,
         my_display_name,
-        presences,
-        my_presence,
         image_cache_gen,
         image_cache.is_some(),
         cell_px,

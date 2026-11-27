@@ -3,13 +3,19 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Cursor, IsTerminal};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
-use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
+use image::{
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType,
+    DynamicImage, ImageFormat, Rgba,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -36,6 +42,7 @@ pub const MAX_SIXEL_PIXELS: u64 = 4_000_000;
 
 const MAX_ITERM2_RAW_BYTES: usize = 2 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+#[cfg(test)]
 const MAX_QUANT_LOOKUP_CACHE: usize = 16_384;
 
 /// Explicit sizing contract for terminal image layout (replaces implicit `max_rows >= max_cols` signaling).
@@ -1375,6 +1382,7 @@ pub fn decode_and_render_halfblocks_with_cell_px(
         (bytes, format_label_for(guessed))
     };
     let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
+    let is_opaque = !dyn_img.color().has_alpha();
     let rgba = dyn_img.into_rgba8();
     let (width_px, height_px) = rgba.dimensions();
     if width_px == 0 || height_px == 0 {
@@ -1383,7 +1391,16 @@ pub fn decode_and_render_halfblocks_with_cell_px(
 
     let (target_w, target_h) = compute_halfblock_dims(width_px, height_px, fit, cell_px);
 
-    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
+    let filter = if target_w <= 256 && target_h <= 512 {
+        FilterType::Triangle
+    } else {
+        FilterType::Lanczos3
+    };
+    let resized = if width_px == target_w && height_px == target_h {
+        rgba
+    } else {
+        image::imageops::resize(&rgba, target_w, target_h, filter)
+    };
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
     type Rgb = (u8, u8, u8);
@@ -1393,8 +1410,13 @@ pub fn decode_and_render_halfblocks_with_cell_px(
         let mut run = String::new();
 
         for x in 0..target_w {
-            let top = blend_over_bg(*resized.get_pixel(x, y), bg_rgb);
-            let bot = blend_over_bg(*resized.get_pixel(x, y + 1), bg_rgb);
+            let top_px = *resized.get_pixel(x, y);
+            let bot_px = *resized.get_pixel(x, y + 1);
+            let (top, bot) = if is_opaque {
+                ((top_px[0], top_px[1], top_px[2]), (bot_px[0], bot_px[1], bot_px[2]))
+            } else {
+                (blend_over_bg(top_px, bg_rgb), blend_over_bg(bot_px, bg_rgb))
+            };
             let pair = (top, bot);
 
             if current_pair == Some(pair) {
@@ -1566,16 +1588,21 @@ pub fn decode_and_render_for_protocol(
             (payload, Some(backing))
         }
         TerminalImageProtocol::Sixel => {
-            let rgba = dyn_img.to_rgba8();
+            let is_opaque = !dyn_img.color().has_alpha();
+            let rgba = dyn_img.into_rgba8();
             let resized = if width_px == target_px_w && height_px == target_px_h {
                 rgba
             } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+                let filter = if target_px_w <= 256 && target_px_h <= 256 {
+                    FilterType::Triangle
+                } else {
+                    FilterType::Lanczos3
+                };
+                image::imageops::resize(&rgba, target_px_w, target_px_h, filter)
             };
-            let mut flat_rgba = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
-            for px in resized.pixels() {
-                let (r, g, b) = blend_over_bg(*px, bg_rgb);
-                flat_rgba.extend_from_slice(&[r, g, b, 255]);
+            let mut flat_rgba = resized.into_raw();
+            if !is_opaque {
+                blend_rgba_in_place(&mut flat_rgba, bg_rgb);
             }
             let (palette, indexed) =
                 quantize_rgba_to_256(&flat_rgba, target_px_w as usize, target_px_h as usize);
@@ -1646,32 +1673,35 @@ fn choose_kitty_fit_axis(
 
 fn encode_kitty_tui_payload(png_bytes: &[u8], axis: KittyFitAxis) -> String {
     let b64 = B64_STANDARD.encode(png_bytes);
-    let chunks: Vec<&str> = b64
-        .as_bytes()
-        .chunks(4096)
-        .map(|c| std::str::from_utf8(c).expect("base64 is valid ASCII"))
-        .collect();
-    let total = chunks.len();
+    let total = b64.len().div_ceil(4096);
     let mut out = String::with_capacity(b64.len() + total * 48);
-    for (idx, chunk) in chunks.into_iter().enumerate() {
-        let more = if idx + 1 < total { 1 } else { 0 };
+    for (idx, chunk_bytes) in b64.as_bytes().chunks(4096).enumerate() {
+        let chunk = std::str::from_utf8(chunk_bytes).expect("base64 is valid ASCII");
+        let more = if idx + 1 < total { '1' } else { '0' };
         if idx == 0 {
+            out.push_str("\x1b_Gf=100,a=T,q=2,i=");
+            push_usize_ascii(&mut out, KITTY_PREVIEW_IMAGE_ID as usize);
             match axis {
                 KittyFitAxis::Cols(c) => {
-                    let _ = write!(
-                        out,
-                        "\x1b_Gf=100,a=T,q=2,i={KITTY_PREVIEW_IMAGE_ID},c={c},C=1,m={more};{chunk}\x1b\\"
-                    );
+                    out.push_str(",c=");
+                    push_usize_ascii(&mut out, c as usize);
                 }
                 KittyFitAxis::Rows(r) => {
-                    let _ = write!(
-                        out,
-                        "\x1b_Gf=100,a=T,q=2,i={KITTY_PREVIEW_IMAGE_ID},r={r},C=1,m={more};{chunk}\x1b\\"
-                    );
+                    out.push_str(",r=");
+                    push_usize_ascii(&mut out, r as usize);
                 }
             }
+            out.push_str(",C=1,m=");
+            out.push(more);
+            out.push(';');
+            out.push_str(chunk);
+            out.push_str("\x1b\\");
         } else {
-            let _ = write!(out, "\x1b_Gq=2,m={more};{chunk}\x1b\\");
+            out.push_str("\x1b_Gq=2,m=");
+            out.push(more);
+            out.push(';');
+            out.push_str(chunk);
+            out.push_str("\x1b\\");
         }
     }
     out
@@ -1840,6 +1870,24 @@ pub fn encode_sixel_rgba(flat_rgba: &[u8], width: u32, height: u32) -> String {
     encode_sixel_indexed_slice(&palette, &indexed, w, 0, 0, w, h)
 }
 
+#[inline]
+fn push_usize_ascii(out: &mut String, mut n: usize) {
+    if n < 10 {
+        out.push((b'0' + n as u8) as char);
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    for &b in &buf[pos..] {
+        out.push(b as char);
+    }
+}
+
 fn encode_sixel_indexed_slice(
     palette: &[(u8, u8, u8)],
     indexed: &[u8],
@@ -1854,16 +1902,28 @@ fn encode_sixel_indexed_slice(
     }
 
     let mut out = String::with_capacity(crop_w * crop_h / 2 + palette.len() * 16 + 32);
-    let _ = write!(out, "\x1bP0;1;q\"1;1;{crop_w};{crop_h}");
+    out.push_str("\x1bP0;1;q\"1;1;");
+    push_usize_ascii(&mut out, crop_w);
+    out.push(';');
+    push_usize_ascii(&mut out, crop_h);
 
     for (idx, &(r, g, b)) in palette.iter().enumerate() {
-        let r_pct = (r as u32 * 100 + 127) / 255;
-        let g_pct = (g as u32 * 100 + 127) / 255;
-        let b_pct = (b as u32 * 100 + 127) / 255;
-        let _ = write!(out, "#{idx};2;{r_pct};{g_pct};{b_pct}");
+        let r_pct = (r as usize * 100 + 127) / 255;
+        let g_pct = (g as usize * 100 + 127) / 255;
+        let b_pct = (b as usize * 100 + 127) / 255;
+        out.push('#');
+        push_usize_ascii(&mut out, idx);
+        out.push_str(";2;");
+        push_usize_ascii(&mut out, r_pct);
+        out.push(';');
+        push_usize_ascii(&mut out, g_pct);
+        out.push(';');
+        push_usize_ascii(&mut out, b_pct);
     }
 
     let mut color_seen = [false; 256];
+    let mut color_min_x = [usize::MAX; 256];
+    let mut color_max_x = [0usize; 256];
     let mut band_colors: Vec<u8> = Vec::with_capacity(palette.len().min(64));
     let mut band_masks = vec![0u8; palette.len().max(1) * crop_w];
 
@@ -1874,13 +1934,23 @@ fn encode_sixel_indexed_slice(
         for dy in 0..band_h {
             let bit = 1u8 << dy;
             let row_offset = (y0 + band_y + dy) * full_w + x0;
-            for x in 0..crop_w {
-                let c = indexed[row_offset + x];
-                if !color_seen[c as usize] {
-                    color_seen[c as usize] = true;
+            let row = &indexed[row_offset..row_offset + crop_w];
+            for (x, &c) in row.iter().enumerate() {
+                let cu = c as usize;
+                if !color_seen[cu] {
+                    color_seen[cu] = true;
+                    color_min_x[cu] = x;
+                    color_max_x[cu] = x;
                     band_colors.push(c);
+                } else {
+                    if x < color_min_x[cu] {
+                        color_min_x[cu] = x;
+                    }
+                    if x > color_max_x[cu] {
+                        color_max_x[cu] = x;
+                    }
                 }
-                band_masks[c as usize * crop_w + x] |= bit;
+                band_masks[cu * crop_w + x] |= bit;
             }
         }
 
@@ -1888,22 +1958,32 @@ fn encode_sixel_indexed_slice(
             if ci > 0 {
                 out.push('$');
             }
-            let _ = write!(out, "#{color_idx}");
+            let cu = color_idx as usize;
+            out.push('#');
+            push_usize_ascii(&mut out, cu);
 
-            let mask_start = color_idx as usize * crop_w;
-            let row_slice = &band_masks[mask_start..mask_start + crop_w];
-            let end = row_slice
-                .iter()
-                .rposition(|&bits| bits != 0)
-                .map_or(0, |idx| idx + 1);
-
-            write_sixel_rle(&row_slice[..end], &mut out);
+            let min_x = color_min_x[cu];
+            let end = color_max_x[cu] + 1;
+            if min_x > 0 {
+                if min_x >= 4 {
+                    out.push('!');
+                    push_usize_ascii(&mut out, min_x);
+                    out.push('?');
+                } else {
+                    for _ in 0..min_x {
+                        out.push('?');
+                    }
+                }
+            }
+            let mask_start = cu * crop_w;
+            write_sixel_rle(&band_masks[mask_start + min_x..mask_start + end], &mut out);
         }
 
         for &c in &band_colors {
-            color_seen[c as usize] = false;
-            let start = c as usize * crop_w;
-            band_masks[start..start + crop_w].fill(0);
+            let cu = c as usize;
+            color_seen[cu] = false;
+            let start = cu * crop_w;
+            band_masks[start + color_min_x[cu]..start + color_max_x[cu] + 1].fill(0);
         }
 
         if band_y + 6 < crop_h {
@@ -1917,15 +1997,18 @@ fn encode_sixel_indexed_slice(
 
 fn write_sixel_rle(masks: &[u8], out: &mut String) {
     let mut i = 0;
-    while i < masks.len() {
+    let len = masks.len();
+    while i < len {
         let bits = masks[i];
         let mut run_len = 1usize;
-        while i + run_len < masks.len() && masks[i + run_len] == bits {
+        while i + run_len < len && masks[i + run_len] == bits {
             run_len += 1;
         }
         let ch = (bits + 63) as char;
         if run_len >= 4 {
-            let _ = write!(out, "!{run_len}{ch}");
+            out.push('!');
+            push_usize_ascii(out, run_len);
+            out.push(ch);
         } else {
             for _ in 0..run_len {
                 out.push(ch);
@@ -1995,34 +2078,36 @@ fn quantize_rgba_to_256_with_stats(
         return (exact_palette, indexed, 0);
     }
 
-    // Perceptual median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
-    let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
+    // Perceptual median-cut over flat 5-5-5 RGB histogram for > 256 distinct colors.
+    let mut hist: Box<[(u32, u32, u32, u32); 32768]> = vec![(0u32, 0u32, 0u32, 0u32); 32768]
+        .into_boxed_slice()
+        .try_into()
+        .expect("32768-slot 5-5-5 histogram");
     for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
-        let qkey = (((px[0] as u16) >> 3) << 10)
-            | (((px[1] as u16) >> 3) << 5)
-            | ((px[2] as u16) >> 3);
-        let entry = hist.entry(qkey).or_insert((0, 0, 0, 0));
+        let qkey = (((px[0] as usize) >> 3) << 10)
+            | (((px[1] as usize) >> 3) << 5)
+            | ((px[2] as usize) >> 3);
+        let entry = &mut hist[qkey];
         entry.0 += 1;
-        entry.1 += px[0] as u64;
-        entry.2 += px[1] as u64;
-        entry.3 += px[2] as u64;
+        entry.1 += px[0] as u32;
+        entry.2 += px[1] as u32;
+        entry.3 += px[2] as u32;
     }
 
     let mut buckets: Vec<ColorBucket> = hist
-        .into_values()
-        .map(|(count, sum_r, sum_g, sum_b)| {
-            let c = count as u64;
-            ColorBucket {
-                r_avg: (sum_r / c) as u8,
-                g_avg: (sum_g / c) as u8,
-                b_avg: (sum_b / c) as u8,
-                count,
-                sum_r,
-                sum_g,
-                sum_b,
-            }
+        .iter()
+        .filter(|&&(count, ..)| count > 0)
+        .map(|&(count, sum_r, sum_g, sum_b)| ColorBucket {
+            r_avg: (sum_r / count) as u8,
+            g_avg: (sum_g / count) as u8,
+            b_avg: (sum_b / count) as u8,
+            count,
+            sum_r: sum_r as u64,
+            sum_g: sum_g as u64,
+            sum_b: sum_b as u64,
         })
         .collect();
+    drop(hist);
 
     let total_buckets = buckets.len();
     let mut boxes: Vec<(usize, usize)> = vec![(0, total_buckets)];
@@ -2123,11 +2208,28 @@ fn quantize_rgba_to_256_with_stats(
         })
         .collect();
 
+    let pal_len = raw_palette.len();
+    let mut pal_r = [0u8; 256];
+    let mut pal_g = [0u8; 256];
+    let mut pal_b = [0u8; 256];
+    for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
+        pal_r[pi] = pr;
+        pal_g[pi] = pg;
+        pal_b[pi] = pb;
+    }
+
     let mut indexed = vec![0u8; pixel_count];
-    let mut lookup_cache: HashMap<u32, u8> = HashMap::with_capacity(4096);
-    let mut used = vec![false; raw_palette.len()];
-    let mut cur_err = vec![[0.0f32; 3]; width];
-    let mut next_err = vec![[0.0f32; 3]; width];
+    // Direct 5-5-5 RGB LUT populated lazily against the SoA palette (at most 32,768 scans total).
+    let mut lut: Box<[u8; 32768]> = vec![0u8; 32768]
+        .into_boxed_slice()
+        .try_into()
+        .expect("32768-slot 5-5-5 LUT");
+    let mut lut_valid = [0u64; 512];
+    let mut lut_populated = 0usize;
+    let mut used = [false; 256];
+    // 2-row i16 Q4 fixed-point Floyd-Steinberg error buffers (scaled by 16; `>> 4` on read).
+    let mut cur_err = vec![[0i16; 3]; width];
+    let mut next_err = vec![[0i16; 3]; width];
 
     for y in 0..height {
         let row_base = y * width;
@@ -2139,24 +2241,22 @@ fn quantize_rgba_to_256_with_stats(
             let orig_g = flat_rgba[px_off + 1];
             let orig_b = flat_rgba[px_off + 2];
 
-            let r = (orig_r as f32 + cur_err[x][0])
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            let g = (orig_g as f32 + cur_err[x][1])
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            let b = (orig_b as f32 + cur_err[x][2])
-                .round()
-                .clamp(0.0, 255.0) as u8;
+            let r = (orig_r as i16 + ((cur_err[x][0] + 8) >> 4)).clamp(0, 255) as u8;
+            let g = (orig_g as i16 + ((cur_err[x][1] + 8) >> 4)).clamp(0, 255) as u8;
+            let b = (orig_b as i16 + ((cur_err[x][2] + 8) >> 4)).clamp(0, 255) as u8;
 
-            let key = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let idx = if let Some(&cached) = lookup_cache.get(&key) {
-                cached
+            let q = (((r as usize) >> 3) << 10)
+                | (((g as usize) >> 3) << 5)
+                | ((b as usize) >> 3);
+            let word = q >> 6;
+            let bit = 1u64 << (q & 63);
+            let idx = if (lut_valid[word] & bit) != 0 {
+                lut[q]
             } else {
                 let mut best_idx = 0u8;
                 let mut best_dist = u32::MAX;
-                for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
-                    let dist = redmean_dist_sq(r, g, b, pr, pg, pb);
+                for pi in 0..pal_len {
+                    let dist = redmean_dist_sq(r, g, b, pal_r[pi], pal_g[pi], pal_b[pi]);
                     if dist < best_dist {
                         best_dist = dist;
                         best_idx = pi as u8;
@@ -2165,80 +2265,87 @@ fn quantize_rgba_to_256_with_stats(
                         }
                     }
                 }
-                if lookup_cache.len() < MAX_QUANT_LOOKUP_CACHE {
-                    lookup_cache.insert(key, best_idx);
-                }
+                lut[q] = best_idx;
+                lut_valid[word] |= bit;
+                lut_populated += 1;
                 best_idx
             };
 
-            let (pr, pg, pb) = raw_palette[idx as usize];
+            let pr = pal_r[idx as usize];
+            let pg = pal_g[idx as usize];
+            let pb = pal_b[idx as usize];
             let raw_er = r as i16 - pr as i16;
             let raw_eg = g as i16 - pg as i16;
             let raw_eb = b as i16 - pb as i16;
 
-            let same_left = x > 0 && {
-                let lo = (row_base + x - 1) * 4;
-                flat_rgba[lo] == orig_r && flat_rgba[lo + 1] == orig_g && flat_rgba[lo + 2] == orig_b
-            };
-            let same_up = y > 0 && {
-                let uo = ((y - 1) * width + x) * 4;
-                flat_rgba[uo] == orig_r && flat_rgba[uo + 1] == orig_g && flat_rgba[uo + 2] == orig_b
-            };
-            let is_flat = match (x > 0, y > 0) {
-                (true, true) => same_left && same_up,
-                (true, false) => same_left,
-                (false, true) => same_up,
-                (false, false) => false,
-            };
-            let pal_dist = redmean_dist_sq(r, g, b, pr, pg, pb);
             let suppress_dither = (raw_er.abs() <= 3 && raw_eg.abs() <= 3 && raw_eb.abs() <= 3)
-                || (is_flat && pal_dist <= 64);
+                || {
+                    let same_left = x > 0 && {
+                        let lo = (row_base + x - 1) * 4;
+                        flat_rgba[lo] == orig_r
+                            && flat_rgba[lo + 1] == orig_g
+                            && flat_rgba[lo + 2] == orig_b
+                    };
+                    let same_up = y > 0 && {
+                        let uo = ((y - 1) * width + x) * 4;
+                        flat_rgba[uo] == orig_r
+                            && flat_rgba[uo + 1] == orig_g
+                            && flat_rgba[uo + 2] == orig_b
+                    };
+                    let is_flat = match (x > 0, y > 0) {
+                        (true, true) => same_left && same_up,
+                        (true, false) => same_left,
+                        (false, true) => same_up,
+                        (false, false) => false,
+                    };
+                    is_flat && redmean_dist_sq(r, g, b, pr, pg, pb) <= 64
+                };
 
             if !suppress_dither {
-                let er = (raw_er as f32).clamp(-48.0, 48.0);
-                let eg = (raw_eg as f32).clamp(-48.0, 48.0);
-                let eb = (raw_eb as f32).clamp(-48.0, 48.0);
+                let er = raw_er.clamp(-48, 48);
+                let eg = raw_eg.clamp(-48, 48);
+                let eb = raw_eb.clamp(-48, 48);
 
                 if ltr {
                     if x + 1 < width {
-                        cur_err[x + 1][0] += er * (7.0 / 16.0);
-                        cur_err[x + 1][1] += eg * (7.0 / 16.0);
-                        cur_err[x + 1][2] += eb * (7.0 / 16.0);
+                        cur_err[x + 1][0] = cur_err[x + 1][0].saturating_add(er * 7);
+                        cur_err[x + 1][1] = cur_err[x + 1][1].saturating_add(eg * 7);
+                        cur_err[x + 1][2] = cur_err[x + 1][2].saturating_add(eb * 7);
                     }
                     if y + 1 < height {
                         if x > 0 {
-                            next_err[x - 1][0] += er * (3.0 / 16.0);
-                            next_err[x - 1][1] += eg * (3.0 / 16.0);
-                            next_err[x - 1][2] += eb * (3.0 / 16.0);
+                            next_err[x - 1][0] = next_err[x - 1][0].saturating_add(er * 3);
+                            next_err[x - 1][1] = next_err[x - 1][1].saturating_add(eg * 3);
+                            next_err[x - 1][2] = next_err[x - 1][2].saturating_add(eb * 3);
                         }
-                        next_err[x][0] += er * (5.0 / 16.0);
-                        next_err[x][1] += eg * (5.0 / 16.0);
-                        next_err[x][2] += eb * (5.0 / 16.0);
+                        next_err[x][0] = next_err[x][0].saturating_add(er * 5);
+                        next_err[x][1] = next_err[x][1].saturating_add(eg * 5);
+                        next_err[x][2] = next_err[x][2].saturating_add(eb * 5);
                         if x + 1 < width {
-                            next_err[x + 1][0] += er * (1.0 / 16.0);
-                            next_err[x + 1][1] += eg * (1.0 / 16.0);
-                            next_err[x + 1][2] += eb * (1.0 / 16.0);
+                            next_err[x + 1][0] = next_err[x + 1][0].saturating_add(er);
+                            next_err[x + 1][1] = next_err[x + 1][1].saturating_add(eg);
+                            next_err[x + 1][2] = next_err[x + 1][2].saturating_add(eb);
                         }
                     }
                 } else {
                     if x > 0 {
-                        cur_err[x - 1][0] += er * (7.0 / 16.0);
-                        cur_err[x - 1][1] += eg * (7.0 / 16.0);
-                        cur_err[x - 1][2] += eb * (7.0 / 16.0);
+                        cur_err[x - 1][0] = cur_err[x - 1][0].saturating_add(er * 7);
+                        cur_err[x - 1][1] = cur_err[x - 1][1].saturating_add(eg * 7);
+                        cur_err[x - 1][2] = cur_err[x - 1][2].saturating_add(eb * 7);
                     }
                     if y + 1 < height {
                         if x + 1 < width {
-                            next_err[x + 1][0] += er * (3.0 / 16.0);
-                            next_err[x + 1][1] += eg * (3.0 / 16.0);
-                            next_err[x + 1][2] += eb * (3.0 / 16.0);
+                            next_err[x + 1][0] = next_err[x + 1][0].saturating_add(er * 3);
+                            next_err[x + 1][1] = next_err[x + 1][1].saturating_add(eg * 3);
+                            next_err[x + 1][2] = next_err[x + 1][2].saturating_add(eb * 3);
                         }
-                        next_err[x][0] += er * (5.0 / 16.0);
-                        next_err[x][1] += eg * (5.0 / 16.0);
-                        next_err[x][2] += eb * (5.0 / 16.0);
+                        next_err[x][0] = next_err[x][0].saturating_add(er * 5);
+                        next_err[x][1] = next_err[x][1].saturating_add(eg * 5);
+                        next_err[x][2] = next_err[x][2].saturating_add(eb * 5);
                         if x > 0 {
-                            next_err[x - 1][0] += er * (1.0 / 16.0);
-                            next_err[x - 1][1] += eg * (1.0 / 16.0);
-                            next_err[x - 1][2] += eb * (1.0 / 16.0);
+                            next_err[x - 1][0] = next_err[x - 1][0].saturating_add(er);
+                            next_err[x - 1][1] = next_err[x - 1][1].saturating_add(eg);
+                            next_err[x - 1][2] = next_err[x - 1][2].saturating_add(eb);
                         }
                     }
                 }
@@ -2248,10 +2355,10 @@ fn quantize_rgba_to_256_with_stats(
             indexed[row_base + x] = idx;
         }
         std::mem::swap(&mut cur_err, &mut next_err);
-        next_err.fill([0.0; 3]);
+        next_err.fill([0i16; 3]);
     }
 
-    let cache_len = lookup_cache.len();
+    let cache_len = lut_populated;
 
     // Compact palette so every emitted `#idx;2;...` entry is actually referenced.
     let mut remap = vec![0u8; raw_palette.len()];
@@ -2362,20 +2469,20 @@ fn render_ansi_stdout_with_caps(
                 &png_owned
             };
             let b64 = B64_STANDARD.encode(png_bytes);
-            let chunks: Vec<&str> = b64
-                .as_bytes()
-                .chunks(4096)
-                .map(|c| std::str::from_utf8(c).expect("base64 is valid ASCII"))
-                .collect();
-            let total = chunks.len();
-            let mut out = String::new();
-            for (idx, chunk) in chunks.into_iter().enumerate() {
-                let more = if idx + 1 < total { 1 } else { 0 };
+            let total = b64.len().div_ceil(4096);
+            let mut out = String::with_capacity(b64.len() + total * 32 + 1);
+            for (idx, chunk_bytes) in b64.as_bytes().chunks(4096).enumerate() {
+                let chunk = std::str::from_utf8(chunk_bytes).expect("base64 is valid ASCII");
+                let more = if idx + 1 < total { '1' } else { '0' };
                 if idx == 0 {
-                    out.push_str(&format!("\x1b_Gf=100,a=T,m={more};{chunk}\x1b\\"));
+                    out.push_str("\x1b_Gf=100,a=T,m=");
                 } else {
-                    out.push_str(&format!("\x1b_Gm={more};{chunk}\x1b\\"));
+                    out.push_str("\x1b_Gm=");
                 }
+                out.push(more);
+                out.push(';');
+                out.push_str(chunk);
+                out.push_str("\x1b\\");
             }
             out.push('\n');
             Ok(out)
@@ -2389,21 +2496,42 @@ fn render_ansi_stdout_with_caps(
         TerminalImageProtocol::Halfblock => {
             let rendered =
                 decode_and_render_halfblocks_with_cell_px(bytes, fit, (0, 0, 0), caps.cell_px)?;
-            let mut out = String::new();
+            let mut out = String::with_capacity(
+                (rendered.rows as usize).saturating_mul((rendered.cols as usize) * 24 + 8),
+            );
             for line in &rendered.lines {
+                let mut last_fg: Option<(u8, u8, u8)> = None;
+                let mut last_bg: Option<(u8, u8, u8)> = None;
                 for span in &line.spans {
-                    let (tr, tg, tb) = match span.style.fg {
+                    let fg = match span.style.fg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (255, 255, 255),
                     };
-                    let (br, bg_c, bb) = match span.style.bg {
+                    let bg = match span.style.bg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (0, 0, 0),
                     };
-                    out.push_str(&format!(
-                        "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg_c};{bb}m{}",
-                        span.content
-                    ));
+                    if last_fg != Some(fg) {
+                        out.push_str("\x1b[38;2;");
+                        push_usize_ascii(&mut out, fg.0 as usize);
+                        out.push(';');
+                        push_usize_ascii(&mut out, fg.1 as usize);
+                        out.push(';');
+                        push_usize_ascii(&mut out, fg.2 as usize);
+                        out.push('m');
+                        last_fg = Some(fg);
+                    }
+                    if last_bg != Some(bg) {
+                        out.push_str("\x1b[48;2;");
+                        push_usize_ascii(&mut out, bg.0 as usize);
+                        out.push(';');
+                        push_usize_ascii(&mut out, bg.1 as usize);
+                        out.push(';');
+                        push_usize_ascii(&mut out, bg.2 as usize);
+                        out.push('m');
+                        last_bg = Some(bg);
+                    }
+                    out.push_str(&span.content);
                 }
                 out.push_str("\x1b[0m\n");
             }
@@ -2423,19 +2551,35 @@ fn format_label_for(fmt: Option<ImageFormat>) -> String {
     }
 }
 
+#[inline]
 fn blend_over_bg(px: Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
-    let a = px[3] as u16;
-    if a == 255 {
-        return (px[0], px[1], px[2]);
-    }
-    if a == 0 {
-        return bg;
-    }
+    let a = px[3] as u32;
     let inv = 255 - a;
-    let r = ((px[0] as u16 * a + bg.0 as u16 * inv + 127) / 255) as u8;
-    let g = ((px[1] as u16 * a + bg.1 as u16 * inv + 127) / 255) as u8;
-    let b = ((px[2] as u16 * a + bg.2 as u16 * inv + 127) / 255) as u8;
-    (r, g, b)
+    let r = px[0] as u32 * a + bg.0 as u32 * inv + 128;
+    let g = px[1] as u32 * a + bg.1 as u32 * inv + 128;
+    let b = px[2] as u32 * a + bg.2 as u32 * inv + 128;
+    (
+        ((r + (r >> 8)) >> 8) as u8,
+        ((g + (g >> 8)) >> 8) as u8,
+        ((b + (b >> 8)) >> 8) as u8,
+    )
+}
+
+fn blend_rgba_in_place(flat_rgba: &mut [u8], bg: (u8, u8, u8)) {
+    let br = bg.0 as u32;
+    let bg_c = bg.1 as u32;
+    let bb = bg.2 as u32;
+    for px in flat_rgba.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        let inv = 255 - a;
+        let r = px[0] as u32 * a + br * inv + 128;
+        let g = px[1] as u32 * a + bg_c * inv + 128;
+        let b = px[2] as u32 * a + bb * inv + 128;
+        px[0] = ((r + (r >> 8)) >> 8) as u8;
+        px[1] = ((g + (g >> 8)) >> 8) as u8;
+        px[2] = ((b + (b >> 8)) >> 8) as u8;
+        px[3] = 255;
+    }
 }
 
 fn encode_crisp_png(dyn_img: &DynamicImage) -> Result<Vec<u8>> {
@@ -2444,10 +2588,12 @@ fn encode_crisp_png(dyn_img: &DynamicImage) -> Result<Vec<u8>> {
 }
 
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
-    let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, ImageFormat::Png)
+    let mut buf = Vec::new();
+    let encoder =
+        PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, PngFilterType::NoFilter);
+    img.write_with_encoder(encoder)
         .context("Failed to encode PNG")?;
-    Ok(buf.into_inner())
+    Ok(buf)
 }
 
 #[cfg(test)]

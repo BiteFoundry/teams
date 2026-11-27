@@ -55,15 +55,20 @@ impl AppState {
             .map(|(i, m)| (m.msg_id.clone(), i))
             .collect();
         let mut new_older = Vec::new();
+        let mut updated_existing = false;
         for msg in messages {
             if let Some(&pos) = existing_pos.get(&msg.msg_id) {
                 self.messages[pos] = msg;
+                updated_existing = true;
             } else {
                 existing_pos.insert(msg.msg_id.clone(), usize::MAX);
                 new_older.push(msg);
             }
         }
         if new_older.is_empty() {
+            if updated_existing {
+                self.bump_messages_gen();
+            }
             return 0;
         }
         new_older.sort_by(|a, b| {
@@ -81,6 +86,7 @@ impl AppState {
         }
         new_older.extend(std::mem::take(&mut self.messages));
         self.messages = new_older;
+        self.bump_messages_gen();
         prepended_count
     }
 
@@ -143,6 +149,7 @@ impl AppState {
                 if !sent.created_at.is_empty() {
                     conv.last_updated_at = Some(sent.created_at.clone());
                 }
+                self.bump_conversations_gen();
             }
         }
     }

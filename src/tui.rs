@@ -813,10 +813,15 @@ fn draw_frame(
 
         let term_size = (ui.term_width, ui.term_height);
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-        let mut desired_payloads: Vec<String> = Vec::new();
+        struct DeferredPixelGraphic {
+            pg: crate::ui::app::PendingPixelGraphic,
+            clamped_rect: Rect,
+        }
+        let mut deferred: Vec<DeferredPixelGraphic> = Vec::new();
 
         if pixel_graphics_allowed_for_overlays(&ui.overlays) {
-            for pg in ui.pending_pixel_graphics.clone() {
+            let pending = std::mem::take(&mut ui.pending_pixel_graphics);
+            for pg in pending {
                 let safe_max_h = ui.term_height.saturating_sub(1).saturating_sub(pg.rect.y);
                 let safe_max_w = ui.term_width.saturating_sub(pg.rect.x);
                 let fit_w = pg.rect.width.min(safe_max_w);
@@ -825,41 +830,41 @@ fn draw_frame(
                     continue;
                 }
                 let clamped_rect = Rect::new(pg.rect.x, pg.rect.y, fit_w, fit_h);
-                let payload_opt: Option<String> = if let Some(inline_payload) = pg.payload {
-                    Some(inline_payload)
+                // Check availability & metadata WITHOUT encoding or cloning the pixel payload
+                // until `plan_transition` confirms `plan.emit_desired == true`.
+                let payload_len_opt: Option<usize> = if let Some(ref inline_payload) = pg.payload {
+                    Some(inline_payload.len())
                 } else {
                     let (base_key, crop) = parse_pixel_key(&pg.cache_key);
                     app.image_cache.get(base_key).and_then(|rendered| {
-                        if let Some((sx, sy, vw, vh)) = crop {
-                            rendered
-                                .viewport_pixel_payload(sx, sy, vw.min(fit_w), vh.min(fit_h))
-                                .map(|(p, _, _)| p)
-                                .or_else(|| {
-                                    if rendered.cols <= fit_w && rendered.rows <= fit_h {
-                                        rendered.pixel_payload.clone()
-                                    } else {
-                                        None
-                                    }
-                                })
-                        } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
-                            rendered.pixel_payload.clone()
+                        if !rendered.protocol.is_pixel() {
+                            return None;
+                        }
+                        if crop.is_some() || rendered.cols > fit_w || rendered.rows > fit_h {
+                            if rendered.scroll_backing.is_some()
+                                || (rendered.cols <= fit_w
+                                    && rendered.rows <= fit_h
+                                    && rendered.pixel_payload.is_some())
+                            {
+                                Some(rendered.pixel_payload.as_ref().map_or(0, String::len))
+                            } else {
+                                None
+                            }
                         } else {
-                            rendered
-                                .viewport_pixel_payload(0, 0, fit_w, fit_h)
-                                .map(|(p, _, _)| p)
+                            rendered.pixel_payload.as_ref().map(String::len)
                         }
                     })
                 };
-                if let Some(payload) = payload_opt {
+                if let Some(payload_len) = payload_len_opt {
                     desired.push(ActivePixelGraphic {
-                        cache_key: pg.cache_key,
+                        cache_key: pg.cache_key.clone(),
                         rect: clamped_rect,
                         protocol: pg.protocol,
                         cols: clamped_rect.width,
                         rows: clamped_rect.height,
-                        payload_len: payload.len(),
+                        payload_len,
                     });
-                    desired_payloads.push(payload);
+                    deferred.push(DeferredPixelGraphic { pg, clamped_rect });
                 }
             }
         }
@@ -898,11 +903,46 @@ fn draw_frame(
             })?;
         }
 
-        let committed = desired;
-        if plan.emit_desired {
-            let any_kitty = committed
+        let committed = if plan.emit_desired {
+            // Materialize viewport-cropped / full pixel payloads ONLY when actually emitting.
+            let mut materialized: Vec<(ActivePixelGraphic, String)> =
+                Vec::with_capacity(deferred.len());
+            for (graphic, def) in desired.into_iter().zip(deferred) {
+                let fit_w = def.clamped_rect.width;
+                let fit_h = def.clamped_rect.height;
+                let payload_opt: Option<String> = if let Some(inline_payload) = def.pg.payload {
+                    Some(inline_payload)
+                } else {
+                    let (base_key, crop) = parse_pixel_key(&def.pg.cache_key);
+                    app.image_cache.get(base_key).and_then(|rendered| {
+                        if let Some((sx, sy, vw, vh)) = crop {
+                            rendered
+                                .viewport_pixel_payload(sx, sy, vw.min(fit_w), vh.min(fit_h))
+                                .map(|(p, _, _)| p)
+                                .or_else(|| {
+                                    if rendered.cols <= fit_w && rendered.rows <= fit_h {
+                                        rendered.pixel_payload.clone()
+                                    } else {
+                                        None
+                                    }
+                                })
+                        } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
+                            rendered.pixel_payload.clone()
+                        } else {
+                            rendered
+                                .viewport_pixel_payload(0, 0, fit_w, fit_h)
+                                .map(|(p, _, _)| p)
+                        }
+                    })
+                };
+                if let Some(payload) = payload_opt {
+                    materialized.push((graphic, payload));
+                }
+            }
+
+            let any_kitty = materialized
                 .iter()
-                .any(|g| g.protocol == TerminalImageProtocol::Kitty);
+                .any(|(g, _)| g.protocol == TerminalImageProtocol::Kitty);
             if any_kitty {
                 terminal
                     .backend_mut()
@@ -910,15 +950,14 @@ fn draw_frame(
                 guard.kitty_used = true;
                 KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
             }
-            let multi_kitty = committed
+            let multi_kitty = materialized
                 .iter()
-                .filter(|g| g.protocol == TerminalImageProtocol::Kitty)
+                .filter(|(g, _)| g.protocol == TerminalImageProtocol::Kitty)
                 .count()
                 > 1;
-            let mut new_active = Vec::with_capacity(committed.len());
-            for (idx, (graphic, payload)) in
-                committed.iter().zip(desired_payloads.iter()).enumerate()
-            {
+            let mut new_active = Vec::with_capacity(materialized.len());
+            let mut committed_vec = Vec::with_capacity(materialized.len());
+            for (idx, (graphic, payload)) in materialized.into_iter().enumerate() {
                 crossterm::queue!(
                     terminal.backend_mut(),
                     crossterm::cursor::MoveTo(graphic.rect.x, graphic.rect.y)
@@ -935,15 +974,20 @@ fn draw_frame(
                     terminal.backend_mut().write_all(payload.as_bytes())?;
                 }
                 new_active.push((graphic.cache_key.clone(), graphic.rect, graphic.protocol));
+                committed_vec.push(graphic);
             }
             terminal.backend_mut().flush()?;
             ui.active_pixel_graphics = new_active;
-        } else if committed.is_empty() {
-            ui.active_pixel_graphics.clear();
-            if plan.delete_kitty {
-                guard.kitty_used = false;
+            committed_vec
+        } else {
+            if desired.is_empty() {
+                ui.active_pixel_graphics.clear();
+                if plan.delete_kitty {
+                    guard.kitty_used = false;
+                }
             }
-        }
+            desired
+        };
 
         guard.pixel_tracker.commit(committed, term_size);
 

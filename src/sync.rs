@@ -1755,6 +1755,8 @@ async fn poll_chats_tier2_with_rolling_cache(
     let mut failed_keys: HashSet<String> = HashSet::new();
     if !fetch_ids.is_empty() {
         let fetched = graph.batch_fetch_chat_messages(&fetch_ids, 20).await?;
+        let mut ready_meta: Vec<(String, String)> = Vec::new();
+        let mut ready_batches: Vec<Vec<MessageItem>> = Vec::new();
         for (chat_id, messages) in fetched {
             let conv_key = ConversationTarget::Chat {
                 chat_id: chat_id.clone(),
@@ -1769,28 +1771,43 @@ async fn poll_chats_tier2_with_rolling_cache(
                 .map(|c| c.title.clone())
                 .or_else(|| chat_cache.get(&conv_key).map(|e| e.title.clone()))
                 .unwrap_or_else(|| conv_key.clone());
+            ready_meta.push((conv_key, conv_title));
+            ready_batches.push(messages);
+        }
 
-            let (outcome, changed_messages, newly_inserted_messages) =
-                run_storage(storage, move |st| {
-                    let outcome = st.upsert_messages_detailed(&messages)?;
+        if !ready_batches.is_empty() {
+            let batch_results = run_storage(storage, move |st| {
+                let outcomes = st.upsert_message_batches_detailed(&ready_batches)?;
+                let mut results = Vec::with_capacity(outcomes.len());
+                for (messages, outcome) in ready_batches.into_iter().zip(outcomes) {
                     let inserted = filter_changed_messages_ref(&messages, &outcome.inserted_ids);
                     let changed = filter_changed_messages(messages, &outcome.changed_ids);
-                    Ok((outcome, changed, inserted))
-                })
-                .await?;
-            if !outcome.preview_updated_convs.is_empty() {
-                any_preview_updated = true;
-            }
-            if !outcome.changed_ids.is_empty() {
-                let notify_candidate =
-                    build_notification_candidate(&conv_key, &conv_title, &newly_inserted_messages);
-                let _ = event_tx.send(CoreEvent::MessagesUpdated {
-                    conv_key,
-                    parent_msg_id: None,
-                    messages: changed_messages,
-                    notify_candidate,
-                    changed_msg_ids: Some(outcome.changed_ids),
-                });
+                    results.push((outcome, changed, inserted));
+                }
+                Ok(results)
+            })
+            .await?;
+
+            for ((conv_key, conv_title), (outcome, changed_messages, newly_inserted_messages)) in
+                ready_meta.into_iter().zip(batch_results)
+            {
+                if !outcome.preview_updated_convs.is_empty() {
+                    any_preview_updated = true;
+                }
+                if !outcome.changed_ids.is_empty() {
+                    let notify_candidate = build_notification_candidate(
+                        &conv_key,
+                        &conv_title,
+                        &newly_inserted_messages,
+                    );
+                    let _ = event_tx.send(CoreEvent::MessagesUpdated {
+                        conv_key,
+                        parent_msg_id: None,
+                        messages: changed_messages,
+                        notify_candidate,
+                        changed_msg_ids: Some(outcome.changed_ids),
+                    });
+                }
             }
         }
     }

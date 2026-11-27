@@ -102,7 +102,7 @@ fn run_fts_search(
                 m.body_plain,
                 m.subject
             FROM messages_fts f
-            JOIN messages m ON m.msg_key = f.msg_key
+            JOIN messages m ON m.rowid = f.rowid
             LEFT JOIN conversations c ON c.conv_key = m.conv_key
             WHERE messages_fts MATCH ?1
               AND m.deleted = 0
@@ -129,7 +129,7 @@ fn run_fts_search(
                 m.body_plain,
                 m.subject
             FROM messages_fts f
-            JOIN messages m ON m.msg_key = f.msg_key
+            JOIN messages m ON m.rowid = f.rowid
             LEFT JOIN conversations c ON c.conv_key = m.conv_key
             WHERE messages_fts MATCH ?1
               AND m.deleted = 0
@@ -190,7 +190,7 @@ fn run_like_search(
         bind_values.len()
     ));
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(bind_values), |row| {
         map_search_hit_row(row, query_ctx)
     })?;

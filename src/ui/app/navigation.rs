@@ -99,16 +99,20 @@ impl AppState {
     pub fn load_cached_teams(&mut self) {
         if let Ok(convs) = self.storage.list_conversations() {
             self.conversations = convs;
+            self.bump_conversations_gen();
         }
         if let Ok(teams) = self.storage.list_teams() {
             self.teams = teams;
+            self.bump_teams_gen();
         }
         if let Ok(presences) = self.storage.get_presences() {
             self.presences = presences;
+            self.bump_presences_gen();
         }
         if !self.my_user_id.is_empty() {
             if let Ok(mentions) = self.storage.list_mentions_for_user(&self.my_user_id, 50) {
                 self.activity_mentions = mentions;
+                self.bump_mentions_gen();
             }
         }
         self.chats_oldest_reached = self
@@ -241,6 +245,7 @@ impl AppState {
         self.active_target = Some(target.clone());
         self.tail_message_updated = false;
         self.active_thread = None;
+        self.bump_thread_gen();
         self.pending_thread = None;
         self.pending_thread_reply_id = None;
         self.conv_req_seq = self.conv_req_seq.wrapping_add(1);
@@ -266,6 +271,8 @@ impl AppState {
             .storage
             .list_root_messages(&new_key, 80, None)
             .unwrap_or_default();
+        self.bump_messages_gen();
+        self.bump_thread_gen();
         // Decided after the window is loaded: an EOF cursor only says Graph has no older page,
         // while the cache can hold more rows than the 80 shown.
         self.oldest_reached = self.cached_history_exhausted(&new_key);
@@ -288,6 +295,7 @@ impl AppState {
         if let Some(conv) = self.conversations.iter_mut().find(|c| c.conv_key == new_key) {
             conv.unread_count = 0;
             conv.last_read_at = Some(now_ts.clone());
+            self.bump_conversations_gen();
         }
 
         self.sync_ctrl.set_focus(Some(target.clone()), None);
@@ -593,6 +601,7 @@ impl AppState {
                 if !ui.collapsed_team_ids.remove(&team_id) {
                     ui.collapsed_team_ids.insert(team_id);
                 }
+                ui.bump_nav_prefs_gen();
             }
             NavRow::TeamChannel { conv_key, .. } => {
                 if let Some(target) = ConversationTarget::from_conv_key(&conv_key) {
@@ -683,6 +692,7 @@ impl AppState {
             // Nothing cached for this root: do not keep showing the previously open thread.
             self.active_thread = None;
         }
+        self.bump_thread_gen();
         ui.thread_drawer_open = true;
         ui.composer_target_thread = true;
         ui.narrow_pane = NarrowPane::Thread;
@@ -824,6 +834,7 @@ impl AppState {
         ui.thread_drawer_open = false;
         ui.composer_target_thread = false;
         self.active_thread = None;
+        self.bump_thread_gen();
         self.pending_thread = None;
         self.pending_thread_reply_id = None;
         self.thread_req_seq = self.thread_req_seq.wrapping_add(1);

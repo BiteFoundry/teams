@@ -21,7 +21,6 @@ use crate::{
     models::ConversationKind,
     ui::{
         app::{AppState, UiState},
-        chat_view::DualHasher,
         hitmap::{ButtonId, HitMap, HitTarget},
     },
 };
@@ -128,7 +127,17 @@ impl NavRow {
 
 const NAV_CACHE_CAPACITY: usize = 16;
 
-type NavRowsCacheKey = (u64, u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NavRowsCacheKey {
+    tab: usize,
+    unread_only: bool,
+    gen_a: u64,
+    gen_b: u64,
+    gen_c: u64,
+    len_a: usize,
+    len_b: usize,
+}
+
 type NavRowsCacheEntry = (NavRowsCacheKey, Arc<[NavRow]>);
 
 struct NavRowsCache {
@@ -144,7 +153,7 @@ impl NavRowsCache {
         }
     }
 
-    fn get(&mut self, key: (u64, u64)) -> Option<Arc<[NavRow]>> {
+    fn get(&mut self, key: NavRowsCacheKey) -> Option<Arc<[NavRow]>> {
         let pos = self.entries.iter().position(|(k, _)| *k == key)?;
         if pos + 1 < self.entries.len() {
             let entry = self.entries.remove(pos);
@@ -153,7 +162,7 @@ impl NavRowsCache {
         self.entries.last().map(|(_, val)| Arc::clone(val))
     }
 
-    fn insert(&mut self, key: (u64, u64), val: Arc<[NavRow]>) {
+    fn insert(&mut self, key: NavRowsCacheKey, val: Arc<[NavRow]>) {
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
             self.entries.remove(pos);
         } else if self.entries.len() >= self.max_entries {
@@ -167,83 +176,47 @@ thread_local! {
     static NAV_ROWS_CACHE: RefCell<NavRowsCache> = RefCell::new(NavRowsCache::new(NAV_CACHE_CAPACITY));
 }
 
+/// Computes an O(1) monotonic generation-counter key for all inputs that affect `NavRow` output.
 #[inline]
-fn write_opt_str(h: &mut DualHasher, s: Option<&str>) {
-    match s {
-        Some(v) => {
-            h.write_hash(&1u8);
-            h.write_str(v);
-        }
-        None => h.write_hash(&0u8),
-    }
-}
-
-/// Computes a 128-bit signature of all inputs that affect `NavRow` output for the active tab.
-fn compute_nav_sig(app: &AppState, ui: &UiState) -> (u64, u64) {
-    let mut h = DualHasher::new(0x4e41_565f_524f_5753);
-    h.write_hash(&ui.active_nav_tab);
-    h.write_hash(&ui.nav_unread_only);
+fn compute_nav_sig(app: &AppState, ui: &UiState) -> NavRowsCacheKey {
     match ui.active_nav_tab {
-        TAB_CHATS => {
-            let mut pinned_keys: Vec<&str> = ui.pinned_convs.iter().map(String::as_str).collect();
-            pinned_keys.sort_unstable();
-            h.write_hash(&pinned_keys.len());
-            for key in pinned_keys {
-                h.write_str(key);
-            }
-            let mut count = 0usize;
-            for c in &app.conversations {
-                if c.kind != ConversationKind::Channel {
-                    h.write_str(&c.conv_key);
-                    h.write_str(&c.title);
-                    h.write_hash(&c.kind);
-                    write_opt_str(&mut h, c.peer_user_id.as_deref());
-                    h.write_hash(&c.unread_count);
-                    h.write_hash(&c.pinned);
-                    count += 1;
-                }
-            }
-            h.write_hash(&count);
-        }
-        TAB_TEAMS => {
-            h.write_hash(&app.teams.len());
-            for team in &app.teams {
-                h.write_str(&team.id);
-                h.write_str(&team.display_name);
-                let collapsed = ui.collapsed_team_ids.contains(&team.id);
-                h.write_hash(&collapsed);
-                h.write_hash(&team.channels.len());
-                for ch in &team.channels {
-                    h.write_str(&ch.team_id);
-                    h.write_str(&ch.id);
-                    h.write_str(&ch.display_name);
-                    h.write_hash(&ChannelMembership::from_membership_type(&ch.membership_type));
-                }
-            }
-            let mut chan_conv_count = 0usize;
-            for c in &app.conversations {
-                if c.kind == ConversationKind::Channel || c.conv_key.starts_with("chan:") {
-                    h.write_str(&c.conv_key);
-                    h.write_hash(&c.unread_count);
-                    chan_conv_count += 1;
-                }
-            }
-            h.write_hash(&chan_conv_count);
-        }
-        TAB_ACTIVITY => {
-            h.write_hash(&app.activity_mentions.len());
-            for m in &app.activity_mentions {
-                h.write_str(&m.conv_key);
-                h.write_str(&m.msg_id);
-                write_opt_str(&mut h, m.parent_msg_id.as_deref());
-                h.write_str(&m.author_name);
-                h.write_str(&m.body_plain);
-                h.write_str(&m.created_at);
-            }
-        }
-        _ => {}
+        TAB_CHATS => NavRowsCacheKey {
+            tab: TAB_CHATS,
+            unread_only: ui.nav_unread_only,
+            gen_a: app.conversations_gen,
+            gen_b: ui.nav_prefs_gen,
+            gen_c: 0,
+            len_a: app.conversations.len(),
+            len_b: ui.pinned_convs.len(),
+        },
+        TAB_TEAMS => NavRowsCacheKey {
+            tab: TAB_TEAMS,
+            unread_only: ui.nav_unread_only,
+            gen_a: app.teams_gen,
+            gen_b: app.conversations_gen,
+            gen_c: ui.nav_prefs_gen,
+            len_a: app.teams.len(),
+            len_b: ui.collapsed_team_ids.len(),
+        },
+        TAB_ACTIVITY => NavRowsCacheKey {
+            tab: TAB_ACTIVITY,
+            unread_only: ui.nav_unread_only,
+            gen_a: app.mentions_gen,
+            gen_b: 0,
+            gen_c: 0,
+            len_a: app.activity_mentions.len(),
+            len_b: 0,
+        },
+        other => NavRowsCacheKey {
+            tab: other,
+            unread_only: ui.nav_unread_only,
+            gen_a: 0,
+            gen_b: 0,
+            gen_c: 0,
+            len_a: 0,
+            len_b: 0,
+        },
     }
-    h.finish()
 }
 
 /// Returns the cached `Arc<[NavRow]>` slice for the active tab, rebuilding only on signature miss.
@@ -1318,6 +1291,7 @@ mod tests {
         let c2 = nav_rows_cached(&app, &ui);
         assert!(Arc::ptr_eq(&c1, &c2));
         app.conversations[0].unread_count = 9;
+        app.bump_conversations_gen();
         let c3 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&c1, &c3));
         assert!(matches!(
@@ -1328,6 +1302,7 @@ mod tests {
 
         // Pinning and unread filter invalidate cache and match nav_row_count
         ui.pinned_convs.insert("chat:c2".to_string());
+        ui.bump_nav_prefs_gen();
         let c4 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&c3, &c4));
         assert!(matches!(
@@ -1343,6 +1318,7 @@ mod tests {
         assert_eq!(c5.len(), 2); // UNREAD header + Alice
         ui.nav_unread_only = false;
         ui.pinned_convs.clear();
+        ui.bump_nav_prefs_gen();
 
         // TAB_TEAMS: channel unread_count & collapsed_team_ids invalidate
         ui.active_nav_tab = TAB_TEAMS;
@@ -1351,6 +1327,7 @@ mod tests {
         assert!(Arc::ptr_eq(&t1, &t2));
 
         app.conversations[2].unread_count = 12;
+        app.bump_conversations_gen();
         let t3 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&t1, &t3));
         assert!(matches!(
@@ -1369,6 +1346,7 @@ mod tests {
         ui.nav_unread_only = false;
 
         ui.collapsed_team_ids.insert("t1".to_string());
+        ui.bump_nav_prefs_gen();
         let t4 = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&t3, &t4));
         assert_eq!(t4.len(), 3);
@@ -1433,6 +1411,7 @@ mod tests {
         // The cached rows are rebuilt when only the membership type changes.
         let before = nav_rows_cached(&app, &ui);
         app.teams[1].channels[1].membership_type = "private".to_string();
+        app.bump_teams_gen();
         let after = nav_rows_cached(&app, &ui);
         assert!(!Arc::ptr_eq(&before, &after));
 

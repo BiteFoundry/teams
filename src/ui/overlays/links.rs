@@ -198,16 +198,17 @@ impl LinksOverlay {
 
 /// Extracts deduplicated, openable URLs from HTML (`<a href>`), Markdown (`[label](url)`), and bare `http(s)://` text.
 pub fn extract_links_from_text(html: &str, plain: &str) -> Vec<ExtractedLink> {
+    static A_HREF_SEL: std::sync::LazyLock<Selector> =
+        std::sync::LazyLock::new(|| Selector::parse("a[href]").expect("valid a[href] selector"));
+
     let mut out: Vec<ExtractedLink> = Vec::new();
 
     if !html.trim().is_empty() {
         let doc = Html::parse_fragment(html);
-        if let Ok(sel) = Selector::parse("a[href]") {
-            for el in doc.select(&sel) {
-                if let Some(href) = el.value().attr("href") {
-                    let label = collapse_ws(&el.text().collect::<Vec<_>>().join(" "));
-                    push_unique_link(&mut out, &label, href);
-                }
+        for el in doc.select(&A_HREF_SEL) {
+            if let Some(href) = el.value().attr("href") {
+                let label = collapse_ws(&el.text().collect::<Vec<_>>().join(" "));
+                push_unique_link(&mut out, &label, href);
             }
         }
 

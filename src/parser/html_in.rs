@@ -1,6 +1,6 @@
 //! Teams HTML + attachment parser into `Vec<RichBlock>`, plain text, and GFM Markdown.
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -18,97 +18,130 @@ use crate::{
 const HTML_CACHE_MAX_ENTRIES: usize = 1024;
 const HTML_CACHE_MAX_HTML_BYTES: usize = 256 * 1024;
 
-type HtmlCacheKey = (u64, u64, usize);
+type HtmlCacheKey = (u64, usize);
 
-#[derive(Default)]
+const LRU_NONE: usize = usize::MAX;
+
+struct LruNode {
+    key: HtmlCacheKey,
+    value: Arc<[RichBlock]>,
+    prev: usize,
+    next: usize,
+}
+
 struct HtmlParseCache {
-    entries: HashMap<HtmlCacheKey, Arc<[RichBlock]>>,
-    order: VecDeque<HtmlCacheKey>,
+    index: HashMap<HtmlCacheKey, usize>,
+    nodes: Vec<LruNode>,
+    head: usize, // MRU
+    tail: usize, // LRU
+}
+
+impl Default for HtmlParseCache {
+    fn default() -> Self {
+        Self {
+            index: HashMap::new(),
+            nodes: Vec::new(),
+            head: LRU_NONE,
+            tail: LRU_NONE,
+        }
+    }
 }
 
 impl HtmlParseCache {
-    fn get(&mut self, key: &HtmlCacheKey) -> Option<Arc<[RichBlock]>> {
-        let val = self.entries.get(key).cloned()?;
-        if self.order.back() != Some(key) {
-            if let Some(pos) = self.order.iter().rposition(|k| k == key) {
-                self.order.remove(pos);
-            }
-            self.order.push_back(*key);
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn detach(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+        if prev != LRU_NONE {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
         }
-        Some(val)
+        if next != LRU_NONE {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+        self.nodes[idx].prev = LRU_NONE;
+        self.nodes[idx].next = LRU_NONE;
+    }
+
+    fn attach_front(&mut self, idx: usize) {
+        self.nodes[idx].prev = LRU_NONE;
+        self.nodes[idx].next = self.head;
+        if self.head != LRU_NONE {
+            self.nodes[self.head].prev = idx;
+        } else {
+            self.tail = idx;
+        }
+        self.head = idx;
+    }
+
+    fn promote_to_front(&mut self, idx: usize) {
+        if self.head == idx {
+            return;
+        }
+        self.detach(idx);
+        self.attach_front(idx);
+    }
+
+    fn get(&mut self, key: &HtmlCacheKey) -> Option<Arc<[RichBlock]>> {
+        let &idx = self.index.get(key)?;
+        self.promote_to_front(idx);
+        Some(Arc::clone(&self.nodes[idx].value))
     }
 
     fn insert(&mut self, key: HtmlCacheKey, value: Arc<[RichBlock]>) {
-        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.entries.entry(key) {
-            entry.insert(value);
-            if self.order.back() != Some(&key) {
-                if let Some(pos) = self.order.iter().rposition(|k| k == &key) {
-                    self.order.remove(pos);
-                }
-                self.order.push_back(key);
-            }
+        if let Some(&idx) = self.index.get(&key) {
+            self.nodes[idx].value = value;
+            self.promote_to_front(idx);
             return;
         }
-        while self.entries.len() >= HTML_CACHE_MAX_ENTRIES {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            } else {
-                break;
+        if self.nodes.len() >= HTML_CACHE_MAX_ENTRIES {
+            let victim = self.tail;
+            if victim != LRU_NONE {
+                let old_key = self.nodes[victim].key;
+                self.index.remove(&old_key);
+                self.detach(victim);
+                self.nodes[victim].key = key;
+                self.nodes[victim].value = value;
+                self.attach_front(victim);
+                self.index.insert(key, victim);
+                return;
             }
         }
-        self.entries.insert(key, value);
-        self.order.push_back(key);
+        let idx = self.nodes.len();
+        self.nodes.push(LruNode {
+            key,
+            value,
+            prev: LRU_NONE,
+            next: LRU_NONE,
+        });
+        self.attach_front(idx);
+        self.index.insert(key, idx);
     }
 }
 
 static HTML_PARSE_CACHE: OnceLock<Mutex<HtmlParseCache>> = OnceLock::new();
 
-struct Fnv1a64(u64);
-
-impl Fnv1a64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn finish_mixed(&self) -> u64 {
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
-    }
+#[inline]
+fn hash_str_field(h: &mut DefaultHasher, s: &str) {
+    s.len().hash(h);
+    h.write(s.as_bytes());
 }
 
-impl Hasher for Fnv1a64 {
-    fn finish(&self) -> u64 {
-        self.finish_mixed()
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-}
-
-fn hash_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, s: &str) {
-    s.len().hash(h1);
-    s.as_bytes().hash(h1);
-    s.len().hash(h2);
-    s.as_bytes().hash(h2);
-}
-
-fn hash_opt_str_field(h1: &mut DefaultHasher, h2: &mut Fnv1a64, opt: Option<&str>) {
+#[inline]
+fn hash_opt_str_field(h: &mut DefaultHasher, opt: Option<&str>) {
     match opt {
         Some(s) => {
-            1u8.hash(h1);
-            1u8.hash(h2);
-            hash_str_field(h1, h2, s);
+            1u8.hash(h);
+            hash_str_field(h, s);
         }
-        None => {
-            0u8.hash(h1);
-            0u8.hash(h2);
-        }
+        None => 0u8.hash(h),
     }
 }
 
@@ -117,58 +150,136 @@ fn compute_parse_fingerprint(
     attachments: &[AttachmentInfo],
     mentions: &[MentionInfo],
 ) -> HtmlCacheKey {
-    let mut h1 = DefaultHasher::new();
-    let mut h2 = Fnv1a64::new();
+    let mut h = DefaultHasher::new();
 
-    0x4854_4d4c_u32.hash(&mut h1);
-    0x9e37_79b9_u32.hash(&mut h2);
+    0x4854_4d4c_u32.hash(&mut h);
+    hash_str_field(&mut h, html);
 
-    hash_str_field(&mut h1, &mut h2, html);
-
-    attachments.len().hash(&mut h1);
-    attachments.len().hash(&mut h2);
+    attachments.len().hash(&mut h);
     for att in attachments {
-        hash_str_field(&mut h1, &mut h2, &att.id);
-        hash_str_field(&mut h1, &mut h2, &att.content_type);
-        hash_opt_str_field(&mut h1, &mut h2, att.name.as_deref());
-        hash_opt_str_field(&mut h1, &mut h2, att.content_url.as_deref());
-        hash_opt_str_field(&mut h1, &mut h2, att.content_json.as_deref());
-        hash_opt_str_field(&mut h1, &mut h2, att.thumbnail_url.as_deref());
+        hash_str_field(&mut h, &att.id);
+        hash_str_field(&mut h, &att.content_type);
+        hash_opt_str_field(&mut h, att.name.as_deref());
+        hash_opt_str_field(&mut h, att.content_url.as_deref());
+        hash_opt_str_field(&mut h, att.content_json.as_deref());
+        hash_opt_str_field(&mut h, att.thumbnail_url.as_deref());
     }
 
-    mentions.len().hash(&mut h1);
-    mentions.len().hash(&mut h2);
+    mentions.len().hash(&mut h);
     for m in mentions {
-        m.id.hash(&mut h1);
-        m.id.hash(&mut h2);
-        m.user_id.hash(&mut h1);
-        m.user_id.hash(&mut h2);
-        hash_str_field(&mut h1, &mut h2, &m.display_name);
+        m.id.hash(&mut h);
+        hash_str_field(&mut h, &m.user_id);
+        hash_str_field(&mut h, &m.display_name);
     }
 
-    (h1.finish(), h2.finish(), html.len())
+    (h.finish(), html.len())
 }
 
-fn normalize_plain_newlines(input: &str) -> String {
+fn decode_named_html_entity(name: &str) -> Option<char> {
+    match name {
+        "amp" | "AMP" => Some('&'),
+        "lt" | "LT" => Some('<'),
+        "gt" | "GT" => Some('>'),
+        "quot" | "QUOT" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some('\u{00A0}'),
+        "ndash" => Some('\u{2013}'),
+        "mdash" => Some('\u{2014}'),
+        "hellip" => Some('\u{2026}'),
+        "lsquo" => Some('\u{2018}'),
+        "rsquo" => Some('\u{2019}'),
+        "ldquo" => Some('\u{201C}'),
+        "rdquo" => Some('\u{201D}'),
+        "bull" => Some('\u{2022}'),
+        "middot" => Some('\u{00B7}'),
+        "copy" | "COPY" => Some('\u{00A9}'),
+        "reg" | "REG" => Some('\u{00AE}'),
+        "trade" => Some('\u{2122}'),
+        "times" => Some('\u{00D7}'),
+        "divide" => Some('\u{00F7}'),
+        "plusmn" => Some('\u{00B1}'),
+        "larr" => Some('\u{2190}'),
+        "rarr" => Some('\u{2192}'),
+        "uarr" => Some('\u{2191}'),
+        "darr" => Some('\u{2193}'),
+        "euro" => Some('\u{20AC}'),
+        "pound" => Some('\u{00A3}'),
+        "yen" => Some('\u{00A5}'),
+        _ => None,
+    }
+}
+
+fn decode_numeric_html_entity(body: &str) -> Option<char> {
+    let cp = if let Some(hex) = body.strip_prefix('x').or_else(|| body.strip_prefix('X')) {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u32::from_str_radix(hex, 16).unwrap_or(0x11_0000)
+    } else {
+        if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        body.parse::<u32>().unwrap_or(0x11_0000)
+    };
+    if cp == 0 {
+        return Some('\u{FFFD}');
+    }
+    Some(char::from_u32(cp).unwrap_or('\u{FFFD}'))
+}
+
+fn decode_plain_entities_and_newlines(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'\r' => {
+                if i + 1 < len && bytes[i + 1] == b'\n' {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                out.push('\n');
             }
-            out.push('\n');
-        } else {
-            out.push(ch);
+            b'&' => {
+                let mut decoded_char = None;
+                let max_end = (i + 16).min(len);
+                if let Some(rel_semi) = bytes[i + 1..max_end].iter().position(|&b| b == b';') {
+                    let entity = &input[i + 1..i + 1 + rel_semi];
+                    decoded_char = if let Some(num) = entity.strip_prefix('#') {
+                        decode_numeric_html_entity(num)
+                    } else if entity.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                        decode_named_html_entity(entity)
+                    } else {
+                        None
+                    };
+                    if let Some(ch) = decoded_char {
+                        out.push(ch);
+                        i = i + 1 + rel_semi + 1;
+                    }
+                }
+                if decoded_char.is_none() {
+                    out.push('&');
+                    i += 1;
+                }
+            }
+            _ => {
+                let start = i;
+                i += 1;
+                while i < len && bytes[i] != b'&' && bytes[i] != b'\r' {
+                    i += 1;
+                }
+                out.push_str(&input[start..i]);
+            }
         }
     }
     out
 }
 
 fn parse_plain_with_entities_preserving_newlines(input: &str) -> Vec<RichBlock> {
-    let fragment = Html::parse_fragment(input);
-    let decoded = collect_raw_text(fragment.root_element());
-    let normalized = normalize_plain_newlines(&decoded);
+    let normalized = decode_plain_entities_and_newlines(input);
     let trimmed = normalized.trim_matches(|c| c == ' ' || c == '\t' || c == '\n');
     if trimmed.is_empty() {
         Vec::new()
@@ -2009,26 +2120,26 @@ mod tests {
     fn html_cache_evicts_at_max_capacity() {
         let mut cache = HtmlParseCache::default();
         for i in 0..(HTML_CACHE_MAX_ENTRIES + 50) {
-            cache.insert((i as u64, (i as u64) ^ 0x55, i), Arc::from(Vec::new()));
+            cache.insert((i as u64, i), Arc::from(Vec::new()));
         }
-        assert_eq!(cache.entries.len(), HTML_CACHE_MAX_ENTRIES);
-        assert_eq!(cache.order.len(), HTML_CACHE_MAX_ENTRIES);
-        assert!(cache.get(&(0, 0x55, 0)).is_none());
+        assert_eq!(cache.len(), HTML_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.nodes.len(), HTML_CACHE_MAX_ENTRIES);
+        assert!(cache.get(&(0, 0)).is_none());
         let last = HTML_CACHE_MAX_ENTRIES + 49;
-        assert!(cache.get(&(last as u64, (last as u64) ^ 0x55, last)).is_some());
+        assert!(cache.get(&(last as u64, last)).is_some());
     }
 
     #[test]
     fn html_cache_promotes_on_get_lru() {
         let mut cache = HtmlParseCache::default();
         for i in 0..HTML_CACHE_MAX_ENTRIES {
-            cache.insert((i as u64, 1, i), Arc::from(Vec::new()));
+            cache.insert((i as u64, i), Arc::from(Vec::new()));
         }
         // Promote key 0 to MRU before inserting one new item; key 1 should be evicted instead of 0.
-        assert!(cache.get(&(0, 1, 0)).is_some());
-        cache.insert((99999, 1, 99999), Arc::from(Vec::new()));
-        assert!(cache.get(&(0, 1, 0)).is_some());
-        assert!(cache.get(&(1, 1, 1)).is_none());
+        assert!(cache.get(&(0, 0)).is_some());
+        cache.insert((99999, 99999), Arc::from(Vec::new()));
+        assert!(cache.get(&(0, 0)).is_some());
+        assert!(cache.get(&(1, 1)).is_none());
     }
 
     #[test]
