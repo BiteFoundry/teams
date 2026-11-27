@@ -901,8 +901,10 @@ mod tests {
             let _ = axum::serve(graph_listener, graph_app).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = format!("http://{graph_addr}/v1.0");
+        let cfg = crate::config::AppConfig {
+            graph_base_url: format!("http://{graph_addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "secret-graph-bearer".into(),
             refresh_token: None,
@@ -968,8 +970,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = crate::config::AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1026,8 +1030,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = crate::config::AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "hosted-secret-token".into(),
             refresh_token: None,
@@ -1100,7 +1106,7 @@ mod tests {
         let real_png = dir.path().join("ok.bin");
         std::fs::write(
             &real_png,
-            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13],
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13],
         )
         .unwrap();
         let (mime4, is_image4) =
@@ -1116,8 +1122,10 @@ mod tests {
         use std::io::Cursor;
 
         // Point graph_base_url at an unreachable local port so any network call would fail immediately.
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = "http://127.0.0.1:1/v1.0".to_string();
+        let cfg = crate::config::AppConfig {
+            graph_base_url: "http://127.0.0.1:1/v1.0".to_string(),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "unused".into(),
             refresh_token: None,

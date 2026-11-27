@@ -531,6 +531,16 @@ impl UiState {
     }
 }
 
+struct AttachmentDecodeJob {
+    key: String,
+    msg_id: String,
+    att: AttachmentInfo,
+    fit: img_preview::FitBox,
+    cell_px: (u16, u16),
+    bg: (u8, u8, u8),
+    caps: Option<TerminalGraphicsCaps>,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub auth: AuthManager,
@@ -2161,8 +2171,8 @@ impl AppState {
         let tx = self.ui_tx.clone();
 
         tokio::spawn(async move {
-            let mut paged: Option<anyhow::Result<(Vec<ConversationSummary>, Option<String>, bool)>> =
-                None;
+            type PagedChatsResult = anyhow::Result<(Vec<ConversationSummary>, Option<String>, bool)>;
+            let mut paged: Option<PagedChatsResult> = None;
             if let Some(ref link) = saved_next_link {
                 match graph.list_chats_page(50, Some(link)).await {
                     Ok((chats, next)) => {
@@ -2749,16 +2759,16 @@ impl AppState {
         self.clear_image_cache();
     }
 
-    fn spawn_attachment_image_decode(
-        &mut self,
-        key: String,
-        msg_id: String,
-        att: AttachmentInfo,
-        fit: img_preview::FitBox,
-        cell_px: (u16, u16),
-        bg: (u8, u8, u8),
-        caps: Option<TerminalGraphicsCaps>,
-    ) {
+    fn spawn_attachment_image_decode(&mut self, job: AttachmentDecodeJob) {
+        let AttachmentDecodeJob {
+            key,
+            msg_id,
+            att,
+            fit,
+            cell_px,
+            bg,
+            caps,
+        } = job;
         if self.image_cache.contains_key(&key)
             || self.image_pending.contains(&key)
             || self.image_errors.contains_key(&key)
@@ -2873,15 +2883,15 @@ impl AppState {
         bg_rgb: (u8, u8, u8),
     ) {
         let key = Self::image_cache_key(&msg_id, &att.id, cols, rows, cell_px, bg_rgb);
-        self.spawn_attachment_image_decode(
+        self.spawn_attachment_image_decode(AttachmentDecodeJob {
             key,
             msg_id,
             att,
-            img_preview::FitBox::fixed(cols, rows),
+            fit: img_preview::FitBox::fixed(cols, rows),
             cell_px,
-            bg_rgb,
-            None,
-        );
+            bg: bg_rgb,
+            caps: None,
+        });
     }
 
     pub fn request_preview_image(
@@ -2902,15 +2912,15 @@ impl AppState {
                     caps.cell_px,
                     caps.protocol,
                 );
-                self.spawn_attachment_image_decode(
+                self.spawn_attachment_image_decode(AttachmentDecodeJob {
                     key,
-                    msg_id.clone(),
-                    attachment.clone(),
+                    msg_id: msg_id.clone(),
+                    att: attachment.clone(),
                     fit,
-                    caps.cell_px,
-                    bg_rgb,
-                    Some(caps),
-                );
+                    cell_px: caps.cell_px,
+                    bg: bg_rgb,
+                    caps: Some(caps),
+                });
             }
         }
     }
@@ -3951,8 +3961,10 @@ impl AppState {
                         if ui.composer.text().trim().is_empty() {
                             ui.composer.load_text(&text);
                         }
-                    } else if !self.drafts.contains_key(&orig_draft_key) {
-                        self.drafts.insert(orig_draft_key, text);
+                    } else if let std::collections::hash_map::Entry::Vacant(entry) =
+                        self.drafts.entry(orig_draft_key)
+                    {
+                        entry.insert(text);
                         self.persist_drafts();
                     }
                 }
@@ -5941,7 +5953,7 @@ pub(super) mod tests {
                 web_url: None,
             }],
         };
-        storage.upsert_teams(&[team.clone()]).unwrap();
+        storage.upsert_teams(std::slice::from_ref(&team)).unwrap();
         let active_chat_target = ConversationTarget::Chat {
             chat_id: "c-open".to_string(),
         };
@@ -5967,7 +5979,9 @@ pub(super) mod tests {
             }])
             .unwrap();
         let active_msg = make_test_msg(&active_key, "a1", "2026-11-20T05:00:00Z", "hello");
-        storage.upsert_messages(&[active_msg.clone()]).unwrap();
+        storage
+            .upsert_messages(std::slice::from_ref(&active_msg))
+            .unwrap();
 
         let mut app = AppState::new(cfg.clone(), auth, graph, storage.clone(), sync_ctrl, ui_tx);
         let mut ui = UiState::from_config(&cfg);
@@ -5986,7 +6000,9 @@ pub(super) mod tests {
 
         let bg_chan_key = "chan:t1:ch1".to_string();
         let bg_msg = make_test_msg(&bg_chan_key, "cm-1", "2026-11-20T05:10:00Z", "Channel news");
-        storage.upsert_messages(&[bg_msg.clone()]).unwrap();
+        storage
+            .upsert_messages(std::slice::from_ref(&bg_msg))
+            .unwrap();
         storage.increment_conversation_unread(&bg_chan_key, 1).unwrap();
         let updated_convs = storage.list_conversations().unwrap();
 
@@ -6306,8 +6322,10 @@ pub(super) mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -6456,8 +6474,10 @@ pub(super) mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = base;
+        let cfg = AppConfig {
+            graph_base_url: base,
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -6614,8 +6634,10 @@ pub(super) mod tests {
     fn make_mock_graph_app(
         base_url: &str,
     ) -> (AppState, UiState, mpsc::UnboundedReceiver<UiMsg>) {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = base_url.to_string();
+        let cfg = AppConfig {
+            graph_base_url: base_url.to_string(),
+            ..Default::default()
+        };
         let auth = mock_graph_auth(&cfg);
         let graph = GraphClient::new(cfg.clone(), auth.clone())
             .unwrap()

@@ -25,7 +25,7 @@ use crate::{
     cli,
     config::AppConfig,
     graph::GraphClient,
-    models::{ConversationKind, ConversationTarget, MentionInfo, ThreadCoverage},
+    models::{ConversationKind, ConversationTarget, MentionInfo},
     parser, resolver,
     storage::Storage,
     sync::{self, SyncCommand},
@@ -252,7 +252,14 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize)]
 pub struct EditMessageBody {
-    pub markdown: String,
+    #[serde(default)]
+    pub markdown: Option<String>,
+    #[serde(default)]
+    pub find: Option<String>,
+    #[serde(default)]
+    pub replace: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
     #[serde(default)]
     pub thread_root_id: Option<String>,
 }
@@ -1072,16 +1079,12 @@ async fn get_thread(
     let limit = cli::clamp_limit(query.limit.unwrap_or(50));
     let conv = resolve_target_for_api(&state, &key, query.offline).await?;
 
-    let ConversationTarget::Channel {
-        ref team_id,
-        ref channel_id,
-    } = conv.target
-    else {
+    if !matches!(conv.target, ConversationTarget::Channel { .. }) {
         return Err(ApiError::bad_request(format!(
             "threads are only supported on team channels: {}",
             conv.conv_key
         )));
-    };
+    }
 
     let (thread, coverage) = if query.offline {
         let conv_clone = conv.clone();
@@ -1092,22 +1095,10 @@ async fn get_thread(
         .await?
         .ok_or_else(|| ApiError::not_found(cli::thread_cache_miss(&root_id, limit).to_string()))?
     } else {
-        let (mut view, complete) = match state
-            .graph
-            .get_thread_with_coverage(team_id, channel_id, &root_id, limit)
-            .await
-        {
+        match cli::read_thread(&state.storage, &state.graph, &conv, &root_id, limit).await {
             Ok(v) => v,
             Err(err) => return Err(map_graph_error(&state.graph, err).await),
-        };
-        let cached = view.clone();
-        with_storage(&state.storage, move |s| s.save_fetched_thread(&cached, complete)).await?;
-        cli::hydrate_thread_attachments(&mut view);
-        let coverage = ThreadCoverage {
-            has_more: !complete,
-            reply_total: complete.then_some(view.replies.len()),
-        };
-        (view, coverage)
+        }
     };
 
     let returned = thread.replies.len();
@@ -1314,35 +1305,37 @@ async fn edit_message(
     Path((key, msg_id)): Path<(String, String)>,
     Json(body): Json<EditMessageBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if body.markdown.trim().is_empty() {
-        return Err(ApiError::bad_request("markdown must not be empty"));
+    let edit = cli::MessageEdit::from_args(
+        body.markdown.as_deref(),
+        body.find.as_deref(),
+        body.replace.as_deref(),
+        body.subject.as_deref(),
+    )
+    .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+
+    let parent_msg_id = body
+        .thread_root_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty());
+    if matches!(edit, cli::MessageEdit::Subject(_)) && parent_msg_id.is_some() {
+        return Err(ApiError::bad_request(
+            "Subject edits require a channel root post.",
+        ));
     }
 
     let conv = resolve_target_for_api(&state, &key, false).await?;
-    let compiled =
-        parser::compile_outgoing_markdown(&body.markdown, None, vec![], vec![], vec![], None);
-
-    if let Err(err) = state
-        .graph
-        .edit_message(
-            &conv.target,
-            &msg_id,
-            body.thread_root_id.as_deref(),
-            &compiled.body_html,
-        )
-        .await
+    if let Err(err) = cli::edit_sent_message(
+        &state.storage,
+        &state.graph,
+        &conv,
+        &msg_id,
+        parent_msg_id,
+        edit,
+    )
+    .await
     {
         return Err(map_graph_error(&state.graph, err).await);
     }
-
-    let ck = conv.conv_key.clone();
-    let mid = msg_id.clone();
-    let html = compiled.body_html.clone();
-    let now = chrono::Utc::now().to_rfc3339();
-    let _ = with_storage(&state.storage, move |s| {
-        s.apply_local_edit(&ck, &mid, &html, &now).map(|_| ())
-    })
-    .await;
 
     Ok(Json(json!({
         "ok": true,

@@ -128,24 +128,26 @@ struct MockState {
     upload_name_counts: RwLock<HashMap<String, usize>>,
 }
 
-fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+fn check_bearer_header(headers: &HeaderMap, expected: &str) -> Option<Response> {
     let actual = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     if actual == Some(expected) {
-        Ok(())
+        None
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": {
-                    "code": "InvalidAuthenticationToken",
-                    "message": "Access token has expired or is not valid."
-                }
-            })),
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": {
+                        "code": "InvalidAuthenticationToken",
+                        "message": "Access token has expired or is not valid."
+                    }
+                })),
+            )
+                .into_response(),
         )
-            .into_response())
     }
 }
 
@@ -163,7 +165,7 @@ impl MockState {
         format!("{prefix}-{}", *seq)
     }
 
-    fn check_bearer(&self, headers: &HeaderMap) -> Result<(), Response> {
+    fn check_bearer(&self, headers: &HeaderMap) -> Option<Response> {
         let expected = self.expected_token.read().unwrap().clone();
         check_bearer_header(headers, &expected)
     }
@@ -286,7 +288,7 @@ async fn get_me_handler(State(state): State<Arc<MockState>>, headers: HeaderMap)
             .unwrap()
             .push(auth_val.to_string());
     }
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
 
@@ -300,7 +302,7 @@ async fn get_me_handler(State(state): State<Arc<MockState>>, headers: HeaderMap)
 }
 
 async fn list_chats_handler(State(state): State<Arc<MockState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let mut chats = mock_chats_payload();
@@ -315,7 +317,7 @@ async fn get_chat_handler(
     headers: HeaderMap,
     Path(chat_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let Some(mut chat) = mock_chats_payload().into_iter().find(|chat| chat["id"] == chat_id) else {
@@ -335,7 +337,7 @@ async fn patch_chat_handler(
     Path(chat_id): Path<String>,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let Some(mut chat) = mock_chats_payload()
@@ -360,7 +362,7 @@ async fn list_chat_messages_handler(
     headers: HeaderMap,
     Path(chat_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let map = state.chat_messages.read().unwrap();
@@ -377,7 +379,7 @@ async fn post_chat_message_handler(
     Path(chat_id): Path<String>,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     state.posted_chat_payloads.write().unwrap().push(payload.clone());
@@ -425,7 +427,7 @@ async fn joined_teams_handler(
     State(state): State<Arc<MockState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     Json(json!({ "value": mock_teams_payload() })).into_response()
@@ -436,7 +438,7 @@ async fn batch_handler(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let reqs = payload
@@ -472,7 +474,7 @@ async fn list_channel_messages_handler(
     headers: HeaderMap,
     Path((team_id, channel_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let msgs_guard = state.channel_messages.read().unwrap();
@@ -500,7 +502,7 @@ async fn post_channel_message_handler(
     Path((team_id, channel_id)): Path<(String, String)>,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let id = state.next_id("chan-root");
@@ -547,7 +549,7 @@ async fn get_channel_root_handler(
     headers: HeaderMap,
     Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let msgs_guard = state.channel_messages.read().unwrap();
@@ -567,7 +569,7 @@ async fn patch_channel_root_handler(
     Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let mut messages = state.channel_messages.write().unwrap();
@@ -595,7 +597,7 @@ async fn list_channel_replies_handler(
     headers: HeaderMap,
     Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let guard = state.channel_replies.read().unwrap();
@@ -612,7 +614,7 @@ async fn post_channel_reply_handler(
     Path((team_id, channel_id, root_id)): Path<(String, String, String)>,
     Json(payload): Json<Value>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     state.posted_reply_payloads.write().unwrap().push(payload.clone());
@@ -660,7 +662,7 @@ async fn chat_drive_upload_handler(
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let file_name = rest
@@ -700,7 +702,7 @@ async fn create_link_handler(
     headers: HeaderMap,
     Path(_item_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let shared_url = "https://contoso.sharepoint.com/:t:/s/chat/Eabc123";
@@ -724,7 +726,7 @@ async fn channel_files_folder_handler(
     headers: HeaderMap,
     Path((_team_id, _channel_id)): Path<(String, String)>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     Json(json!({
@@ -744,7 +746,7 @@ async fn sp_drive_upload_handler(
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let file_name = rest
@@ -784,7 +786,7 @@ async fn download_share_content_handler(
     headers: HeaderMap,
     Path(share_token): Path<String>,
 ) -> Response {
-    if let Err(resp) = state.check_bearer(&headers) {
+    if let Some(resp) = state.check_bearer(&headers) {
         return resp;
     }
     let Some(encoded) = share_token.strip_prefix("u!") else {
@@ -2098,7 +2100,7 @@ async fn e2e_inline_image_preview_and_self_updater() {
         .route(
             "/v1.0/chats/c-img/messages",
             get(|State(st): State<HostedImgMockState>, headers: HeaderMap| async move {
-                if let Err(resp) = check_bearer_header(&headers, "inline-img-tok") {
+                if let Some(resp) = check_bearer_header(&headers, "inline-img-tok") {
                     return resp;
                 }
                 let img_url = format!(
@@ -2126,7 +2128,7 @@ async fn e2e_inline_image_preview_and_self_updater() {
         .route(
             "/v1.0/chats/c-img/messages/m-img/hostedContents/hc-1/$value",
             get(|State(st): State<HostedImgMockState>, headers: HeaderMap| async move {
-                if let Err(resp) = check_bearer_header(&headers, "inline-img-tok") {
+                if let Some(resp) = check_bearer_header(&headers, "inline-img-tok") {
                     return resp;
                 }
                 (StatusCode::OK, st.png_bytes).into_response()
@@ -4884,9 +4886,11 @@ async fn regression_teams_bug_01_single_quote_reply_blockquote() {
     assert_single_reply_bq(&html_u2, "m-older-99", "CLI fallback body", "CLI single-GET fallback");
 
     // 2. MCP cached & uncached
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = graph_base.clone();
-    cfg.auth_base_url = auth_base.clone();
+    let cfg = AppConfig {
+        graph_base_url: graph_base.clone(),
+        auth_base_url: auth_base.clone(),
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: jwt.clone(),
         refresh_token: None,
@@ -4972,10 +4976,12 @@ async fn regression_teams_bug_01_single_quote_reply_blockquote() {
     // Regression control: Channel thread reply uses /replies endpoint with 0 Skype Reply blockquotes
     let chan_rep = run_cli(&tmp_cached, &["reply", "Eng/General", "root-1", "Channel reply text", "--json"]).await;
     assert!(chan_rep.status.success(), "stderr={}", String::from_utf8_lossy(&chan_rep.stderr));
-    let chan_posts = state.posted_channel_reply_bodies.read().unwrap();
-    assert_eq!(chan_posts.len(), 1);
-    assert_eq!(chan_posts[0].0, "root-1");
-    assert_eq!(chan_posts[0].1, "<p>Channel reply text</p>");
+    {
+        let chan_posts = state.posted_channel_reply_bodies.read().unwrap();
+        assert_eq!(chan_posts.len(), 1);
+        assert_eq!(chan_posts[0].0, "root-1");
+        assert_eq!(chan_posts[0].1, "<p>Channel reply text</p>");
+    }
 
     // W2: Replying to a nonexistent chat message ID fails without posting an empty quote reply
     let posts_before = state.posted_chat_bodies.read().unwrap().len();
@@ -5905,9 +5911,11 @@ async fn regression_teams_bug_14_mcp_list_chats_schema_and_presence_reset() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let mut cfg = AppConfig::default();
-    cfg.graph_base_url = graph_base.clone();
-    cfg.auth_base_url = auth_base.clone();
+    let cfg = AppConfig {
+        graph_base_url: graph_base.clone(),
+        auth_base_url: auth_base.clone(),
+        ..Default::default()
+    };
     let tokens = StoredTokens {
         access_token: "tok".into(),
         refresh_token: None,

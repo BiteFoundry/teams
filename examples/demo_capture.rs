@@ -545,12 +545,14 @@ async fn main() {
     // Isolate config dir so real local drafts/config paths never leak into the demo GIF.
     std::env::set_var("TEAMS_CONFIG_DIR", "~/.config/teams-cli");
 
-    let mut cfg = AppConfig::default();
-    cfg.theme = ThemePreset::Dark;
-    cfg.density = DensityMode::Cozy;
-    cfg.show_nav_rail = true;
-    cfg.auto_thread_pane = true;
-    cfg.inline_images = true;
+    let cfg = AppConfig {
+        theme: ThemePreset::Dark,
+        density: DensityMode::Cozy,
+        show_nav_rail: true,
+        auto_thread_pane: true,
+        inline_images: true,
+        ..Default::default()
+    };
 
     let auth = AuthManager::new(cfg.clone()).expect("auth init");
     let graph = GraphClient::new(cfg.clone(), auth.clone()).expect("graph init");

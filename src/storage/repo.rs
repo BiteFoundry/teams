@@ -507,7 +507,7 @@ fn upsert_messages_in_transaction(
             let deleted_int = if msg.deleted { 1i32 } else { 0i32 };
             let reply_count_i64 = msg.reply_count as i64;
 
-            let existing: Option<(
+            type ExistingMessageRow = (
                 Option<String>,
                 i32,
                 i64,
@@ -519,7 +519,8 @@ fn upsert_messages_in_transaction(
                 String,
                 bool,
                 Option<String>,
-            )> = check_stmt
+            );
+            let existing: Option<ExistingMessageRow> = check_stmt
                 .query_row(params![msg_key.as_ref(), &msg.body_html], |row| {
                     Ok((
                         row.get(0)?,
@@ -1524,8 +1525,7 @@ fn map_message_row(row: &Row<'_>) -> rusqlite::Result<MessageItem> {
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(max_chars.min(text.len()));
-    let mut count = 0usize;
-    for ch in text.chars() {
+    for (count, ch) in text.chars().enumerate() {
         if count >= max_chars {
             while out.chars().count() >= max_chars {
                 out.pop();
@@ -1534,7 +1534,6 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
             return out;
         }
         out.push(ch);
-        count += 1;
     }
     out
 }

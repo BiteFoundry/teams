@@ -111,7 +111,7 @@ impl GraphClient {
 
 pub(crate) fn format_iso8601_duration_mins(mins: u32) -> String {
     let m = mins.max(1);
-    if m % 60 == 0 {
+    if m.is_multiple_of(60) {
         format!("PT{}H", m / 60)
     } else {
         format!("PT{}M", m)

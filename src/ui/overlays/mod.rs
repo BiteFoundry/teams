@@ -89,7 +89,7 @@ pub enum Overlay {
     NewChat(NewChatState),
     RoomInfo(RoomInfoState),
     ImagePreview(ImagePreviewOverlay),
-    HtmlPreview(HtmlPreviewOverlay),
+    HtmlPreview(Box<HtmlPreviewOverlay>),
     Help(HelpOverlay),
     Confirm(ConfirmDialog),
 }
@@ -129,11 +129,11 @@ impl Overlay {
     }
 
     pub fn html_preview(title: Option<String>, raw_html: String) -> Self {
-        Overlay::HtmlPreview(HtmlPreviewOverlay::new(title, raw_html))
+        Overlay::HtmlPreview(Box::new(HtmlPreviewOverlay::new(title, raw_html)))
     }
 
     pub fn markdown_preview(title: Option<String>, raw_md: String) -> Self {
-        Overlay::HtmlPreview(HtmlPreviewOverlay::new_markdown(title, raw_md))
+        Overlay::HtmlPreview(Box::new(HtmlPreviewOverlay::new_markdown(title, raw_md)))
     }
 
     pub fn context_menu(menu: ContextMenu) -> Self {

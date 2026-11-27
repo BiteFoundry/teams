@@ -1045,8 +1045,7 @@ async fn dispatch_command(
                 subject,
                 &mention,
                 important,
-                json,
-                full,
+                PostOutput { json, full },
             ))
             .await
         }
@@ -1066,8 +1065,7 @@ async fn dispatch_command(
                 &markdown,
                 &mention,
                 important,
-                json,
-                full,
+                PostOutput { json, full },
             ))
             .await
         }
@@ -1087,8 +1085,7 @@ async fn dispatch_command(
                 caption.as_deref(),
                 thread.as_deref(),
                 inline,
-                json,
-                full,
+                PostOutput { json, full },
             ))
             .await
         }
@@ -2970,6 +2967,11 @@ fn reaction_symbol(reaction_type: &str) -> &str {
     }
 }
 
+struct PostOutput {
+    json: bool,
+    full: bool,
+}
+
 async fn cmd_send(
     cfg: &AppConfig,
     target: &str,
@@ -2977,8 +2979,7 @@ async fn cmd_send(
     subject: Option<String>,
     mentions_raw: &[String],
     important: bool,
-    json_out: bool,
-    full: bool,
+    output: PostOutput,
 ) -> Result<()> {
     if markdown.trim().is_empty() {
         bail!("Message body is empty.");
@@ -2998,8 +2999,8 @@ async fn cmd_send(
     let sent = graph.send_message(&conv.target, &outgoing).await?;
     let _ = storage.upsert_messages(std::slice::from_ref(&sent));
 
-    if json_out {
-        let payload = if full {
+    if output.json {
+        let payload = if output.full {
             json!({
                 "ok": true,
                 "conversation": conv,
@@ -3022,8 +3023,7 @@ async fn cmd_reply(
     markdown: &str,
     mentions_raw: &[String],
     important: bool,
-    json_out: bool,
-    full: bool,
+    output: PostOutput,
 ) -> Result<()> {
     if markdown.trim().is_empty() {
         bail!("Reply body is empty.");
@@ -3044,8 +3044,8 @@ async fn cmd_reply(
     let sent = graph.reply_message(&conv.target, msg_id, &outgoing).await?;
     let _ = storage.upsert_messages(std::slice::from_ref(&sent));
 
-    if json_out {
-        let payload = if full {
+    if output.json {
+        let payload = if output.full {
             json!({
                 "ok": true,
                 "conversation": conv,
@@ -3074,15 +3074,14 @@ async fn cmd_send_file(
     caption: Option<&str>,
     thread: Option<&str>,
     inline: bool,
-    json_out: bool,
-    full: bool,
+    output: PostOutput,
 ) -> Result<()> {
     let (_auth, graph, storage) = open_runtime(cfg, true).await?;
     let conv = resolve_post_target(&storage, &graph, target).await?;
     let sent = send_file_or_inline(&graph, &storage, &conv, path, caption, thread, inline).await?;
 
-    if json_out {
-        let payload = if full {
+    if output.json {
+        let payload = if output.full {
             json!({
                 "ok": true,
                 "conversation": conv,
@@ -5801,8 +5800,10 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
 
-        let mut cfg = AppConfig::default();
-        cfg.image_protocol = config::ImageProtocolPreference::Kitty;
+        let cfg = AppConfig {
+            image_protocol: config::ImageProtocolPreference::Kitty,
+            ..Default::default()
+        };
         assert_eq!(
             resolve_image_protocol_preference(&cfg, None).unwrap(),
             config::ImageProtocolPreference::Kitty
@@ -7199,8 +7200,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

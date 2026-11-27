@@ -469,12 +469,16 @@ pub fn parse_card_markdown_spans(input: &str) -> Vec<RichSpan> {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
-                    if !spans.is_empty() && !spans.last().is_some_and(|s| s.text.ends_with('\n')) {
-                        if list_stack.is_empty() || !spans.last().is_some_and(|s| s.text.ends_with("• ") || s.text.ends_with(". ")) {
-                            push_card_span(&mut spans, "\n", &default_style);
-                            if quote_depth > 0 {
-                                push_card_span(&mut spans, "│ ", &default_style);
-                            }
+                    if !spans.is_empty()
+                        && !spans.last().is_some_and(|s| s.text.ends_with('\n'))
+                        && (list_stack.is_empty()
+                            || !spans
+                                .last()
+                                .is_some_and(|s| s.text.ends_with("• ") || s.text.ends_with(". ")))
+                    {
+                        push_card_span(&mut spans, "\n", &default_style);
+                        if quote_depth > 0 {
+                            push_card_span(&mut spans, "│ ", &default_style);
                         }
                     }
                 }
@@ -594,10 +598,8 @@ pub fn parse_card_markdown_spans(input: &str) -> Vec<RichSpan> {
                 TagEnd::TableHead => {
                     in_table_head = false;
                 }
-                TagEnd::TableCell => {
-                    if in_table_head && style_stack.len() > 1 {
-                        style_stack.pop();
-                    }
+                TagEnd::TableCell if in_table_head && style_stack.len() > 1 => {
+                    style_stack.pop();
                 }
                 _ => {}
             },

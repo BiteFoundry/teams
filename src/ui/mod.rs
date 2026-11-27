@@ -342,19 +342,22 @@ pub fn draw(frame: &mut Frame, app: &mut AppState, ui: &mut UiState) -> Option<(
         nav_pane::draw(frame, nav_area, app, ui, &mut hitmap);
     }
 
-    let thread_anchored_composer = plan.mode == Some(LayoutMode::Wide)
+    let thread_anchored_rects = if plan.mode == Some(LayoutMode::Wide)
         && thread_open
         && ui.composer_target_thread
-        && plan.thread.is_some()
-        && plan.chat.is_some()
-        && plan.composer.is_some();
+    {
+        match (plan.chat, plan.composer, plan.thread) {
+            (Some(chat_r), Some(comp_r), Some(thread_r)) => Some((chat_r, comp_r, thread_r)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let thread_anchored_composer = thread_anchored_rects.is_some();
 
     let mut cursor_pos = None;
 
-    if thread_anchored_composer {
-        let chat_r = plan.chat.unwrap();
-        let comp_r = plan.composer.unwrap();
-        let thread_r = plan.thread.unwrap();
+    if let Some((chat_r, comp_r, thread_r)) = thread_anchored_rects {
         let full_chat = Rect::new(
             chat_r.x,
             chat_r.y,
@@ -737,9 +740,9 @@ fn draw_status_bar(
     let compact_right_w = seg_width(&compact_segments);
 
     let chosen_right: &[(&str, Option<ButtonId>)] =
-        if full_left_w + 2 + full_right_w <= area.width {
-            &full_segments
-        } else if badge_w + 12 + full_right_w <= area.width {
+        if full_left_w + 2 + full_right_w <= area.width
+            || badge_w + 12 + full_right_w <= area.width
+        {
             &full_segments
         } else if badge_w + 10 + compact_right_w <= area.width {
             &compact_segments

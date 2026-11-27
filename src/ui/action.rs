@@ -1117,8 +1117,10 @@ fn dispatch_without_overlay(action: Action, app: &mut AppState, ui: &mut UiState
             app.search_results.clear();
             app.search_query.clear();
             app.searching = false;
-            let mut search = SearchOverlay::default();
-            search.query = query.clone();
+            let search = SearchOverlay {
+                query: query.clone(),
+                ..Default::default()
+            };
             ui.push_overlay(Overlay::Search(search));
             if !query.trim().is_empty() {
                 app.search_messages(ui, query);
@@ -1580,7 +1582,7 @@ fn open_html_preview_for_message(
 
     if let Some(overlay) = HtmlPreviewOverlay::from_teams_message(&msg) {
         ui.close_overlays_of(OverlayKind::HtmlPreview);
-        ui.push_overlay(Overlay::HtmlPreview(overlay));
+        ui.push_overlay(Overlay::HtmlPreview(Box::new(overlay)));
     } else {
         ui.info("No HTML content or Adaptive Card in this message");
     }
@@ -1894,9 +1896,9 @@ fn step_active_nav_conversation(app: &mut AppState, ui: &mut UiState, delta: i32
 }
 
 fn active_stream_half_page(ui: &UiState) -> i32 {
-    let h = if ui.thread_drawer_open && ui.composer_target_thread {
-        ui.thread_scroll.area.height
-    } else if matches!(ui.focus(), Focus::Thread) {
+    let h = if (ui.thread_drawer_open && ui.composer_target_thread)
+        || matches!(ui.focus(), Focus::Thread)
+    {
         ui.thread_scroll.area.height
     } else {
         ui.chat_scroll.area.height
@@ -3697,8 +3699,10 @@ mod tests {
             let _ = axum::serve(listener, mock_app).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = format!("http://127.0.0.1:{}", addr.port());
+        let cfg = crate::config::AppConfig {
+            graph_base_url: format!("http://127.0.0.1:{}", addr.port()),
+            ..Default::default()
+        };
         let auth = crate::auth::AuthManager::new(cfg.clone()).unwrap();
         let graph = crate::graph::GraphClient::new(cfg.clone(), auth.clone()).unwrap();
         let storage = crate::storage::Storage::open_in_memory().unwrap();

@@ -39,8 +39,7 @@ scraper = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 unicode-width = "0.2"
@@ -56,6 +55,9 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = "fat"

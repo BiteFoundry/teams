@@ -100,6 +100,33 @@ enum RequestBody {
     },
 }
 
+struct ExecuteOptions<'a> {
+    extra_headers: &'a [(&'a str, String)],
+    use_bearer: bool,
+    timeout: Duration,
+    retry: RetryClass,
+}
+
+impl<'a> ExecuteOptions<'a> {
+    fn standard(retry: RetryClass) -> Self {
+        Self {
+            extra_headers: &[],
+            use_bearer: true,
+            timeout: STANDARD_REQUEST_TIMEOUT,
+            retry,
+        }
+    }
+
+    fn media(use_bearer: bool) -> Self {
+        Self {
+            extra_headers: &[],
+            use_bearer,
+            timeout: MEDIA_REQUEST_TIMEOUT,
+            retry: RetryClass::Idempotent,
+        }
+    }
+}
+
 impl GraphClient {
     pub(crate) fn resolve_url(&self, path_or_url: &str) -> String {
         if path_or_url.starts_with("https://") || path_or_url.starts_with("http://") {
@@ -171,10 +198,7 @@ impl GraphClient {
                 Method::GET,
                 &url,
                 RequestBody::Empty,
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::standard(RetryClass::Idempotent),
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
@@ -194,10 +218,7 @@ impl GraphClient {
                 Method::POST,
                 &url,
                 RequestBody::Json(json_val),
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-                RetryClass::NonIdempotent,
+                ExecuteOptions::standard(RetryClass::NonIdempotent),
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
@@ -216,10 +237,7 @@ impl GraphClient {
             Method::POST,
             &url,
             RequestBody::Json(json_val),
-            &[],
-            true,
-            STANDARD_REQUEST_TIMEOUT,
-            RetryClass::NonIdempotent,
+            ExecuteOptions::standard(RetryClass::NonIdempotent),
         )
         .await?;
         Ok(())
@@ -246,10 +264,10 @@ impl GraphClient {
             Method::PATCH,
             &url,
             RequestBody::Json(json_val),
-            headers,
-            true,
-            STANDARD_REQUEST_TIMEOUT,
-            RetryClass::Idempotent,
+            ExecuteOptions {
+                extra_headers: headers,
+                ..ExecuteOptions::standard(RetryClass::Idempotent)
+            },
         )
         .await
     }
@@ -260,10 +278,7 @@ impl GraphClient {
             Method::POST,
             &url,
             RequestBody::Empty,
-            &[],
-            true,
-            STANDARD_REQUEST_TIMEOUT,
-            RetryClass::NonIdempotent,
+            ExecuteOptions::standard(RetryClass::NonIdempotent),
         )
         .await?;
         Ok(())
@@ -275,10 +290,7 @@ impl GraphClient {
             Method::DELETE,
             &url,
             RequestBody::Empty,
-            &[],
-            true,
-            STANDARD_REQUEST_TIMEOUT,
-            RetryClass::Idempotent,
+            ExecuteOptions::standard(RetryClass::Idempotent),
         )
         .await?;
         Ok(())
@@ -299,10 +311,7 @@ impl GraphClient {
                     data: Arc::from(bytes),
                     content_type: content_type.map(str::to_string),
                 },
-                &[],
-                true,
-                MEDIA_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::media(true),
             )
             .await?;
         let resp_bytes = resp.bytes().await.context("Failed to read Graph PUT response body")?;
@@ -334,10 +343,10 @@ impl GraphClient {
                     data: Arc::from(chunk),
                     content_type: Some("application/octet-stream".to_string()),
                 },
-                &headers,
-                false,
-                MEDIA_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions {
+                    extra_headers: &headers,
+                    ..ExecuteOptions::media(false)
+                },
             )
             .await?;
         let status = resp.status();
@@ -357,10 +366,7 @@ impl GraphClient {
                 Method::GET,
                 &url,
                 RequestBody::Empty,
-                &[],
-                true,
-                MEDIA_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::media(true),
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph binary response")?;
@@ -379,10 +385,7 @@ impl GraphClient {
                 Method::GET,
                 &url,
                 RequestBody::Empty,
-                &[],
-                use_bearer,
-                MEDIA_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::media(use_bearer),
             )
             .await?;
         if let Some(len) = resp.content_length() {
@@ -419,10 +422,7 @@ impl GraphClient {
                 Method::GET,
                 &url,
                 RequestBody::Empty,
-                &[],
-                use_bearer,
-                MEDIA_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::media(use_bearer),
             )
             .await?;
 
@@ -465,10 +465,7 @@ impl GraphClient {
                 Method::GET,
                 &url,
                 RequestBody::Empty,
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::standard(RetryClass::Idempotent),
             )
             .await?;
         resp.text().await.context("Failed to read Graph text response")
@@ -489,10 +486,7 @@ impl GraphClient {
                     data: Arc::from(bytes),
                     content_type: Some(content_type.to_string()),
                 },
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-                RetryClass::NonIdempotent,
+                ExecuteOptions::standard(RetryClass::NonIdempotent),
             )
             .await?;
         let resp_bytes = resp.bytes().await.context("Failed to read Graph POST response body")?;
@@ -514,10 +508,7 @@ impl GraphClient {
                 data: Arc::from(bytes),
                 content_type: Some(content_type.to_string()),
             },
-            &[],
-            true,
-            STANDARD_REQUEST_TIMEOUT,
-            RetryClass::Idempotent,
+            ExecuteOptions::standard(RetryClass::Idempotent),
         )
         .await?;
         Ok(())
@@ -569,10 +560,7 @@ impl GraphClient {
                 Method::POST,
                 url,
                 RequestBody::Json(payload),
-                &[],
-                true,
-                STANDARD_REQUEST_TIMEOUT,
-                RetryClass::Idempotent,
+                ExecuteOptions::standard(RetryClass::Idempotent),
             )
             .await?;
         let bytes = resp.bytes().await.context("Failed to read Graph response body")?;
@@ -586,11 +574,14 @@ impl GraphClient {
         method: Method,
         url: &str,
         body: RequestBody,
-        extra_headers: &[(&str, String)],
-        use_bearer: bool,
-        timeout: Duration,
-        retry: RetryClass,
+        opts: ExecuteOptions<'_>,
     ) -> Result<reqwest::Response> {
+        let ExecuteOptions {
+            extra_headers,
+            use_bearer,
+            timeout,
+            retry,
+        } = opts;
         // One central origin check for every helper, including `@odata.nextLink` values
         // taken from responses or from the SQLite cursor table: the Graph token only ever
         // goes to the configured Graph host (or the hosts `should_send_bearer` allows).
@@ -1226,8 +1217,10 @@ mod tests {
 
     #[test]
     fn test_resolve_url_relative_and_absolute() {
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = "https://graph.microsoft.com/v1.0/".to_string();
+        let cfg = AppConfig {
+            graph_base_url: "https://graph.microsoft.com/v1.0/".to_string(),
+            ..Default::default()
+        };
         let auth = AuthManager::new(cfg.clone()).unwrap_or_else(|_| {
             AuthManager::from_tokens(
                 cfg.clone(),
@@ -1469,10 +1462,12 @@ mod tests {
         });
 
         let dir = tempdir().unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            graph_base_url: format!("http://{addr}/v1.0"),
+            tenant_id: "tid".into(),
+            ..Default::default()
+        };
 
         let tok = crate::auth::StoredTokens {
             access_token: "stale-token".into(),
@@ -1648,8 +1643,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1719,8 +1716,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = AppConfig::default();
-        cfg.graph_base_url = format!("http://{addr}/v1.0");
+        let cfg = AppConfig {
+            graph_base_url: format!("http://{addr}/v1.0"),
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

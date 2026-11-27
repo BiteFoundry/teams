@@ -45,7 +45,7 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const LOCK_STALE_AGE: Duration = Duration::from_secs(5);
 const BROADCAST_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub running: bool,
     pub pid: Option<u32>,
@@ -59,25 +59,6 @@ pub struct DaemonStatus {
     pub sync_summary: String,
     pub last_sync_at: Option<String>,
     pub last_error: Option<String>,
-}
-
-impl Default for DaemonStatus {
-    fn default() -> Self {
-        Self {
-            running: false,
-            pid: None,
-            version: None,
-            transport: None,
-            endpoint: None,
-            user_id: None,
-            uptime_secs: None,
-            attached_clients: 0,
-            sync_busy: false,
-            sync_summary: String::new(),
-            last_sync_at: None,
-            last_error: None,
-        }
-    }
 }
 
 /// Handle returned when a TUI client attaches to a live background sync daemon.

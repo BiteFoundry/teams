@@ -489,13 +489,56 @@ pub(crate) fn verify_sha256_sums(
     Ok(())
 }
 
+struct TempExtractDir {
+    path: PathBuf,
+}
+
+impl TempExtractDir {
+    fn create() -> Result<Self> {
+        let base = std::env::temp_dir();
+        for _ in 0..8 {
+            let candidate = base.join(format!("teams-update-{}", uuid::Uuid::new_v4()));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &candidate,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
+                    return Ok(Self { path: candidate });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).context(
+                        "Failed to create temporary directory for update extraction",
+                    );
+                }
+            }
+        }
+        bail!("Failed to create unique temporary directory for update extraction")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempExtractDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec<u8>> {
     let lower = asset_name.to_ascii_lowercase();
     if !lower.ends_with(".tar.gz") && !lower.ends_with(".tgz") && !lower.ends_with(".zip") {
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir().context("Failed to create temporary directory for update extraction")?;
+    let tmp = TempExtractDir::create()?;
     let archive_path = tmp.path().join(asset_name);
     std::fs::write(&archive_path, asset_bytes)
         .with_context(|| format!("Failed to save temporary archive: {}", archive_path.display()))?;

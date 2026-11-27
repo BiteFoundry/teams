@@ -128,8 +128,11 @@ impl NavRow {
 
 const NAV_CACHE_CAPACITY: usize = 16;
 
+type NavRowsCacheKey = (u64, u64);
+type NavRowsCacheEntry = (NavRowsCacheKey, Arc<[NavRow]>);
+
 struct NavRowsCache {
-    entries: Vec<((u64, u64), Arc<[NavRow]>)>,
+    entries: Vec<NavRowsCacheEntry>,
     max_entries: usize,
 }
 

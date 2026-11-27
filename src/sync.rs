@@ -301,7 +301,7 @@ impl PeriodicBackoffTracker {
             return true;
         }
         self.tick_count = self.tick_count.saturating_add(1);
-        self.tick_count % mult == 0
+        self.tick_count.is_multiple_of(mult)
     }
 }
 
@@ -3619,7 +3619,6 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         let stage = Arc::new(AtomicUsize::new(0));
-        let st_chats = Arc::clone(&stage);
         let st_batch = Arc::clone(&stage);
         let st_active = Arc::clone(&stage);
         let st_delta = Arc::clone(&stage);
@@ -3631,18 +3630,12 @@ mod tests {
         let app = Router::new()
             .route(
                 "/v1.0/me/chats",
-                get(move || {
-                    let st = Arc::clone(&st_chats);
-                    async move {
-                        let s = st.load(Ordering::SeqCst);
-                        // Keep lastMessagePreview.id AND lastUpdatedDateTime identical across stages
-                        // to prove rolling batch still catches edits/deletes on inactive chats.
-                        let preview_body = if s == 0 {
-                            "<p>bg-last-original</p>"
-                        } else {
-                            "<p>bg-last-original</p>"
-                        };
-                        Json(serde_json::json!({
+                get(|| async {
+                    // Keep lastMessagePreview (id, body, AND lastUpdatedDateTime) identical
+                    // across stages to prove rolling batch still catches edits/deletes on
+                    // inactive chats.
+                    let preview_body = "<p>bg-last-original</p>";
+                    Json(serde_json::json!({
                             "value": [
                                 {
                                     "id": "c-bg-1",
@@ -3678,7 +3671,6 @@ mod tests {
                                 }
                             ]
                         }))
-                    }
                 }),
             )
             .route(

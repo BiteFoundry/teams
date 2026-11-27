@@ -2263,9 +2263,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_access_token_login_and_valid_token() {
-        let mut cfg = AppConfig::default();
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tid".into();
+        let cfg = AppConfig {
+            client_id: "cid".into(),
+            tenant_id: "tid".into(),
+            ..Default::default()
+        };
 
         // Construct without touching real user keyring/config by using from_tokens or temp TEAMS_CONFIG_DIR
         let tok = StoredTokens {
@@ -2323,10 +2325,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let cred_path = dir.path().join("creds.json");
 
-        let mut cfg = AppConfig::default();
-        cfg.auth_base_url = format!("http://{addr}");
-        cfg.client_id = "cid".into();
-        cfg.tenant_id = "tenant-1".into();
+        let cfg = AppConfig {
+            auth_base_url: format!("http://{addr}"),
+            client_id: "cid".into(),
+            tenant_id: "tenant-1".into(),
+            ..Default::default()
+        };
 
         // 1. Client credentials login
         let dummy = StoredTokens {
@@ -2669,9 +2673,11 @@ mod tests {
         );
         std::fs::write(&token_path, &soon_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
+        let mut cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            ..Default::default()
+        };
         #[cfg(windows)]
         {
             cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", token_path.display());
@@ -2708,8 +2714,10 @@ mod tests {
         );
 
         // 1. Missing token_file bootstrapped via token_refresh_cmd writing the file
-        let mut cfg = AppConfig::default();
-        cfg.token_file = missing_path.to_string_lossy().to_string();
+        let mut cfg = AppConfig {
+            token_file: missing_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
         #[cfg(windows)]
         {
             cfg.token_refresh_cmd = format!("echo {fresh_jwt}> \"{}\"", missing_path.display());
@@ -2750,10 +2758,12 @@ mod tests {
         // Still-valid (not hard-expired) token within skew_secs -> falls back with warning
         let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
         std::fs::write(&token_path, &soon_jwt).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
-        cfg.token_refresh_cmd = "exit 1".to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            token_refresh_cmd: "exit 1".to_string(),
+            ..Default::default()
+        };
 
         let mgr = AuthManager::new(cfg.clone()).unwrap();
         assert_eq!(mgr.valid_access_token().await.unwrap(), soon_jwt);
@@ -2778,8 +2788,10 @@ mod tests {
         std::fs::write(&token_path, &expired_jwt).unwrap();
 
         // 1. token_file without refresh_cmd
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
         let mgr_file = AuthManager::new(cfg.clone()).unwrap();
         assert!(!mgr_file.is_refreshable().await);
         let err_file = mgr_file.valid_access_token().await.unwrap_err();
@@ -2811,8 +2823,10 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
         std::fs::write(&token_path, &fresh_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
         assert!(should_skip_keyring_on_init(&cfg));
 
         // Even with a fresh AuthManager pointing at token_file, update_identity must NOT persist to disk/keyring
@@ -2845,9 +2859,11 @@ mod tests {
             make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 3600 }), false);
         std::fs::write(&token_path, &soon_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
+        let mut cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            ..Default::default()
+        };
         #[cfg(windows)]
         {
             cfg.token_refresh_cmd = format!(
@@ -3051,8 +3067,10 @@ mod tests {
         let jwt2 = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 7200, "oid": "u-2-longer" }), false);
 
         std::fs::write(&token_path, &jwt1).unwrap();
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
+        let cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
         let mgr = AuthManager::new(cfg).unwrap();
         let _client = mgr.http_client();
 
@@ -3079,9 +3097,11 @@ mod tests {
         let soon_jwt = make_test_jwt_with_encoder(&serde_json::json!({ "exp": now + 120 }), false);
         std::fs::write(&token_path, &soon_jwt).unwrap();
 
-        let mut cfg = AppConfig::default();
-        cfg.token_file = token_path.to_string_lossy().to_string();
-        cfg.token_refresh_mins = 5;
+        let mut cfg = AppConfig {
+            token_file: token_path.to_string_lossy().to_string(),
+            token_refresh_mins: 5,
+            ..Default::default()
+        };
         #[cfg(windows)]
         {
             cfg.token_refresh_cmd = format!("echo hit>> \"{}\" && exit 1", count_path.display());

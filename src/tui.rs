@@ -288,14 +288,14 @@ struct TerminalGuard {
     orig_conin_mode: Option<u32>,
 }
 
+type TerminalSession = (
+    TerminalGuard,
+    Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+    TerminalGraphicsCaps,
+);
+
 impl TerminalGuard {
-    fn enter(
-        image_protocol: ImageProtocolPreference,
-    ) -> Result<(
-        Self,
-        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-        TerminalGraphicsCaps,
-    )> {
+    fn enter(image_protocol: ImageProtocolPreference) -> Result<TerminalSession> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -647,25 +647,29 @@ enum LoopStep {
     Quit,
 }
 
+struct EventLoopState {
+    dirty: bool,
+    pending_cell_px_refresh: bool,
+    last_activity_sent: Option<Instant>,
+    window_focused: Option<bool>,
+}
+
 async fn process_terminal_event_with_burst(
     first_ev: CrosstermEvent,
     events: &mut TerminalEventReader,
     app: &mut AppState,
     ui: &mut UiState,
-    dirty: &mut bool,
-    pending_cell_px_refresh: &mut bool,
-    last_activity_sent: &mut Option<Instant>,
-    window_focused: &mut Option<bool>,
+    loop_state: &mut EventLoopState,
 ) -> LoopStep {
     let CrosstermEvent::Key(first_key) = first_ev else {
         return handle_terminal_event(
             first_ev,
             app,
             ui,
-            dirty,
-            pending_cell_px_refresh,
-            last_activity_sent,
-            window_focused,
+            &mut loop_state.dirty,
+            &mut loop_state.pending_cell_px_refresh,
+            &mut loop_state.last_activity_sent,
+            &mut loop_state.window_focused,
         );
     };
     if !ui.accepts_text_input() || !PasteBurstDetector::is_candidate_key(&first_key) {
@@ -673,10 +677,10 @@ async fn process_terminal_event_with_burst(
             CrosstermEvent::Key(first_key),
             app,
             ui,
-            dirty,
-            pending_cell_px_refresh,
-            last_activity_sent,
-            window_focused,
+            &mut loop_state.dirty,
+            &mut loop_state.pending_cell_px_refresh,
+            &mut loop_state.last_activity_sent,
+            &mut loop_state.window_focused,
         );
     }
 
@@ -727,8 +731,8 @@ async fn process_terminal_event_with_burst(
 
     match detector.into_paste_or_keys() {
         Ok(coalesced) => {
-            notify_activity_throttled(app, last_activity_sent);
-            *dirty = true;
+            notify_activity_throttled(app, &mut loop_state.last_activity_sent);
+            loop_state.dirty = true;
             if action::dispatch(Action::Paste(coalesced), app, ui) {
                 return LoopStep::Quit;
             }
@@ -740,10 +744,10 @@ async fn process_terminal_event_with_burst(
                         CrosstermEvent::Key(k),
                         app,
                         ui,
-                        dirty,
-                        pending_cell_px_refresh,
-                        last_activity_sent,
-                        window_focused
+                        &mut loop_state.dirty,
+                        &mut loop_state.pending_cell_px_refresh,
+                        &mut loop_state.last_activity_sent,
+                        &mut loop_state.window_focused
                     ),
                     LoopStep::Quit
                 ) {
@@ -759,10 +763,10 @@ async fn process_terminal_event_with_burst(
                 extra,
                 app,
                 ui,
-                dirty,
-                pending_cell_px_refresh,
-                last_activity_sent,
-                window_focused
+                &mut loop_state.dirty,
+                &mut loop_state.pending_cell_px_refresh,
+                &mut loop_state.last_activity_sent,
+                &mut loop_state.window_focused
             ),
             LoopStep::Quit
         ) {
@@ -1060,16 +1064,26 @@ fn handle_terminal_event(
     LoopStep::Continue
 }
 
+struct SyncSupervisorChannels {
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+    ui_tx: mpsc::UnboundedSender<UiMsg>,
+    proxy_focus_rx: watch::Receiver<FocusTarget>,
+    proxy_nudge_rx: mpsc::UnboundedReceiver<SyncCommand>,
+}
+
 fn spawn_sync_supervisor(
     config: AppConfig,
     auth: AuthManager,
     graph: GraphClient,
     storage: Storage,
-    core_tx: mpsc::UnboundedSender<CoreEvent>,
-    ui_tx: mpsc::UnboundedSender<UiMsg>,
-    mut proxy_focus_rx: watch::Receiver<FocusTarget>,
-    mut proxy_nudge_rx: mpsc::UnboundedReceiver<SyncCommand>,
+    channels: SyncSupervisorChannels,
 ) {
+    let SyncSupervisorChannels {
+        core_tx,
+        ui_tx,
+        mut proxy_focus_rx,
+        mut proxy_nudge_rx,
+    } = channels;
     tokio::spawn(async move {
         let expected_user_id = auth
             .current_tokens()
@@ -1231,23 +1245,27 @@ pub async fn run_with_persona(
         auth,
         graph,
         storage,
-        core_tx,
-        ui_tx,
-        proxy_focus_rx,
-        proxy_nudge_rx,
+        SyncSupervisorChannels {
+            core_tx,
+            ui_tx,
+            proxy_focus_rx,
+            proxy_nudge_rx,
+        },
     );
 
     let mut events = TerminalEventReader::start();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut dirty = true;
-    let mut pending_cell_px_refresh = false;
-    let mut last_activity_sent: Option<Instant> = None;
-    let mut window_focused: Option<bool> = None;
+    let mut loop_state = EventLoopState {
+        dirty: true,
+        pending_cell_px_refresh: false,
+        last_activity_sent: None,
+        window_focused: None,
+    };
 
     loop {
-        if pending_cell_px_refresh {
-            pending_cell_px_refresh = false;
+        if loop_state.pending_cell_px_refresh {
+            loop_state.pending_cell_px_refresh = false;
             #[cfg(windows)]
             {
                 events.pause();
@@ -1337,7 +1355,7 @@ pub async fn run_with_persona(
             }
             terminal.clear()?;
             events.resume();
-            dirty = true;
+            loop_state.dirty = true;
 
             match result {
                 Ok(edited) => {
@@ -1350,9 +1368,9 @@ pub async fn run_with_persona(
             }
         }
 
-        if dirty {
+        if loop_state.dirty {
             draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
-            dirty = false;
+            loop_state.dirty = false;
         }
 
         let mut should_quit = false;
@@ -1362,11 +1380,11 @@ pub async fn run_with_persona(
                 let before = ui.toasts.len();
                 ui.toasts.tick(std::time::Instant::now());
                 if ui.toasts.len() != before {
-                    dirty = true;
+                    loop_state.dirty = true;
                 }
                 if ui.poll_retrying || app.syncing || ui.tasks.first_running().is_some() {
                     ui.spinner_tick = ui.spinner_tick.wrapping_add(1);
-                    dirty = true;
+                    loop_state.dirty = true;
                 }
             }
             maybe_core = core_rx.recv() => {
@@ -1374,7 +1392,7 @@ pub async fn run_with_persona(
                     Some(ev) => {
                         let before = LayoutSnapshot::capture(&app, &ui);
                         app.handle_core_event(&mut ui, ev);
-                        dirty = true;
+                        loop_state.dirty = true;
                         if LayoutSnapshot::capture(&app, &ui) != before {
                             need_redraw_before_coalesce = true;
                         }
@@ -1386,7 +1404,7 @@ pub async fn run_with_persona(
                 if let Some(msg) = maybe_ui {
                     let before = LayoutSnapshot::capture(&app, &ui);
                     app.handle_ui_msg(&mut ui, msg);
-                    dirty = true;
+                    loop_state.dirty = true;
                     if LayoutSnapshot::capture(&app, &ui) != before {
                         need_redraw_before_coalesce = true;
                     }
@@ -1403,10 +1421,7 @@ pub async fn run_with_persona(
                                 &mut events,
                                 &mut app,
                                 &mut ui,
-                                &mut dirty,
-                                &mut pending_cell_px_refresh,
-                                &mut last_activity_sent,
-                                &mut window_focused
+                                &mut loop_state
                             )
                             .await,
                             LoopStep::Quit
@@ -1436,7 +1451,7 @@ pub async fn run_with_persona(
                     Ok(ev) => {
                         let before = LayoutSnapshot::capture(&app, &ui);
                         app.handle_core_event(&mut ui, ev);
-                        dirty = true;
+                        loop_state.dirty = true;
                         drained += 1;
                         progressed = true;
                         if LayoutSnapshot::capture(&app, &ui) != before {
@@ -1459,7 +1474,7 @@ pub async fn run_with_persona(
                     Ok(msg) => {
                         let before = LayoutSnapshot::capture(&app, &ui);
                         app.handle_ui_msg(&mut ui, msg);
-                        dirty = true;
+                        loop_state.dirty = true;
                         drained += 1;
                         progressed = true;
                         if LayoutSnapshot::capture(&app, &ui) != before {
@@ -1486,10 +1501,7 @@ pub async fn run_with_persona(
                                 &mut events,
                                 &mut app,
                                 &mut ui,
-                                &mut dirty,
-                                &mut pending_cell_px_refresh,
-                                &mut last_activity_sent,
-                                &mut window_focused
+                                &mut loop_state
                             )
                             .await,
                             LoopStep::Quit
@@ -1519,7 +1531,7 @@ pub async fn run_with_persona(
     }
 
     app.stash_draft(&ui);
-    let _ = sync_ctrl.request(SyncCommand::Shutdown);
+    sync_ctrl.request(SyncCommand::Shutdown);
     events.pause();
     drop(guard);
     Ok(())
@@ -1602,7 +1614,7 @@ mod tests {
         tracker.commit(vec![img_a.clone()], (120, 36));
 
         // Same graphic & size -> skip erase and emit
-        let noop = tracker.plan_transition(&[img_a.clone()], (120, 36), false);
+        let noop = tracker.plan_transition(std::slice::from_ref(&img_a), (120, 36), false);
         assert!(!noop.erase_and_redraw);
         assert!(!noop.emit_desired);
 

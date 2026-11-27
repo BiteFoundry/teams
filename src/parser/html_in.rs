@@ -39,8 +39,8 @@ impl HtmlParseCache {
     }
 
     fn insert(&mut self, key: HtmlCacheKey, value: Arc<[RichBlock]>) {
-        if self.entries.contains_key(&key) {
-            self.entries.insert(key, value);
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.entries.entry(key) {
+            entry.insert(value);
             if self.order.back() != Some(&key) {
                 if let Some(pos) = self.order.iter().rposition(|k| k == &key) {
                     self.order.remove(pos);
@@ -593,10 +593,10 @@ pub fn parse_plain_markdown_blocks(input: &str) -> Vec<RichBlock> {
                 MdTagEnd::Strong
                 | MdTagEnd::Emphasis
                 | MdTagEnd::Strikethrough
-                | MdTagEnd::Link => {
-                    if style_stack.len() > 1 {
-                        style_stack.pop();
-                    }
+                | MdTagEnd::Link
+                    if style_stack.len() > 1 =>
+                {
+                    style_stack.pop();
                 }
                 _ => {}
             },
@@ -1694,30 +1694,29 @@ fn row_has_th_or_block_td(row_el: ElementRef<'_>, has_th: &mut bool, has_block_t
     for cell in row_el.children().filter_map(ElementRef::wrap) {
         match cell.value().name() {
             "th" => *has_th = true,
-            "td" => {
-                if cell.descendants().skip(1).any(|desc| {
-                    ElementRef::wrap(desc).is_some_and(|el| {
-                        matches!(
-                            el.value().name(),
-                            "div"
-                                | "p"
-                                | "ul"
-                                | "ol"
-                                | "blockquote"
-                                | "pre"
-                                | "h1"
-                                | "h2"
-                                | "h3"
-                                | "h4"
-                                | "h5"
-                                | "h6"
-                                | "hr"
-                                | "table"
-                        )
-                    })
-                }) {
-                    *has_block_td = true;
-                }
+            "td" if cell.descendants().skip(1).any(|desc| {
+                ElementRef::wrap(desc).is_some_and(|el| {
+                    matches!(
+                        el.value().name(),
+                        "div"
+                            | "p"
+                            | "ul"
+                            | "ol"
+                            | "blockquote"
+                            | "pre"
+                            | "h1"
+                            | "h2"
+                            | "h3"
+                            | "h4"
+                            | "h5"
+                            | "h6"
+                            | "hr"
+                            | "table"
+                    )
+                })
+            }) =>
+            {
+                *has_block_td = true;
             }
             _ => {}
         }

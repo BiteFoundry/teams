@@ -627,10 +627,11 @@ pub fn parse_da1_has_sixel(reply: &str) -> bool {
         let after = &rest[idx + 3..];
         if let Some(end) = after.find('c') {
             let body = &after[..end];
-            if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit() || b == b';') {
-                if body.split(';').skip(1).any(|attr| attr == "4") {
-                    return true;
-                }
+            if !body.is_empty()
+                && body.bytes().all(|b| b.is_ascii_digit() || b == b';')
+                && body.split(';').skip(1).any(|attr| attr == "4")
+            {
+                return true;
             }
         }
         rest = after;
@@ -868,7 +869,7 @@ fn write_and_read_terminal_probe(query: &str, timeout: Duration) -> String {
                         let key = unsafe { rec.event.key };
                         if key.b_key_down != 0 && key.unicode_char > 0 && key.unicode_char <= 0x7f {
                             let ch = key.unicode_char as u8 as char;
-                            let reps = key.w_repeat_count.max(1).min(16);
+                            let reps = key.w_repeat_count.clamp(1, 16);
                             for _ in 0..reps {
                                 reply.push(ch);
                             }
@@ -921,7 +922,7 @@ fn write_and_read_terminal_probe(query: &str, timeout: Duration) -> String {
                             && reply.len() < 1024
                         {
                             let ch = key.unicode_char as u8 as char;
-                            let reps = key.w_repeat_count.max(1).min(16);
+                            let reps = key.w_repeat_count.clamp(1, 16);
                             for _ in 0..reps {
                                 reply.push(ch);
                             }
@@ -1374,9 +1375,10 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
+    type Rgb = (u8, u8, u8);
     for y in (0..target_h).step_by(2) {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current_pair: Option<((u8, u8, u8), (u8, u8, u8))> = None;
+        let mut current_pair: Option<(Rgb, Rgb)> = None;
         let mut run = String::new();
 
         for x in 0..target_w {
@@ -1709,13 +1711,13 @@ pub fn compute_halfblock_dims(
         target_h = target_h.min((view_rows as u32) * 2).max(2);
     }
 
-    if target_h % 2 != 0 {
+    if !target_h.is_multiple_of(2) {
         let max_h = if !tall_scroll && zoom_pct <= 100 {
             (view_rows as u32) * 2
         } else {
             MAX_HALFBLOCK_SUBPX_H as u32
         };
-        if target_h + 1 <= max_h {
+        if target_h < max_h {
             target_h += 1;
         } else {
             target_h = target_h.saturating_sub(1).max(2);
@@ -1949,7 +1951,7 @@ fn quantize_rgba_to_256_with_stats(
     let mut indexed = Vec::with_capacity(pixel_count);
     let mut overflow = false;
 
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         if let Some(&idx) = exact_map.get(&key) {
             indexed.push(idx);
@@ -1970,7 +1972,7 @@ fn quantize_rgba_to_256_with_stats(
 
     // Perceptual median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
     let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let qkey = (((px[0] as u16) >> 3) << 10)
             | (((px[1] as u16) >> 3) << 5)
             | ((px[2] as u16) >> 3);
@@ -2088,11 +2090,11 @@ fn quantize_rgba_to_256_with_stats(
                 sg += b.sum_g;
                 sb += b.sum_b;
             }
-            if cnt == 0 {
-                (0, 0, 0)
-            } else {
-                ((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8)
-            }
+            (
+                sr.checked_div(cnt).unwrap_or(0) as u8,
+                sg.checked_div(cnt).unwrap_or(0) as u8,
+                sb.checked_div(cnt).unwrap_or(0) as u8,
+            )
         })
         .collect();
 
@@ -3437,11 +3439,11 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 let off = (y * w + x) * 4;
-                let (r, g, b) = if y >= 10 && y < 14 && x >= 10 && x < 60 {
+                let (r, g, b) = if (10..14).contains(&y) && (10..60).contains(&x) {
                     blue
-                } else if y >= 20 && y < 24 && x >= 10 && x < 60 {
+                } else if (20..24).contains(&y) && (10..60).contains(&x) {
                     red
-                } else if y >= 30 && y < 46 && x >= 10 && x < 28 {
+                } else if (30..46).contains(&y) && (10..28).contains(&x) {
                     // 16x18 = 288 distinct RGB colors in a small avatar patch
                     (((x - 10) * 14) as u8, ((y - 30) * 15) as u8, (((x + y) * 9) % 256) as u8)
                 } else {

@@ -346,10 +346,7 @@ fn extract_bare_urls(text: &str, out: &mut Vec<ExtractedLink>) {
 }
 
 fn trim_trailing_url_punct(mut s: &str) -> &str {
-    loop {
-        let Some(last) = s.chars().next_back() else {
-            break;
-        };
+    while let Some(last) = s.chars().next_back() {
         match last {
             '.' | ',' | ';' | ':' | '!' | '?' | ']' | '}' => {
                 s = &s[..s.len() - last.len_utf8()];

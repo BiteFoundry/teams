@@ -394,14 +394,12 @@ impl GraphClient {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
 
-            if items.is_empty()
-                && raw_non_empty
-                && current_next_link.is_some()
-                && empty_noise_pages < 5
-            {
-                empty_noise_pages += 1;
-                url = current_next_link.take().unwrap();
-                continue;
+            if items.is_empty() && raw_non_empty && empty_noise_pages < 5 {
+                if let Some(next_url) = current_next_link.take() {
+                    empty_noise_pages += 1;
+                    url = next_url;
+                    continue;
+                }
             }
             break;
         }
@@ -1348,8 +1346,10 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = base;
+        let cfg = crate::config::AppConfig {
+            graph_base_url: base,
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1428,8 +1428,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = base;
+        let cfg = crate::config::AppConfig {
+            graph_base_url: base,
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1554,8 +1556,10 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
 
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = base;
+        let cfg = crate::config::AppConfig {
+            graph_base_url: base,
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,
@@ -1593,8 +1597,10 @@ mod tests {
     }
 
     fn track5_channel_client(base: String) -> GraphClient {
-        let mut cfg = crate::config::AppConfig::default();
-        cfg.graph_base_url = base;
+        let cfg = crate::config::AppConfig {
+            graph_base_url: base,
+            ..Default::default()
+        };
         let tok = crate::auth::StoredTokens {
             access_token: "tok".into(),
             refresh_token: None,

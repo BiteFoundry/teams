@@ -376,11 +376,10 @@ pub(crate) fn render_scrolled_lines_with_selection(
     for (row, rendered) in slice.iter().enumerate() {
         let global_idx = offset + row;
         let y = area.y + row as u16;
-        let is_selected = selection
+        if let Some(sel) = selection
             .as_ref()
-            .is_some_and(|sel| global_idx >= sel.range.0 && global_idx < sel.range.1);
-        if is_selected {
-            let sel = selection.as_ref().unwrap();
+            .filter(|sel| global_idx >= sel.range.0 && global_idx < sel.range.1)
+        {
             let mut decorated = rendered.clone();
             apply_selection_to_line(
                 &mut decorated,
@@ -1710,8 +1709,8 @@ fn render_message_compact(
         }
 
         // Compact suffix: `[👍2] [❤️1] · ↳ 4` (flow-wrapped so `↳ N` never disappears)
-        let mut suffix_rows: Vec<(Vec<Span<'static>>, Vec<(u16, u16, HitTarget)>, u16)> =
-            Vec::new();
+        type SuffixRow = (Vec<Span<'static>>, Vec<(u16, u16, HitTarget)>, u16);
+        let mut suffix_rows: Vec<SuffixRow> = Vec::new();
         let mut cur_spans: Vec<Span<'static>> = Vec::new();
         let mut cur_targets: Vec<(u16, u16, HitTarget)> = Vec::new();
         let mut scol = 0u16;
@@ -2263,7 +2262,7 @@ pub(crate) fn apply_selection_to_line(
             + sep_w * chips.len().saturating_sub(1);
 
         if cur_w + 2 + chips_w <= width {
-            let trail = usize::from(cur_w + 2 + chips_w + 1 <= width);
+            let trail = usize::from(cur_w + 2 + chips_w < width);
             let pad = width.saturating_sub(cur_w + chips_w + trail);
             if pad > 0 {
                 rendered
@@ -3230,7 +3229,7 @@ mod tests {
 
         let theme = Theme::midnight_dark();
         let view = ChatRender {
-            messages: &vec![m1],
+            messages: &[m1],
             is_channel: false,
             selected_index: Some(0),
         };

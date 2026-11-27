@@ -6,11 +6,12 @@ pub const MAX_BODY_CHARS: usize = 120;
 const MAX_IN_FLIGHT_NOTIFICATIONS: usize = 2;
 static IN_FLIGHT_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(any(target_os = "linux", test))]
 fn has_non_empty_env(val: Option<&str>) -> bool {
     val.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", test))]
 fn linux_desktop_notifications_available_with(
     dbus_addr: Option<&str>,
     display: Option<&str>,
